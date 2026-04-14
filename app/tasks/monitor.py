@@ -1,0 +1,488 @@
+"""
+Tâche background: Monitoring continu des modèles
+Vérifie l'état en ligne, génère les miniatures et met à jour SQLite
+"""
+import asyncio
+import aiohttp
+import subprocess
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING
+from datetime import datetime
+
+if TYPE_CHECKING:
+    from ..ffmpeg_runner import FFmpegManager
+    from ..core.database import Database
+
+from ..logger import logger
+from ..core.config import OUTPUT_DIR
+
+# Intervalle de vérification (en secondes)
+MONITOR_INTERVAL = 30  # Vérifie toutes les 30 secondes
+THUMBNAIL_UPDATE_INTERVAL = 60  # Miniature mise à jour toutes les 60 secondes
+
+async def check_model_status(session: aiohttp.ClientSession, username: str, csrftoken: str = None) -> dict:
+    """Vérifie le statut d'un modèle via l'API Chaturbate"""
+    try:
+        url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://chaturbate.com/",
+            "Origin": "https://chaturbate.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        
+        # Ajouter les cookies si disponibles
+        cookies = []
+        if csrftoken:
+            cookies.append(f"csrftoken={csrftoken}")
+        
+        # Récupérer les autres cookies depuis les variables d'environnement
+        affkey = os.getenv("CHATURBATE_AFFKEY")
+        sessionid = os.getenv("CHATURBATE_SESSIONID")
+        
+        if affkey:
+            cookies.append(f"affkey={affkey}")
+        if sessionid:
+            cookies.append(f"sessionid={sessionid}")
+        
+        if cookies:
+            headers["Cookie"] = "; ".join(cookies)
+        
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as response:
+            if response.status == 200:
+                data = await response.json()
+                
+                # Log les données de l'API pour débogage
+                logger.debug("Réponse API Chaturbate", 
+                           username=username,
+                           room_status=data.get("room_status"),
+                           has_hls=bool(data.get("hls_source")),
+                           num_users=data.get("num_users", 0))
+                
+                # Détection améliorée du statut en ligne
+                room_status = data.get("room_status", "")
+                hls_source = data.get("hls_source")
+                
+                # Un modèle est en ligne si :
+                # 1. Il a un flux HLS disponible OU
+                # 2. Le room_status est "public" OU
+                # 3. Le room_status est "away" (temporairement absent mais toujours en ligne)
+                is_online = (
+                    bool(hls_source) or 
+                    room_status in ["public", "away"]
+                )
+                
+                viewers = data.get("num_users", 0)
+                
+                return {
+                    "is_online": is_online,
+                    "viewers": viewers,
+                    "hls_source": hls_source
+                }
+    except Exception as e:
+        logger.debug("Erreur vérification statut modèle", username=username, error=str(e))
+    
+    return {
+        "is_online": False,
+        "viewers": 0,
+        "hls_source": None
+    }
+
+async def generate_thumbnail_from_stream(
+    username: str,
+    session_id: str,
+    output_dir: Path,
+    ffmpeg_path: str = "ffmpeg"
+) -> str | None:
+    """Génère une miniature depuis le stream HLS en cours"""
+    try:
+        session_dir = output_dir / "sessions" / session_id
+        m3u8_file = session_dir / "stream.m3u8"
+        
+        if not m3u8_file.exists():
+            return None
+        
+        # Dossier pour les miniatures live
+        live_thumbs_dir = output_dir / "thumbnails" / "live"
+        live_thumbs_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = live_thumbs_dir / f"{username}.jpg"
+        
+        # Générer la miniature
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path, "-i", str(m3u8_file),
+            "-vframes", "1",
+            "-vf", "scale=280:-1",
+            "-y",
+            str(thumb_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        
+        await asyncio.wait_for(process.wait(), timeout=10)
+        
+        if thumb_path.exists():
+            return str(thumb_path)
+    
+    except Exception as e:
+        logger.debug("Erreur génération miniature stream", username=username, error=str(e))
+    
+    return None
+
+async def generate_thumbnail_from_recording(
+    username: str,
+    output_dir: Path,
+    ffmpeg_path: str = "ffmpeg"
+) -> str | None:
+    """Génère une miniature depuis la dernière rediffusion"""
+    try:
+        records_dir = output_dir / "records" / username
+        
+        if not records_dir.exists():
+            return None
+        
+        # Trouver la dernière rediffusion
+        ts_files = sorted(records_dir.glob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+        
+        if not ts_files:
+            return None
+        
+        latest_recording = ts_files[0]
+        
+        # Dossier pour les miniatures offline
+        offline_thumbs_dir = output_dir / "thumbnails" / "offline"
+        offline_thumbs_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = offline_thumbs_dir / f"{username}.jpg"
+        
+        # Ne régénérer que si la miniature n'existe pas ou est plus ancienne que l'enregistrement
+        if thumb_path.exists() and thumb_path.stat().st_mtime > latest_recording.stat().st_mtime:
+            return str(thumb_path)
+        
+        # Extraire une frame au milieu de la vidéo
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path, "-ss", "00:00:30",
+            "-i", str(latest_recording),
+            "-vframes", "1",
+            "-vf", "scale=280:-1",
+            "-y",
+            str(thumb_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        
+        await asyncio.wait_for(process.wait(), timeout=15)
+        
+        if thumb_path.exists():
+            return str(thumb_path)
+    
+    except Exception as e:
+        logger.debug("Erreur génération miniature offline", username=username, error=str(e))
+    
+    return None
+
+async def download_thumbnail_from_chaturbate(
+    session: aiohttp.ClientSession,
+    username: str,
+    output_dir: Path
+) -> str | None:
+    """Télécharge la miniature depuis Chaturbate"""
+    try:
+        img_urls = [
+            f"https://roomimg.stream.highwebmedia.com/ri/{username}.jpg",
+            f"https://cbjpeg.stream.highwebmedia.com/stream?room={username}&f=.jpg",
+        ]
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://chaturbate.com/",
+        }
+        
+        for img_url in img_urls:
+            try:
+                async with session.get(img_url, headers=headers, timeout=5) as response:
+                    if response.status == 200:
+                        content = await response.read()
+                        
+                        if len(content) > 1000:
+                            # Sauvegarder la miniature
+                            cb_thumbs_dir = output_dir / "thumbnails" / "chaturbate"
+                            cb_thumbs_dir.mkdir(parents=True, exist_ok=True)
+                            thumb_path = cb_thumbs_dir / f"{username}.jpg"
+                            
+                            with open(thumb_path, 'wb') as f:
+                                f.write(content)
+                            
+                            return str(thumb_path)
+            except:
+                continue
+    
+    except Exception as e:
+        logger.debug("Erreur téléchargement miniature Chaturbate", username=username, error=str(e))
+    
+    return None
+
+async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> int:
+    """Récupère la durée d'une vidéo avec ffprobe"""
+    try:
+        # Utiliser ffprobe pour récupérer la durée
+        ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+        
+        process = await asyncio.create_subprocess_exec(
+            ffprobe_path,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        
+        if process.returncode == 0 and stdout:
+            duration_str = stdout.decode().strip()
+            if duration_str:
+                return int(float(duration_str))
+    
+    except Exception as e:
+        logger.debug("Erreur récupération durée vidéo", file_path=str(file_path), error=str(e))
+    
+    return 0
+
+
+async def generate_recording_thumbnail(
+    ts_file: Path,
+    output_dir: Path,
+    username: str,
+    ffmpeg_path: str = "ffmpeg"
+) -> str | None:
+    """Génère une miniature pour un enregistrement"""
+    try:
+        # Dossier pour les miniatures d'enregistrements
+        thumbs_dir = output_dir / "thumbnails" / username
+        thumbs_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumbs_dir / f"{ts_file.stem}.jpg"
+        
+        # Ne pas régénérer si existe déjà
+        if thumb_path.exists():
+            return str(thumb_path)
+        
+        # Extraire une frame à 30 secondes du début
+        process = await asyncio.create_subprocess_exec(
+            ffmpeg_path,
+            "-ss", "00:00:30",
+            "-i", str(ts_file),
+            "-vframes", "1",
+            "-vf", "scale=320:-1",
+            "-y",
+            str(thumb_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        
+        await asyncio.wait_for(process.wait(), timeout=15)
+        
+        if thumb_path.exists():
+            return str(thumb_path)
+    
+    except Exception as e:
+        logger.debug("Erreur génération miniature enregistrement", 
+                    username=username, 
+                    filename=ts_file.name, 
+                    error=str(e))
+    
+    return None
+
+
+async def update_recordings_cache(db: 'Database', username: str, output_dir: Path, ffmpeg_path: str = "ffmpeg"):
+    """Met à jour le cache des enregistrements dans SQLite"""
+    try:
+        import time
+        records_dir = output_dir / "records" / username
+        
+        if not records_dir.exists():
+            return
+        
+        for ts_file in records_dir.glob("*.ts"):
+            stat = ts_file.stat()
+            
+            # Récupérer la durée actuelle depuis la DB
+            existing_recordings = await db.get_recordings(username)
+            existing_rec = next((r for r in existing_recordings if r['filename'] == ts_file.name), None)
+            
+            # Calculer la durée uniquement si elle n'est pas déjà en cache ou est à 0
+            duration_seconds = 0
+            if existing_rec:
+                duration_seconds = existing_rec.get('duration_seconds', 0)
+            
+            if duration_seconds == 0:
+                # Vérifier que le fichier est stable (pas modifié depuis 120s)
+                # pour éviter de calculer la durée sur un fichier en cours d'écriture
+                last_modified = ts_file.stat().st_mtime
+                seconds_since_modification = time.time() - last_modified
+                
+                if seconds_since_modification >= 120:
+                    # Calculer la durée avec ffprobe
+                    duration_seconds = await get_video_duration(ts_file, ffmpeg_path)
+                    logger.debug("Durée calculée", username=username, filename=ts_file.name, duration=duration_seconds)
+                else:
+                    logger.debug("Fichier pas encore stable, skip calcul durée", 
+                               username=username, 
+                               filename=ts_file.name,
+                               seconds_since_modification=int(seconds_since_modification))
+            
+            # Générer la miniature si elle n'existe pas
+            thumbnail_path = None
+            if existing_rec:
+                thumbnail_path = existing_rec.get('thumbnail_path')
+            
+            if not thumbnail_path or not Path(thumbnail_path).exists():
+                thumbnail_path = await generate_recording_thumbnail(ts_file, output_dir, username, ffmpeg_path)
+                if thumbnail_path:
+                    logger.debug("Miniature générée", username=username, filename=ts_file.name, thumb=thumbnail_path)
+            
+            # Générer recording_id si c'est un nouvel enregistrement
+            recording_id = None
+            if existing_rec:
+                recording_id = existing_rec.get('recording_id')
+            
+            if not recording_id:
+                # Extraire le timestamp du nom de fichier (format: YYYYMMDD_HHMMSS_xxx.ts)
+                # Sinon générer un nouveau recording_id
+                recording_id = f"{username}_{ts_file.stem}"
+            
+            await db.add_or_update_recording(
+                username=username,
+                filename=ts_file.name,
+                file_path=str(ts_file),
+                file_size=stat.st_size,
+                recording_id=recording_id,
+                duration_seconds=duration_seconds,
+                thumbnail_path=thumbnail_path
+            )
+    
+    except Exception as e:
+        logger.debug("Erreur mise à jour cache enregistrements", username=username, error=str(e))
+
+async def monitor_models_task(
+    db: 'Database',
+    manager: 'FFmpegManager',
+    ffmpeg_path: str = "ffmpeg"
+):
+    """
+    Tâche de monitoring en arrière-plan
+    Vérifie continuellement l'état des modèles et génère les miniatures
+    """
+    logger.background_task("monitor", "Démarrage du monitoring continu")
+    
+    # Récupérer le csrftoken depuis les variables d'environnement
+    csrftoken = os.getenv("CHATURBATE_CSRFTOKEN")
+    if csrftoken:
+        logger.info("CSRF token détecté", has_token=True)
+    
+    # Initialiser la base de données
+    await db.initialize()
+    
+    # Créer une session HTTP persistante
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                # Récupérer tous les modèles depuis la DB
+                models = await db.get_all_models()
+                
+                if not models:
+                    await asyncio.sleep(MONITOR_INTERVAL)
+                    continue
+                
+                logger.debug("Vérification des modèles", count=len(models))
+                
+                # Récupérer les sessions actives
+                active_sessions = manager.list_status()
+                
+                # Vérifier chaque modèle
+                for model in models:
+                    username = model['username']
+                    
+                    try:
+                        # Vérifier le statut en ligne
+                        status = await check_model_status(session, username, csrftoken)
+                        
+                        # Vérifier si en cours d'enregistrement
+                        active_session = next(
+                            (s for s in active_sessions if s.get('person') == username and s.get('running')),
+                            None
+                        )
+                        is_recording = active_session is not None
+                        
+                        # Générer/mettre à jour la miniature
+                        thumbnail_path = None
+                        last_thumbnail_update = model.get('thumbnail_updated_at') or 0
+                        needs_thumbnail_update = (
+                            datetime.now().timestamp() - last_thumbnail_update > THUMBNAIL_UPDATE_INTERVAL
+                        )
+                        
+                        if needs_thumbnail_update:
+                            if is_recording and active_session:
+                                # Miniature depuis le stream en cours
+                                thumbnail_path = await generate_thumbnail_from_stream(
+                                    username,
+                                    active_session['id'],
+                                    OUTPUT_DIR,
+                                    ffmpeg_path
+                                )
+                            
+                            if not thumbnail_path and status['is_online']:
+                                # Miniature depuis Chaturbate
+                                thumbnail_path = await download_thumbnail_from_chaturbate(
+                                    session,
+                                    username,
+                                    OUTPUT_DIR
+                                )
+                            
+                            if not thumbnail_path:
+                                # Miniature depuis la dernière rediffusion
+                                thumbnail_path = await generate_thumbnail_from_recording(
+                                    username,
+                                    OUTPUT_DIR,
+                                    ffmpeg_path
+                                )
+                        
+                        # Mettre à jour le statut dans la DB
+                        await db.update_model_status(
+                            username=username,
+                            is_online=status['is_online'],
+                            viewers=status['viewers'],
+                            is_recording=is_recording,
+                            thumbnail_path=thumbnail_path
+                        )
+                        
+                        # Mettre à jour le cache des enregistrements
+                        await update_recordings_cache(db, username, OUTPUT_DIR, ffmpeg_path)
+                        
+                        logger.debug("Modèle mis à jour",
+                                   username=username,
+                                   is_online=status['is_online'],
+                                   is_recording=is_recording,
+                                   viewers=status['viewers'])
+                    
+                    except Exception as e:
+                        logger.error("Erreur monitoring modèle",
+                                   username=username,
+                                   error=str(e),
+                                   exc_info=True)
+                        continue
+                
+                # Attendre avant la prochaine vérification
+                await asyncio.sleep(MONITOR_INTERVAL)
+            
+            except Exception as e:
+                logger.error("Erreur dans monitor task",
+                           error=str(e),
+                           exc_info=True)
+                await asyncio.sleep(60)

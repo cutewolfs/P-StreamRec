@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1033"/>
+      <stop offset="100%" stop-color="#3a1458"/>
+    </linearGradient>
+    <linearGradient id="recGlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ff4d6d"/>
+      <stop offset="100%" stop-color="#c9184a"/>
+    </linearGradient>
+    <linearGradient id="playGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e6d9ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="256" height="256" fill="url(#bg)"/>
+
+  <!-- Subtle screen glow -->
+  <circle cx="128" cy="128" r="96" fill="#ffffff" opacity="0.04"/>
+  <circle cx="128" cy="128" r="64" fill="#ffffff" opacity="0.05"/>
+
+  <!-- Monitor / screen -->
+  <rect x="44" y="60" width="168" height="112" rx="14" ry="14"
+        fill="#0d0720" stroke="#7a3ab8" stroke-width="4"/>
+
+  <!-- Play triangle (stream indicator) -->
+  <path d="M108 98 L108 158 L160 128 Z" fill="url(#playGrad)"/>
+
+  <!-- Recording dot -->
+  <circle cx="196" cy="76" r="14" fill="url(#recGlow)"/>
+  <circle cx="196" cy="76" r="14" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.5"/>
+
+  <!-- Monitor stand -->
+  <rect x="116" y="172" width="24" height="18" fill="#7a3ab8"/>
+  <rect x="92"  y="188" width="72" height="10" rx="4" ry="4" fill="#7a3ab8"/>
+</svg>

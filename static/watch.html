@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Watch - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script src="/static/loader.js"></script>
+  <script defer src="/static/watch.js"></script>
+</head>
+<body>
+  <div id="header-placeholder"></div>
+
+  <!-- Video Player (Theater Mode) -->
+  <div class="watch-player-container">
+    <video id="videoPlayer" class="watch-video" autoplay playsinline></video>
+    <span class="live-badge">&#9679; LIVE</span>
+    <div class="live-controls" id="liveControls">
+      <button class="live-ctrl-btn" id="playPauseBtn" onclick="togglePlayPause()" title="Play/Pause">&#9654;</button>
+      <button class="live-ctrl-btn" id="muteBtn" onclick="toggleMute()" title="Mute/Unmute">&#128264;</button>
+      <input type="range" class="live-volume-slider" id="volumeSlider" min="0" max="1" step="0.05" value="0.7" oninput="changeVolume(this.value)" />
+      <div class="live-ctrl-spacer"></div>
+      <button class="live-ctrl-btn" id="fullscreenBtn" onclick="toggleFullscreen()" title="Fullscreen">&#x26F6;</button>
+    </div>
+    <div class="watch-offline-overlay" id="offlineOverlay" style="display: none;">
+      <div class="offline-message">
+        <div class="icon">&#128308;</div>
+        <h2>Model is Offline</h2>
+        <p id="offlineText">This model is currently not streaming.</p>
+        <button class="watch-btn retry-btn" id="retryBtn" onclick="retryStream()" style="margin-top: 1rem;">Retry</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Model Info -->
+  <div class="watch-info">
+    <div class="watch-info-left">
+      <h1 class="watch-username" id="watchUsername">Loading...</h1>
+      <div class="watch-status" id="watchStatus">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Checking...</span>
+        <span class="watch-viewers" id="viewerCount" style="display: none;">
+          &#128065; <span id="viewerNum">0</span>
+        </span>
+      </div>
+    </div>
+    <div class="watch-info-right">
+      <button class="watch-btn follow-btn" id="followBtn" onclick="toggleFollow()" style="display: none;">
+        <span id="followIcon">&#9829;</span>
+        <span id="followText">Follow</span>
+      </button>
+      <button class="watch-btn record-btn" id="recordBtn" onclick="toggleAutoRecord()" style="display: none;">
+        <span id="recordIcon">&#9679;</span>
+        <span id="recordText">Auto-Record</span>
+      </button>
+    </div>
+  </div>
+
+</body>
+</html>

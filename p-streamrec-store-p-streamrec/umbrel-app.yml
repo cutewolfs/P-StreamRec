@@ -1,0 +1,58 @@
+manifestVersion: 1
+id: p-streamrec-store-p-streamrec
+name: P-StreamRec
+tagline: Automatic Chaturbate & m3u8 stream recorder
+icon: https://raw.githubusercontent.com/raccommode/P-StreamRec/main/p-streamrec-store-p-streamrec/icon.svg
+category: media
+version: "2026.09.7"
+port: 8080
+description: >-
+  P-StreamRec is a self-hosted recorder for Chaturbate and any m3u8/HLS live stream, with a modern web interface.
+
+
+  Features:
+
+  - 24/7 automatic recording — monitors models and records when they go live
+
+  - Auto MP4 conversion — converts TS to compressed MP4 in background (50-70% smaller)
+
+  - Discover — browse live Chaturbate models with gender, tag, and search filters
+
+  - Following — sync and view your followed models from your Chaturbate account
+
+  - Recordings — manage all recordings with a built-in video player
+
+  - Live Watch — watch streams directly in the browser with HLS.js
+
+  - FlareSolverr bundled — automatic Cloudflare bypass
+
+  - Password protection and optional Chaturbate login for better stream quality
+
+
+  Built with FastAPI, SQLite, HLS.js and FFmpeg. All data stays on your Umbrel.
+developer: raccommode
+website: https://github.com/raccommode/P-StreamRec
+submitter: raccommode
+submission: https://github.com/raccommode/P-StreamRec
+repo: https://github.com/raccommode/P-StreamRec
+support: https://github.com/raccommode/P-StreamRec/issues
+gallery:
+  - https://raw.githubusercontent.com/raccommode/P-StreamRec/main/discover.png
+  - https://raw.githubusercontent.com/raccommode/P-StreamRec/main/following.png
+  - https://raw.githubusercontent.com/raccommode/P-StreamRec/main/recordings.png
+releaseNotes: >-
+  First Umbrel release of P-StreamRec.
+
+  - FlareSolverr integration for Cloudflare bypass
+
+  - Chaturbate authentication (login/session management)
+
+  - Discover, Following and Recordings pages
+
+  - Settings page for account and FlareSolverr status
+
+  - Authenticated edge HLS for improved stream resolution
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""

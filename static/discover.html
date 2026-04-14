@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Discover - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/loader.js"></script>
+  <script defer src="/static/discover.js"></script>
+</head>
+<body>
+  <div id="header-placeholder"></div>
+
+  <div class="container">
+    <div class="discover-controls">
+      <div class="search-bar">
+        <span class="search-icon">&#128269;</span>
+        <input type="text" class="search-input" id="searchInput" placeholder="Search models..." autocomplete="off" />
+      </div>
+      <div class="filter-pills" id="genderFilters">
+        <button class="filter-pill active" data-gender="" onclick="setGender('', this)">All</button>
+        <button class="filter-pill" data-gender="female" onclick="setGender('female', this)">Female</button>
+        <button class="filter-pill" data-gender="male" onclick="setGender('male', this)">Male</button>
+        <button class="filter-pill" data-gender="couple" onclick="setGender('couple', this)">Couple</button>
+        <button class="filter-pill" data-gender="trans" onclick="setGender('trans', this)">Trans</button>
+      </div>
+      <select class="sort-select" id="sortSelect" onchange="setSort(this.value)">
+        <option value="viewers">Sort by Viewers</option>
+        <option value="newest">Sort by Newest</option>
+      </select>
+    </div>
+
+    <!-- Tag Filters -->
+    <div class="tag-filter-section">
+      <div class="tag-input-container">
+        <span class="tag-icon">&#127991;</span>
+        <input type="text" class="tag-input" id="tagInput" placeholder="Filter by tag (press Enter)..." autocomplete="off" />
+      </div>
+      <div class="active-tag-filters" id="activeTagFilters" style="display: none;"></div>
+    </div>
+
+    <div class="discover-grid" id="discoverGrid">
+      <div class="empty-message">
+        <div class="icon">&#128269;</div>
+        <p>Loading models...</p>
+      </div>
+    </div>
+
+    <div class="pagination" id="pagination" style="display: none;">
+      <button class="pagination-btn" id="prevBtn" onclick="changePage(-1)" disabled>Previous</button>
+      <span class="pagination-info" id="pageInfo">Page 1</span>
+      <button class="pagination-btn" id="nextBtn" onclick="changePage(1)">Next</button>
+    </div>
+  </div>
+
+  <div id="footer-placeholder"></div>
+</body>
+</html>

@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    :root {
+      --bg-primary: #0a0e27;
+      --bg-secondary: #111432;
+      --bg-card: #1a1f3a;
+      --bg-card-hover: #232a4a;
+      --text-primary: #ffffff;
+      --text-secondary: #a0aec0;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --danger: #ef4444;
+      --border: rgba(255, 255, 255, 0.1);
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    }
+    
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, var(--bg-primary) 0%, #0d1128 100%);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    
+    .login-container {
+      background: var(--bg-card);
+      border-radius: 24px;
+      padding: 3rem;
+      max-width: 420px;
+      width: 100%;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow);
+      animation: slideUp 0.4s ease-out;
+    }
+    
+    @keyframes slideUp {
+      from { transform: translateY(30px); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+    
+    .logo {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    
+    .logo h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+      background-clip: text;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.5rem;
+    }
+    
+    .logo p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+    }
+    
+    .form-group {
+      margin-bottom: 1.5rem;
+    }
+    
+    label {
+      display: block;
+      margin-bottom: 0.5rem;
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+    
+    input[type="password"] {
+      width: 100%;
+      padding: 1rem;
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text-primary);
+      font-size: 1rem;
+      transition: all 0.3s;
+      font-family: 'Inter', sans-serif;
+    }
+    
+    input[type="password"]:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+    }
+    
+    .btn-login {
+      width: 100%;
+      padding: 1rem;
+      border: none;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+      background: linear-gradient(135deg, var(--accent) 0%, #a855f7 100%);
+      color: white;
+      margin-top: 1rem;
+    }
+    
+    .btn-login:hover:not(:disabled) {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(99, 102, 241, 0.4);
+    }
+    
+    .btn-login:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    
+    .error-message {
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: var(--danger);
+      padding: 0.875rem;
+      border-radius: 10px;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+      display: none;
+      animation: shake 0.4s ease-in-out;
+    }
+    
+    .error-message.show {
+      display: block;
+    }
+    
+    @keyframes shake {
+      0%, 100% { transform: translateX(0); }
+      25% { transform: translateX(-10px); }
+      75% { transform: translateX(10px); }
+    }
+    
+    .lock-icon {
+      text-align: center;
+      font-size: 3rem;
+      margin-bottom: 1.5rem;
+      opacity: 0.8;
+    }
+    
+    @media (max-width: 480px) {
+      .login-container {
+        padding: 2rem;
+      }
+      
+      .logo h1 {
+        font-size: 1.75rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="login-container">
+    <div class="lock-icon">🔐</div>
+    
+    <div class="logo">
+      <h1>P-StreamRec</h1>
+      <p>Connexion requise</p>
+    </div>
+    
+    <div class="error-message" id="errorMessage">
+      Mot de passe incorrect
+    </div>
+    
+    <form id="loginForm">
+      <div class="form-group">
+        <label for="password">Mot de passe</label>
+        <input 
+          type="password" 
+          id="password"
+          name="password"
+          placeholder="Entrez votre mot de passe" 
+          required
+          autofocus
+        />
+      </div>
+      
+      <button type="submit" class="btn-login" id="loginBtn">
+        Se connecter
+      </button>
+    </form>
+  </div>
+
+  <script>
+    const loginForm = document.getElementById('loginForm');
+    const passwordInput = document.getElementById('password');
+    const loginBtn = document.getElementById('loginBtn');
+    const errorMessage = document.getElementById('errorMessage');
+
+    loginForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      const password = passwordInput.value;
+      
+      if (!password) {
+        showError('Veuillez entrer un mot de passe');
+        return;
+      }
+      
+      // Désactiver le bouton pendant la requête
+      loginBtn.disabled = true;
+      loginBtn.textContent = 'Connexion...';
+      errorMessage.classList.remove('show');
+      
+      try {
+        const response = await fetch('/api/login', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ password })
+        });
+        
+        if (response.ok) {
+          // Connexion réussie, rediriger vers l'accueil
+          window.location.href = '/';
+        } else {
+          const data = await response.json();
+          showError(data.detail || 'Mot de passe incorrect');
+          loginBtn.disabled = false;
+          loginBtn.textContent = 'Se connecter';
+          passwordInput.value = '';
+          passwordInput.focus();
+        }
+      } catch (error) {
+        console.error('Erreur de connexion:', error);
+        showError('Erreur de connexion au serveur');
+        loginBtn.disabled = false;
+        loginBtn.textContent = 'Se connecter';
+      }
+    });
+    
+    function showError(message) {
+      errorMessage.textContent = message;
+      errorMessage.classList.add('show');
+      
+      // Retirer l'animation après qu'elle soit terminée
+      setTimeout(() => {
+        errorMessage.style.animation = 'none';
+      }, 400);
+    }
+    
+    // Permettre la connexion avec la touche Entrée
+    passwordInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        loginForm.dispatchEvent(new Event('submit'));
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,1657 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Model - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    :root {
+      --bg-primary: #0a0e27;
+      --bg-secondary: #111432;
+      --bg-card: #1a1f3a;
+      --bg-card-hover: #232a4a;
+      --text-primary: #ffffff;
+      --text-secondary: #a0aec0;
+      --accent: #6366f1;
+      --accent-hover: #4f46e5;
+      --success: #10b981;
+      --danger: #ef4444;
+      --border: rgba(255, 255, 255, 0.1);
+      --shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    }
+    
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, var(--bg-primary) 0%, #0d1128 100%);
+      color: var(--text-primary);
+      min-height: 100vh;
+      line-height: 1.6;
+    }
+    
+    /* Header */
+    .header {
+      background: rgba(17, 20, 50, 0.8);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 1.5rem 2rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    
+    .back-btn {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      font-size: 20px;
+      cursor: pointer;
+      transition: all 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .back-btn:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+    }
+    
+    .model-header {
+      flex: 1;
+    }
+    
+    .model-title {
+      font-size: 1.5rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    
+    .model-subtitle {
+      font-size: 0.9rem;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.25rem;
+    }
+    
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    
+    .status-dot.online { background: var(--success); }
+    .status-dot.offline { background: #6b7280; animation: none; }
+    .status-dot.recording { background: var(--danger); }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    
+    .action-btn {
+      padding: 0.75rem 1.5rem;
+      border-radius: 10px;
+      border: none;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+    
+    .btn-record {
+      background: linear-gradient(135deg, var(--danger) 0%, #dc2626 100%);
+      color: white;
+    }
+    
+    .btn-record:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
+    }
+    
+    .btn-stop {
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+    
+    .btn-stop:hover {
+      background: var(--bg-card-hover);
+    }
+    
+    .btn-delete {
+      background: transparent;
+      color: var(--danger);
+      border: 1px solid var(--danger);
+    }
+    
+    .btn-delete:hover {
+      background: var(--danger);
+      color: white;
+    }
+    
+    /* Container */
+    .container {
+      padding: 1rem;
+    }
+    
+    /* Video Player */
+    .player-container {
+      position: relative;
+      width: 100%;
+      background: var(--bg-card);
+      border-radius: 16px;
+      overflow: hidden;
+      margin-bottom: 1.5rem;
+      border: 1px solid var(--border);
+      min-height: 400px;
+      transition: all 0.3s ease;
+    }
+    
+    /* Theater Mode */
+    .player-container.theater-mode {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      width: 100vw;
+      height: 100vh;
+      border-radius: 0;
+      margin: 0;
+      z-index: 9999;
+      border: none;
+    }
+    
+    .player-container.theater-mode .video-player {
+      max-height: 100vh;
+      height: 100vh;
+    }
+    
+    /* Hide header, footer, tabs and container in theater mode */
+    body.theater-mode-active .header,
+    body.theater-mode-active .tabs,
+    body.theater-mode-active footer {
+      display: none !important;
+    }
+    
+    body.theater-mode-active {
+      overflow: hidden;
+    }
+    
+    body.theater-mode-active .container {
+      padding: 0;
+      max-width: 100%;
+      margin: 0;
+    }
+    
+    .video-player {
+      width: 100%;
+      max-height: 70vh;
+      background: black;
+      display: block;
+    }
+    
+    .player-container .empty-message {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg-card);
+      pointer-events: none;
+      transition: opacity 0.3s ease;
+      z-index: 1;
+    }
+    
+    .player-container.has-video .empty-message {
+      opacity: 0;
+      pointer-events: none;
+    }
+    
+    .quality-selector {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      background: rgba(0, 0, 0, 0.8);
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .theater-mode-btn {
+      position: absolute;
+      top: 1rem;
+      right: 1rem;
+      background: rgba(0, 0, 0, 0.8);
+      color: white;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      z-index: 11;
+      font-size: 0.9rem;
+      font-weight: 500;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .theater-mode-btn:hover {
+      background: rgba(0, 0, 0, 0.95);
+      border-color: var(--accent);
+    }
+    
+    .quality-selector.theater-mode {
+      top: 4rem;
+    }
+    
+    .quality-selector label {
+      color: white;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    
+    .quality-selector select {
+      background: var(--bg-secondary);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.4rem 0.8rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+      outline: none;
+      transition: all 0.3s ease;
+    }
+    
+    .quality-selector select:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+    }
+    
+    .quality-selector select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+    }
+    
+    .control-btn {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      border: none;
+      background: var(--bg-secondary);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.3s;
+      font-size: 0.9rem;
+    }
+    .control-btn:hover {
+      background: var(--bg-card-hover);
+      color: var(--text-primary);
+    }
+    
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 1.5rem;
+      border-bottom: 2px solid var(--border);
+    }
+    
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--text-secondary);
+      padding: 1rem 1.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      border-bottom: 3px solid transparent;
+      transition: all 0.3s ease;
+    }
+    
+    .tab-btn:hover {
+      color: var(--text-primary);
+      background: rgba(255, 255, 255, 0.05);
+    }
+    
+    .tab-btn.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+    
+    .tab-content {
+      display: none;
+    }
+    
+    .tab-content.active {
+      display: block;
+    }
+    
+    /* Recordings */
+    .recordings-section {
+      background: var(--bg-card);
+      border-radius: 16px;
+      padding: 1.5rem;
+      border: 1px solid var(--border);
+    }
+    
+    .section-header {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    
+    .recordings-list {
+      display: grid;
+      gap: 0.75rem;
+    }
+    
+    .recording-item {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem;
+      background: var(--bg-secondary);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      transition: all 0.3s ease;
+    }
+    
+    .recording-item:hover {
+      background: var(--bg-card-hover);
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+    
+    .recording-thumbnail {
+      width: 160px;
+      height: 90px;
+      object-fit: cover;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .recording-thumbnail:hover {
+      transform: scale(1.05);
+      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+    }
+    
+    .recording-info {
+      flex: 1;
+      cursor: pointer;
+    }
+    
+    .recording-title {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 0.25rem;
+    }
+    
+    .recording-meta {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+      margin-bottom: 0.5rem;
+    }
+    
+    .watch-progress {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    
+    .progress-bar {
+      flex: 1;
+      height: 4px;
+      background: var(--bg-primary);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    
+    .progress-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.3s ease;
+    }
+    
+    .progress-text {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      min-width: 100px;
+      text-align: right;
+      white-space: nowrap;
+    }
+    
+    .recording-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+    
+    .play-btn {
+      background: var(--accent);
+      color: white;
+      border: none;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      font-size: 1.2rem;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .play-btn:hover {
+      background: var(--accent-hover);
+      transform: scale(1.1);
+    }
+    
+    .delete-btn {
+      background: var(--danger);
+      color: white;
+      border: none;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      font-size: 1.1rem;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .delete-btn:hover {
+      background: #dc2626;
+      transform: scale(1.1);
+    }
+    
+    .recording-name {
+      font-weight: 600;
+      margin-bottom: 0.25rem;
+    }
+    
+    .recording-meta {
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+    
+    .recording-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+    
+    .icon-btn {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      border: none;
+      background: var(--bg-card);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.3s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+    }
+    
+    .icon-btn:hover {
+      background: var(--accent);
+      color: white;
+    }
+    
+    .empty-message {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: var(--text-secondary);
+    }
+    
+    .empty-message .icon {
+      font-size: 3rem;
+      margin-bottom: 1rem;
+      opacity: 0.5;
+    }
+  </style>
+  <script src="/static/loader.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+  <script>
+    // Load version from API
+    (async function loadVersion() {
+      try {
+        const res = await fetch('/api/version');
+        const data = await res.json();
+        const versionEl = document.getElementById('appVersion');
+        if (versionEl) versionEl.textContent = `v${data.version}`;
+      } catch (e) {
+        console.error('Error loading version:', e);
+        const versionEl = document.getElementById('appVersion');
+        if (versionEl) versionEl.textContent = 'v?.?.?';
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div id="header-placeholder"></div>
+  
+  <script>
+    // Vérifier si l'authentification est activée
+    async function checkAuthStatus() {
+      try {
+        const res = await fetch('/api/version');
+        // Si on peut accéder à l'API, vérifier les cookies
+        return document.cookie.includes('session_token');
+      } catch {
+        return false;
+      }
+    }
+    
+    // Fonction de déconnexion
+    async function logout() {
+      if (!confirm('Voulez-vous vraiment vous déconnecter ?')) {
+        return;
+      }
+      
+      try {
+        await fetch('/api/logout', { method: 'POST' });
+        window.location.href = '/login';
+      } catch (error) {
+        console.error('Erreur de déconnexion:', error);
+        alert('Erreur lors de la déconnexion');
+      }
+    }
+    
+    // Customize header for model page
+    document.addEventListener('DOMContentLoaded', () => {
+      setTimeout(() => {
+        const headerLeft = document.querySelector('.header-left');
+        const headerRight = document.getElementById('headerRight');
+        
+        if (headerLeft) {
+          // Replace logo with back button + model name
+          const logo = headerLeft.querySelector('.logo');
+          if (logo) {
+            logo.outerHTML = `
+              <button class="back-btn" onclick="window.location.href='/'" style="border: none; background: none; color: var(--text-primary); font-size: 1.5rem; cursor: pointer; padding: 0.5rem; margin-right: 1rem;">←</button>
+              <div style="display: flex; flex-direction: column;">
+                <div class="model-title" id="modelName" style="font-size: 1.25rem; font-weight: 600;">Loading...</div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; margin-top: 0.25rem;">
+                  <span class="status-dot" id="statusDot" style="width: 8px; height: 8px; border-radius: 50%; background: var(--text-secondary);"></span>
+                  <span id="statusText" style="color: var(--text-secondary);">Checking...</span>
+                </div>
+              </div>
+            `;
+          }
+        }
+        
+        if (headerRight) {
+          // Vérifier si l'authentification est activée
+          checkAuthStatus().then(isAuthEnabled => {
+            let buttonsHTML = '';
+            
+            // Ajouter le bouton de déconnexion si l'authentification est activée
+            if (isAuthEnabled) {
+              buttonsHTML += '<button onclick="logout()" title="Se déconnecter" style="background: rgba(99, 102, 241, 0.1); border: 1px solid var(--border); color: var(--text-primary); padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-weight: 500; margin-right: 0.5rem;">🚪</button>';
+            }
+            
+            buttonsHTML += '<button onclick="openSettingsModal()" style="background: rgba(99, 102, 241, 0.1); border: 1px solid var(--border); color: var(--text-primary); padding: 0.5rem 1rem; border-radius: 8px; cursor: pointer; font-weight: 500;">⚙️ Settings</button>';
+            
+            headerRight.innerHTML = buttonsHTML;
+          });
+        }
+      }, 100);
+    });
+  </script>
+
+  <div class="container">
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('live', event)">📺 Live</button>
+      <button class="tab-btn" onclick="switchTab('recordings', event)">📁 Recordings</button>
+    </div>
+
+    <!-- Live Content -->
+    <div id="tab-live" class="tab-content active">
+      <div class="player-container" id="playerContainer">
+        <button class="theater-mode-btn" id="theaterBtn" onclick="toggleTheaterMode()" style="display: none;">
+          <span id="theaterIcon">🎬</span>
+          <span id="theaterText">Theater Mode</span>
+        </button>
+        <video id="player" class="video-player" muted autoplay></video>
+        <span class="live-badge">&#9679; LIVE</span>
+        <div class="live-controls" id="liveControls">
+          <button class="live-ctrl-btn" id="livePlayPauseBtn" onclick="liveTogglePlayPause()" title="Play/Pause">&#9646;&#9646;</button>
+          <button class="live-ctrl-btn" id="liveMuteBtn" onclick="liveToggleMute()" title="Mute/Unmute">&#128263;</button>
+          <input type="range" class="live-volume-slider" id="liveVolumeSlider" min="0" max="1" step="0.05" value="0.7" oninput="liveChangeVolume(this.value)" />
+          <div class="live-ctrl-spacer"></div>
+          <button class="live-ctrl-btn" id="liveFullscreenBtn" onclick="liveToggleFullscreen()" title="Fullscreen">&#x26F6;</button>
+        </div>
+        <div class="quality-selector" id="qualitySelector" style="display: none;">
+          <label for="qualitySelect">Quality:</label>
+          <select id="qualitySelect" onchange="changeQuality(this.value)">
+            <option value="-1">🎯 Best</option>
+          </select>
+        </div>
+        <div class="empty-message">
+          <div class="icon">📺</div>
+          <p>No stream in progress</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Recordings Content -->
+    <div id="tab-recordings" class="tab-content">
+      <div class="recordings-section">
+        <div class="section-header">
+          <span>📁 Available Recordings</span>
+          <span class="recording-meta" id="recordingsCount">0 files</span>
+        </div>
+        <div class="recordings-list" id="recordingsList">
+          <!-- Recordings will be added here -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal" id="settingsModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; align-items: center; justify-content: center;">
+    <div class="modal-content" style="background: var(--bg-card); padding: 2rem; border-radius: 12px; max-width: 500px; width: 90%;">
+      <h2 style="margin-bottom: 1.5rem; color: var(--text-primary);">⚙️ Model Settings</h2>
+      <form onsubmit="saveSettings(event)">
+        <div class="form-group" style="margin-bottom: 1.5rem;">
+          <label for="settingsQuality" style="display: block; margin-bottom: 0.5rem; color: var(--text-primary); font-weight: 500;">Recording Quality</label>
+          <select id="settingsQuality" style="width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); color: var(--text-primary); font-size: 1rem;">
+            <option value="best">🎯 Best Quality (default)</option>
+            <option value="1080p">1080p (Full HD)</option>
+            <option value="720p">720p (HD)</option>
+            <option value="480p">480p (SD)</option>
+            <option value="360p">360p (Low)</option>
+          </select>
+          <small style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.25rem; display: block;">
+            Quality of recorded stream (higher = more disk space)
+          </small>
+        </div>
+        
+        <div class="form-group" style="margin-bottom: 1.5rem;">
+          <label for="settingsRetention" style="display: block; margin-bottom: 0.5rem; color: var(--text-primary); font-weight: 500;">Retention Period (days)</label>
+          <input 
+            type="number" 
+            id="settingsRetention"
+            min="1"
+            max="365"
+            style="width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-secondary); color: var(--text-primary); font-size: 1rem;"
+            required
+          />
+          <small style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.25rem; display: block;">
+            Older recordings will be automatically deleted (default: 30 days)
+          </small>
+        </div>
+        
+        <div class="form-group" style="margin-bottom: 1.5rem;">
+          <label style="display: flex; align-items: center; gap: 0.75rem; cursor: pointer; color: var(--text-primary); font-weight: 500;">
+            <input 
+              type="checkbox" 
+              id="settingsAutoRecord"
+              style="width: 20px; height: 20px; cursor: pointer; accent-color: var(--accent);"
+            />
+            <span>🤖 Auto-record</span>
+          </label>
+          <small style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.5rem; display: block; margin-left: 2rem;">
+            Server automatically records when model goes online (checked every 2 minutes)
+          </small>
+        </div>
+        
+        <div style="display: flex; gap: 1rem; justify-content: flex-end; margin-top: 2rem;">
+          <button type="button" onclick="closeSettingsModal()" style="padding: 0.75rem 1.5rem; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text-primary); cursor: pointer; font-size: 1rem;">
+            Cancel
+          </button>
+          <button type="submit" style="padding: 0.75rem 1.5rem; border: none; border-radius: 8px; background: var(--accent); color: white; cursor: pointer; font-size: 1rem; font-weight: 500;">
+            💾 Save
+          </button>
+        </div>
+      </form>
+      
+      <hr style="margin: 2rem 0; border: none; border-top: 1px solid var(--border);" />
+      
+      <div style="text-align: center;">
+        <button type="button" onclick="deleteModelFromSettings()" style="padding: 0.75rem 1.5rem; border: 1px solid var(--danger); border-radius: 8px; background: transparent; color: var(--danger); cursor: pointer; font-size: 1rem; font-weight: 500; transition: all 0.2s;">
+          🗑️ Delete this model
+        </button>
+        <div style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.5rem;">
+          This action is irreversible
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const username = urlParams.get('username');
+    let currentSession = null;
+    let hlsPlayer = null;
+    let liveStreamLoaded = false; // Track if we loaded a live stream without recording
+
+    if (!username) {
+      window.location.href = '/';
+    }
+
+    // Wait for DOM to be loaded AND header to be injected
+    let initAttempts = 0;
+    const initInterval = setInterval(() => {
+      const modelNameEl = document.getElementById('modelName');
+      if (modelNameEl || initAttempts > 20) {
+        clearInterval(initInterval);
+        if (modelNameEl) {
+          modelNameEl.textContent = username;
+          // Launch initialization
+          initializePage();
+        }
+      }
+      initAttempts++;
+    }, 100);
+
+    // ============================================
+    // GLOBAL FUNCTIONS (called from HTML)
+    // ============================================
+    
+    // Variables to store internal functions
+    let loadRecordingsFunc = null;
+    let getWatchProgressFunc = null;
+    let saveWatchProgressFunc = null;
+    
+    // Switch between tabs
+    window.switchTab = function(tabName, event) {
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+      
+      // If called from tab button, activate the button
+      if (event && event.target) {
+        event.target.classList.add('active');
+      } else {
+        // Otherwise, find and activate the right button
+        const buttons = document.querySelectorAll('.tab-btn');
+        buttons.forEach((btn, index) => {
+          if ((tabName === 'live' && index === 0) || (tabName === 'recordings' && index === 1)) {
+            btn.classList.add('active');
+          }
+        });
+      }
+      
+      document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+      document.getElementById(`tab-${tabName}`).classList.add('active');
+      if (tabName === 'recordings' && loadRecordingsFunc) {
+        loadRecordingsFunc();
+      }
+    };
+    
+    // Open settings modal
+    window.openSettingsModal = async function() {
+      try {
+        const res = await fetch('/api/models');
+        if (res.ok) {
+          const data = await res.json();
+          const model = data.models.find(m => m.username === username);
+          if (model) {
+            document.getElementById('settingsQuality').value = model.recordQuality || 'best';
+            document.getElementById('settingsRetention').value = model.retentionDays || 30;
+            document.getElementById('settingsAutoRecord').checked = model.autoRecord !== false;
+          }
+        }
+      } catch (e) {
+        console.error('Error loading settings:', e);
+      }
+      document.getElementById('settingsModal').style.display = 'flex';
+    };
+    
+    // Close settings modal
+    window.closeSettingsModal = function() {
+      document.getElementById('settingsModal').style.display = 'none';
+    };
+    
+    // Save settings
+    window.saveSettings = async function(e) {
+      e.preventDefault();
+      const quality = document.getElementById('settingsQuality').value;
+      const retention = parseInt(document.getElementById('settingsRetention').value);
+      const autoRecord = document.getElementById('settingsAutoRecord').checked;
+      
+      try {
+        const res = await fetch(`/api/models/${username}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ recordQuality: quality, retentionDays: retention, autoRecord })
+        });
+        if (res.ok) {
+          showNotification('Settings saved', 'success');
+          closeSettingsModal();
+        } else {
+          showNotification('Save failed', 'error');
+        }
+      } catch (e) {
+        showNotification('Connection error', 'error');
+      }
+    };
+    
+    // Delete from modal
+    window.deleteModelFromSettings = async function() {
+      if (!confirm(`Delete ${username} from your list?`)) return;
+      try {
+        const res = await fetch(`/api/models/${username}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification('Model deleted', 'success');
+          closeSettingsModal();
+          setTimeout(() => window.location.href = '/', 1000);
+        }
+      } catch (e) {
+        showNotification('Delete failed', 'error');
+      }
+    };
+    
+    // Play recording (will be defined later in initializePage)
+    window.playRecording = null;
+    
+    // Delete recording (will be defined later in initializePage)
+    window.deleteRecording = null;
+
+    function initializePage() {
+
+    // Get model status
+    async function updateModelStatus() {
+      try {
+        // Get active sessions
+        const res = await fetch('/api/status');
+        const sessions = await res.json();
+        const session = sessions.find(s => s.person === username);
+
+        // Get online status
+        const statusRes = await fetch(`/api/model/${username}/status`);
+        const modelInfo = statusRes.ok ? await statusRes.json() : { isOnline: false };
+
+        if (session && session.running) {
+          const wasRecording = currentSession && currentSession.id === session.id;
+          currentSession = session;
+          liveStreamLoaded = false; // Reset since we have a recording session
+          
+          console.log('📊 Session found:', session);
+          console.log('📺 Playback URL:', session.playback_url);
+          console.log('🔄 Was already recording:', wasRecording);
+          
+          document.getElementById('statusDot').className = 'status-dot recording';
+          document.getElementById('statusText').textContent = 'Recording';
+          
+          // Load stream ONLY if it wasn't already running
+          if (!wasRecording) {
+            console.log('▶️ Loading stream...');
+            loadStream(session.playback_url);
+          } else {
+            console.log('⏭️ Stream already loaded, skip');
+          }
+        } else if (modelInfo.isOnline) {
+          currentSession = null;
+          document.getElementById('statusDot').className = 'status-dot online';
+          document.getElementById('statusText').textContent = 'Live (Watching)';
+          
+          // Charger le stream live même sans enregistrement (une seule fois)
+          if (!liveStreamLoaded) {
+            console.log('🔴 Model is live, loading stream...');
+            try {
+              const streamRes = await fetch(`/api/model/${username}/stream`);
+              if (streamRes.ok) {
+                const streamData = await streamRes.json();
+                console.log('📺 Stream URL:', streamData.streamUrl);
+                loadStream(streamData.streamUrl);
+                liveStreamLoaded = true; // Mark as loaded
+              } else {
+                console.log('⚠️ Could not load stream:', streamRes.status);
+              }
+            } catch (e) {
+              console.error('❌ Error loading live stream:', e);
+            }
+          } else {
+            console.log('⏭️ Live stream already loaded, skip');
+          }
+        } else {
+          currentSession = null;
+          liveStreamLoaded = false; // Reset when offline
+          document.getElementById('statusDot').className = 'status-dot offline';
+          document.getElementById('statusText').textContent = 'Offline';
+        }
+      } catch (e) {
+        console.error('Status error:', e);
+      }
+    }
+
+    // Toggle recording
+    async function toggleRecording() {
+      if (currentSession) {
+        // Stop
+        try {
+          const res = await fetch(`/api/stop/${currentSession.id}`, { method: 'POST' });
+          if (res.ok) {
+            showNotification('Recording stopped');
+            await updateModelStatus();
+            updateManualRecordButton();
+          }
+        } catch (e) {
+          showNotification('Error stopping', 'error');
+        }
+      } else {
+        // Start
+        try {
+          const res = await fetch('/api/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              target: username,
+              source_type: 'chaturbate',
+              person: username,
+              name: username
+            })
+          });
+          
+          if (res.ok) {
+            const data = await res.json();
+            showNotification('Recording started!');
+            await updateModelStatus();
+            updateManualRecordButton();
+          } else if (res.status === 409) {
+            // Session already running, load stream anyway
+            console.log('⏭️ Session already running, loading stream...');
+            await updateModelStatus();
+            updateManualRecordButton();
+          } else {
+            const error = await res.json();
+            showNotification(error.detail || 'Error', 'error');
+          }
+        } catch (e) {
+          showNotification('Error starting', 'error');
+        }
+      }
+    }
+
+    // Load stream with retry if manifest not ready yet
+    async function loadStream(url) {
+      console.log('🎬 Loading stream:', url);
+      const video = document.getElementById('player');
+      
+      // Wait for manifest to be available (max 10 attempts)
+      let retries = 10;
+      while (retries > 0) {
+        try {
+          const checkResponse = await fetch(url, { method: 'HEAD' });
+          if (checkResponse.ok) {
+            console.log('✅ Manifest available');
+            break;
+          }
+        } catch (e) {
+          console.log(`⏳ Manifest not yet available, waiting... (${retries} attempts remaining)`);
+        }
+        retries--;
+        if (retries > 0) {
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+        }
+      }
+      
+      if (retries === 0) {
+        console.error('❌ Manifest still unavailable after 10 seconds');
+        showNotification('Stream unavailable, try again in a few seconds', 'error');
+        return;
+      }
+      
+      // Mark container as having video
+      const playerContainer = document.querySelector('.player-container');
+      if (playerContainer) {
+        playerContainer.classList.add('has-video');
+      }
+      
+      // Show theater mode button
+      const theaterBtn = document.getElementById('theaterBtn');
+      if (theaterBtn) {
+        theaterBtn.style.display = 'flex';
+      }
+      
+      // Setup volume management
+      setupVolumeManagement();
+      
+      if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        console.log('📱 Using native player');
+        video.src = url;
+        video.muted = true; // Muted
+        // Auto-start
+        video.play().catch(e => {
+          console.log('Autoplay blocked');
+          showNotification('Click ▶️ to play', 'info');
+        });
+      } else if (window.Hls && window.Hls.isSupported()) {
+        console.log('🎥 Using HLS.js');
+        if (hlsPlayer) {
+          hlsPlayer.destroy();
+        }
+        hlsPlayer = new Hls({ 
+          debug: false,
+          enableWorker: false,
+          capLevelToPlayerSize: false,  // Don't limit quality to player size
+        });
+        
+        // HLS error handling
+        hlsPlayer.on(Hls.Events.ERROR, (event, data) => {
+          console.error('❌ HLS Error:', data);
+          console.error('Type:', data.type, 'Fatal:', data.fatal, 'Details:', data.details);
+          
+          // Show error to user
+          const errorMsg = `HLS Error: ${data.details} (${data.type})`;
+          showNotification(errorMsg, 'error');
+          
+          if (data.fatal) {
+            switch(data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                console.log('🔄 Network error, attempting recovery...');
+                showNotification('Network error, reconnecting...', 'info');
+                hlsPlayer.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                console.log('🔄 Media error, attempting recovery...');
+                showNotification('Media error, recovering...', 'info');
+                hlsPlayer.recoverMediaError();
+                break;
+              default:
+                console.error('💥 Fatal error, reloading...');
+                showNotification('Fatal error, reloading in 2s...', 'error');
+                hlsPlayer.destroy();
+                setTimeout(() => loadStream(url), 2000);
+                break;
+            }
+          }
+        });
+        
+        hlsPlayer.loadSource(url);
+        hlsPlayer.attachMedia(video);
+        
+        hlsPlayer.on(Hls.Events.MANIFEST_PARSED, () => {
+          console.log('✅ Manifest loaded, starting playback...');
+          
+          // FORCE BEST QUALITY IMMEDIATELY
+          if (hlsPlayer.levels.length > 0) {
+            const highestLevel = hlsPlayer.levels.length - 1;
+            hlsPlayer.currentLevel = highestLevel;  // Force immediately
+            hlsPlayer.loadLevel = highestLevel;  // Force loading
+            hlsPlayer.autoLevelCapping = highestLevel;  // Cap ceiling
+            hlsPlayer.startLevel = highestLevel;  // Start at max
+            console.log(`🎚️ Best quality forced: ${hlsPlayer.levels[highestLevel].height}p`);
+            showNotification(`Quality: ${hlsPlayer.levels[highestLevel].height}p (Max)`, 'success');
+          }
+          
+          // Show quality selector if multiple levels available
+          if (hlsPlayer.levels.length > 1) {
+            updateQualitySelector();
+          }
+          
+          // Muted for autoplay
+          video.muted = true;
+          // Auto-start
+          video.play().then(() => {
+            console.log('✅ Playback started (muted)');
+            showNotification('Playback started (click 🔊 to enable sound)', 'info');
+          }).catch(e => {
+            console.log('Autoplay blocked');
+            showNotification('Click ▶️ to play', 'info');
+          });
+        });
+        
+        hlsPlayer.on(Hls.Events.LEVEL_LOADED, (event, data) => {
+          console.log('✅ Level loaded:', data.level, 'Segments:', data.details.fragments.length);
+        });
+        
+        hlsPlayer.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+          console.log('🎚️ Quality changed:', data.level);
+          updateQualitySelector();
+        });
+        
+      } else {
+        console.error('HLS not supported by this browser');
+        showNotification('HLS not supported', 'error');
+      }
+    }
+
+    // Update quality selector
+    function updateQualitySelector() {
+      if (!hlsPlayer || hlsPlayer.levels.length <= 1) {
+        document.getElementById('qualitySelector').style.display = 'none';
+        return;
+      }
+      
+      const selector = document.getElementById('qualitySelector');
+      const select = document.getElementById('qualitySelect');
+      
+      // Clear options
+      select.innerHTML = '<option value="-1">🎯 Best</option>';
+      
+      // Add all available qualities
+      hlsPlayer.levels.forEach((level, index) => {
+        const height = level.height;
+        const bitrate = Math.round(level.bitrate / 1000);
+        const label = height ? `${height}p (${bitrate} kbps)` : `${bitrate} kbps`;
+        
+        const option = document.createElement('option');
+        option.value = index;
+        option.textContent = label;
+        
+        if (hlsPlayer.currentLevel === index) {
+          option.selected = true;
+        }
+        
+        select.appendChild(option);
+      });
+      
+      // Show selector
+      selector.style.display = 'flex';
+      
+      console.log(`🎚️ ${hlsPlayer.levels.length} qualities available`);
+    }
+    
+    // Change quality
+    function changeQuality(levelIndex) {
+      if (!hlsPlayer) return;
+      
+      const level = parseInt(levelIndex);
+      
+      if (level === -1) {
+        // Auto mode = Force best available quality
+        const highestLevel = hlsPlayer.levels.length - 1;
+        hlsPlayer.loadLevel = highestLevel;
+        hlsPlayer.autoLevelCapping = highestLevel;
+        const bestLevel = hlsPlayer.levels[highestLevel];
+        const label = bestLevel.height ? `${bestLevel.height}p` : `${Math.round(bestLevel.bitrate / 1000)} kbps`;
+        console.log(`🎚️ Auto mode: Best quality forced (${label})`);
+        showNotification(`Quality: Best (${label})`, 'info');
+      } else {
+        hlsPlayer.currentLevel = level;
+        const selectedLevel = hlsPlayer.levels[level];
+        const label = selectedLevel.height ? `${selectedLevel.height}p` : `${Math.round(selectedLevel.bitrate / 1000)} kbps`;
+        console.log(`🎚️ Quality selected: ${label}`);
+        showNotification(`Quality: ${label}`, 'info');
+      }
+    }
+    // Expose globally
+    window.changeQuality = changeQuality;
+
+    // Load recordings
+    async function loadRecordings() {
+      const list = document.getElementById('recordingsList');
+      const count = document.getElementById('recordingsCount');
+      
+      // Make globally accessible
+      loadRecordingsFunc = loadRecordings;
+      
+      try {
+        const res = await fetch(`/api/recordings/${username}`);
+        const data = await res.json();
+        
+        // Filter recordings: DO NOT show current one (today)
+        const today = new Date().toISOString().split('T')[0]; // Format YYYY-MM-DD
+        const recordings = (data.recordings || []).filter(rec => {
+          // If recording in progress for today, don't show it
+          if (currentSession && currentSession.running && rec.date === today) {
+            return false;
+          }
+          return true;
+        });
+        
+        if (recordings.length > 0) {
+          count.textContent = `${recordings.length} File${recordings.length > 1 ? 's' : ''}`;
+          
+          list.innerHTML = recordings.map(rec => {
+            const progress = getWatchProgress(rec.filename);
+            const progressPercent = progress ? Math.round((progress.position / progress.duration) * 100) : 0;
+            
+            // Format progress time
+            let progressTimeStr = '';
+            if (progress && progress.position > 0) {
+              const pos = Math.floor(progress.position);
+              const dur = Math.floor(progress.duration);
+              
+              const formatTime = (seconds) => {
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = seconds % 60;
+                if (h > 0) return `${h}h${m.toString().padStart(2, '0')}m`;
+                return `${m}m${s.toString().padStart(2, '0')}s`;
+              };
+              
+              progressTimeStr = `${formatTime(pos)} / ${formatTime(dur)}`;
+            }
+            
+            return `
+            <div class="recording-item">
+              <img 
+                src="${rec.thumbnail || '/api/recording-thumbnail/' + username + '/' + rec.date + '.jpg'}" 
+                alt="${rec.date}"
+                class="recording-thumbnail"
+                onerror="this.src='data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22160%22 height=%2290%22%3E%3Crect fill=%22%231a1f3a%22 width=%22160%22 height=%2290%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-size=%2214%22%3E📹%3C/text%3E%3C/svg%3E'"
+                onclick="playRecording('${rec.url}', '${rec.filename}')"
+              />
+              <div class="recording-info" onclick="playRecording('${rec.url}', '${rec.filename}')">
+                <div class="recording-title">📹 ${rec.date}</div>
+                <div class="recording-meta">
+                  ${rec.duration_str || ''} ${rec.duration_str ? '·' : ''} ${rec.size_mb} MB
+                </div>
+                ${progressPercent > 0 ? `
+                  <div class="watch-progress">
+                    <div class="progress-bar">
+                      <div class="progress-fill" style="width: ${progressPercent}%"></div>
+                    </div>
+                    <span class="progress-text">${progressTimeStr}</span>
+                  </div>
+                ` : ''}
+              </div>
+              <div class="recording-actions">
+                <button class="play-btn" onclick="event.stopPropagation(); playRecording('${rec.url}', '${rec.filename}')">▶️</button>
+                <button class="delete-btn" onclick="event.stopPropagation(); deleteRecording('${rec.filename}')">🗑️</button>
+              </div>
+            </div>
+          `;
+          }).join('');
+        } else {
+          list.innerHTML = `
+            <div class="empty-message">
+              <div class="icon">📂</div>
+              <p>No Recordings</p>
+              <p style="font-size: 0.85rem; margin-top: 0.5rem; opacity: 0.7;">Recordings will appear here</p>
+            </div>
+          `;
+          count.textContent = '0 files';
+        }
+      } catch (e) {
+        console.error('Error loading recordings:', e);
+        list.innerHTML = `
+          <div class="empty-message">
+            <div class="icon">⚠️</div>
+            <p>Loading error</p>
+          </div>
+        `;
+      }
+    }
+    
+    // Save playback progress
+    function saveWatchProgress(filename, position, duration) {
+      const key = `watch_progress_${username}_${filename}`;
+      localStorage.setItem(key, JSON.stringify({ position, duration, timestamp: Date.now() }));
+    }
+    saveWatchProgressFunc = saveWatchProgress; // Make accessible
+    
+    // Get playback progress
+    function getWatchProgress(filename) {
+      const key = `watch_progress_${username}_${filename}`;
+      const data = localStorage.getItem(key);
+      return data ? JSON.parse(data) : null;
+    }
+    getWatchProgressFunc = getWatchProgress; // Make accessible
+    
+    // Variable to track current recording
+    let currentRecordingFile = null;
+    
+    // Play a recording
+    function playRecording(url, filename) {
+      console.log('📹 Playing recording:', url);
+      
+      // SECURITY: Prevent playback of current day recording
+      const today = new Date().toISOString().split('T')[0];
+      const recordingDate = filename.replace('.ts', '');
+      
+      if (currentSession && currentSession.running && recordingDate === today) {
+        showNotification('⚠️ Recording in progress! Watch live instead of replay.', 'error');
+        switchTab('live');
+        return;
+      }
+      
+      const video = document.getElementById('player');
+      const container = document.querySelector('.player-container');
+      
+      // Stop HLS player if active
+      if (hlsPlayer) {
+        hlsPlayer.destroy();
+        hlsPlayer = null;
+      }
+      
+      // Hide quality selector (no HLS for replays)
+      document.getElementById('qualitySelector').style.display = 'none';
+      
+      currentRecordingFile = filename;
+      
+      // Show video container
+      container.classList.add('has-video');
+      
+      // Show theater mode button
+      const theaterBtn = document.getElementById('theaterBtn');
+      if (theaterBtn) {
+        theaterBtn.style.display = 'flex';
+      }
+      
+      // Setup volume management
+      setupVolumeManagement();
+      
+      // Load video directly
+      video.src = url;
+      video.load();  // Force loading
+      
+      // Resume at saved position
+      const progress = getWatchProgress(filename);
+      if (progress && progress.position > 10) {
+        video.addEventListener('loadedmetadata', () => {
+          video.currentTime = progress.position;
+          showNotification(`Resuming at ${Math.floor(progress.position / 60)}min ${Math.floor(progress.position % 60)}s`, 'info');
+        }, { once: true });
+      }
+      
+      // Start playback
+      video.play().catch(e => {
+        console.error('Playback error:', e);
+        showNotification('Click ▶️ to start playback', 'info');
+      });
+      
+      // Return to Live tab to see player
+      switchTab('live');
+      
+      showNotification('Loading replay...', 'info');
+    }
+    // Expose globally to use from HTML buttons
+    window.playRecording = playRecording;
+    
+    // Delete a recording
+    async function deleteRecording(filename) {
+      if (!confirm('Delete this recording?')) return;
+      try {
+        const res = await fetch(`/api/recordings/${username}/${filename}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification('Recording deleted', 'success');
+          const key = `watch_progress_${username}_${filename}`;
+          localStorage.removeItem(key);
+          loadRecordings();
+        } else {
+          showNotification('Error deleting', 'error');
+        }
+      } catch (e) {
+        console.error('Delete error:', e);
+        showNotification('Error deleting', 'error');
+      }
+    }
+    // Expose globally
+    window.deleteRecording = deleteRecording;
+
+    // Delete model
+    async function deleteModel() {
+      if (!confirm(`Really delete ${username} from your list?`)) {
+        return;
+      }
+      
+      try {
+        const res = await fetch(`/api/models/${username}`, {
+          method: 'DELETE'
+        });
+        
+        if (res.ok) {
+          showNotification('Model deleted');
+          setTimeout(() => window.location.href = '/', 1000);
+        } else {
+          showNotification('Error deleting', 'error');
+        }
+      } catch (e) {
+        console.error('Model delete error:', e);
+        showNotification('Connection error', 'error');
+      }
+    }
+
+    // Notification
+    function showNotification(message, type = 'success') {
+      const notif = document.createElement('div');
+      const bgColor = type === 'success' ? '#10b981' : '#ef4444';
+      notif.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        background: ${bgColor};
+        color: white;
+        padding: 1rem 1.5rem;
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        z-index: 9999;
+        font-weight: 500;
+      `;
+      notif.textContent = message;
+      document.body.appendChild(notif);
+      setTimeout(() => notif.remove(), 3000);
+    }
+
+    // ============================================
+    // Theater Mode
+    // ============================================
+    
+    window.toggleTheaterMode = function() {
+      const container = document.getElementById('playerContainer');
+      const btn = document.getElementById('theaterBtn');
+      const icon = document.getElementById('theaterIcon');
+      const text = document.getElementById('theaterText');
+      const qualitySelector = document.getElementById('qualitySelector');
+      
+      container.classList.toggle('theater-mode');
+      document.body.classList.toggle('theater-mode-active');
+      
+      if (container.classList.contains('theater-mode')) {
+        icon.textContent = '🪟';
+        text.textContent = 'Exit Theater';
+        if (qualitySelector) {
+          qualitySelector.classList.add('theater-mode');
+        }
+      } else {
+        icon.textContent = '🎬';
+        text.textContent = 'Theater Mode';
+        if (qualitySelector) {
+          qualitySelector.classList.remove('theater-mode');
+        }
+      }
+    };
+    
+    // Activate theater mode by default on page load
+    (function activateTheaterByDefault() {
+      const container = document.getElementById('playerContainer');
+      if (container && !container.classList.contains('theater-mode')) {
+        toggleTheaterMode();
+      }
+    })();
+
+    // Escape key to exit theater mode
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        const container = document.getElementById('playerContainer');
+        if (container && container.classList.contains('theater-mode')) {
+          toggleTheaterMode();
+        }
+      }
+    });
+    
+    // ============================================
+    // Live Player Controls (no seek bar)
+    // ============================================
+
+    window.liveTogglePlayPause = function() {
+      const video = document.getElementById('player');
+      const btn = document.getElementById('livePlayPauseBtn');
+      if (video.paused) {
+        video.play().catch(() => {});
+        btn.innerHTML = '&#9646;&#9646;';
+      } else {
+        video.pause();
+        btn.innerHTML = '&#9654;';
+      }
+    };
+
+    window.liveToggleMute = function() {
+      const video = document.getElementById('player');
+      const btn = document.getElementById('liveMuteBtn');
+      const slider = document.getElementById('liveVolumeSlider');
+      video.muted = !video.muted;
+      if (video.muted) {
+        btn.innerHTML = '&#128263;';
+        slider.value = 0;
+      } else {
+        btn.innerHTML = '&#128266;';
+        slider.value = video.volume;
+      }
+    };
+
+    window.liveChangeVolume = function(val) {
+      const video = document.getElementById('player');
+      const btn = document.getElementById('liveMuteBtn');
+      video.volume = parseFloat(val);
+      video.muted = (parseFloat(val) === 0);
+      btn.innerHTML = (video.muted || parseFloat(val) === 0) ? '&#128263;' : '&#128266;';
+      if (!video.muted && video.volume > 0) {
+        saveVolume(video.volume);
+      }
+    };
+
+    window.liveToggleFullscreen = function() {
+      const container = document.getElementById('playerContainer');
+      if (document.fullscreenElement) {
+        document.exitFullscreen();
+      } else {
+        container.requestFullscreen().catch(() => {});
+      }
+    };
+
+    // Sync play/pause button with video state + click to toggle
+    (function() {
+      const video = document.getElementById('player');
+      const btn = document.getElementById('livePlayPauseBtn');
+      video.addEventListener('play', () => { btn.innerHTML = '&#9646;&#9646;'; });
+      video.addEventListener('pause', () => { btn.innerHTML = '&#9654;'; });
+      video.addEventListener('click', () => { liveTogglePlayPause(); });
+    })();
+
+    // ============================================
+    // Volume Management (save & restore)
+    // ============================================
+    
+    // Save volume to localStorage
+    function saveVolume(volume) {
+      localStorage.setItem(`video_volume_${username}`, volume.toString());
+      console.log('💾 Volume saved:', volume);
+    }
+    
+    // Get saved volume (default 0.7 if not set)
+    function getSavedVolume() {
+      const saved = localStorage.getItem(`video_volume_${username}`);
+      return saved !== null ? parseFloat(saved) : 0.7;
+    }
+    
+    // Setup volume management on video player
+    function setupVolumeManagement() {
+      const video = document.getElementById('player');
+      const slider = document.getElementById('liveVolumeSlider');
+      const muteBtn = document.getElementById('liveMuteBtn');
+      if (!video) return;
+
+      // Get saved volume
+      const savedVolume = getSavedVolume();
+
+      // Set saved volume and start muted
+      video.volume = savedVolume;
+      video.muted = true;
+      if (slider) slider.value = 0;
+
+      let wasMuted = true;
+
+      // Listen for mute/unmute changes
+      video.addEventListener('volumechange', () => {
+        // User just unmuted
+        if (wasMuted && !video.muted) {
+          const currentSaved = getSavedVolume();
+          video.volume = currentSaved;
+          if (slider) slider.value = currentSaved;
+          if (muteBtn) muteBtn.innerHTML = '&#128266;';
+          console.log('🔊 Unmuted, restored volume to:', currentSaved);
+        }
+
+        // Save volume when user adjusts slider (only if unmuted)
+        if (!video.muted && video.volume > 0) {
+          saveVolume(video.volume);
+        }
+
+        // Sync slider and mute icon
+        if (slider) slider.value = video.muted ? 0 : video.volume;
+        if (muteBtn) muteBtn.innerHTML = (video.muted || video.volume === 0) ? '&#128263;' : '&#128266;';
+        
+        wasMuted = video.muted;
+      });
+      
+      console.log('🔊 Volume management ready. Saved volume:', savedVolume);
+    }
+
+    // NOTE: Auto-recording is now handled by the backend auto_record.py task
+    // This prevents forcing a recording when user just wants to watch live
+
+    // Save progress every 10 seconds
+    const video = document.getElementById('player');
+    setInterval(() => {
+      if (currentRecordingFile && video.currentTime > 0 && video.duration > 0) {
+        saveWatchProgress(currentRecordingFile, video.currentTime, video.duration);
+      }
+    }, 10000);
+    
+    // Also save on pause or leaving page
+    video.addEventListener('pause', () => {
+      if (currentRecordingFile && video.currentTime > 0 && video.duration > 0) {
+        saveWatchProgress(currentRecordingFile, video.currentTime, video.duration);
+      }
+    });
+    
+    window.addEventListener('beforeunload', () => {
+      if (currentRecordingFile && video.currentTime > 0 && video.duration > 0) {
+        saveWatchProgress(currentRecordingFile, video.currentTime, video.duration);
+      }
+    });
+
+    // Initialization
+    updateModelStatus();
+    loadRecordings();
+    
+    // Refresh every 10 seconds (less aggressive)
+    setInterval(updateModelStatus, 10000);
+    
+    } // End of initializePage()
+  </script>
+  
+  <div id="footer-placeholder"></div>
+</body>
+</html>

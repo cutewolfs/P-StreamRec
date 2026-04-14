@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - TZ=${TZ:-America/Toronto}
+    ports:
+      - "${FLARESOLVERR_PORT:-8191}:8191"
+    restart: unless-stopped
+
+  p-streamrec:
+    image: ghcr.io/raccommode/p-streamrec:latest
+    container_name: p-streamrec
+    depends_on:
+      - flaresolverr
+    environment:
+      - OUTPUT_DIR=/data
+      - PORT=${PORT:-8080}
+      - FFMPEG_PATH=ffmpeg
+      - HLS_TIME=${HLS_TIME:-4}
+      - HLS_LIST_SIZE=${HLS_LIST_SIZE:-6}
+      - CB_RESOLVER_ENABLED=${CB_RESOLVER_ENABLED:-true}
+      - AUTO_RECORD_USERS=${AUTO_RECORD_USERS:-}
+      # - CB_COOKIE=session=...; autre=...   # Optionnel
+      - PASSWORD=${PASSWORD:-}
+      - TZ=${TZ:-America/Toronto}
+      # Chaturbate Authentication
+      - CHATURBATE_USERNAME=${CHATURBATE_USERNAME:-}
+      - CHATURBATE_PASSWORD=${CHATURBATE_PASSWORD:-}
+      # FlareSolverr
+      - FLARESOLVERR_URL=${FLARESOLVERR_URL:-http://flaresolverr:8191}
+    ports:
+      - "${HOST_PORT:-8080}:${PORT:-8080}"
+    volumes:
+      - ${HOST_DATA_DIR:-./data}:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+/data/
+/data-dev/
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+.windsurf
+.claude/
+.env.dev
+docker-compose-dev.yml
