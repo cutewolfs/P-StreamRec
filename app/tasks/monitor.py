@@ -21,8 +21,22 @@ from ..core.config import OUTPUT_DIR
 MONITOR_INTERVAL = 30  # Vérifie toutes les 30 secondes
 THUMBNAIL_UPDATE_INTERVAL = 60  # Miniature mise à jour toutes les 60 secondes
 
-async def check_model_status(session: aiohttp.ClientSession, username: str, csrftoken: str = None) -> dict:
-    """Vérifie le statut d'un modèle via l'API Chaturbate"""
+async def check_model_status(
+    session: aiohttp.ClientSession,
+    username: str,
+    csrftoken: str = None,
+    auth_cookies: dict | None = None,
+) -> dict:
+    """Vérifie le statut d'un modèle via l'API Chaturbate.
+
+    Cookies priority:
+    1. ``auth_cookies`` (authenticated session stored in DB, injected by the
+       ChaturbateAuthService via the builtin plugin or monitor task)
+    2. ``CHATURBATE_*`` environment variables (legacy fallback)
+
+    Without auth cookies Chaturbate redirects ``/api/chatvideocontext/`` to the
+    login page and the check silently fails (see GH #11).
+    """
     try:
         url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
         headers = {
@@ -37,23 +51,26 @@ async def check_model_status(session: aiohttp.ClientSession, username: str, csrf
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-        
-        # Ajouter les cookies si disponibles
-        cookies = []
-        if csrftoken:
-            cookies.append(f"csrftoken={csrftoken}")
-        
-        # Récupérer les autres cookies depuis les variables d'environnement
-        affkey = os.getenv("CHATURBATE_AFFKEY")
-        sessionid = os.getenv("CHATURBATE_SESSIONID")
-        
-        if affkey:
-            cookies.append(f"affkey={affkey}")
-        if sessionid:
-            cookies.append(f"sessionid={sessionid}")
-        
+
+        cookies: dict[str, str] = {}
+
+        if auth_cookies:
+            cookies.update(auth_cookies)
+
+        if csrftoken and "csrftoken" not in cookies:
+            cookies["csrftoken"] = csrftoken
+
+        # Legacy env-var fallback: only fill slots the authenticated session did
+        # not already provide.
+        affkey_env = os.getenv("CHATURBATE_AFFKEY")
+        sessionid_env = os.getenv("CHATURBATE_SESSIONID")
+        if affkey_env and "affkey" not in cookies:
+            cookies["affkey"] = affkey_env
+        if sessionid_env and "sessionid" not in cookies:
+            cookies["sessionid"] = sessionid_env
+
         if cookies:
-            headers["Cookie"] = "; ".join(cookies)
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
         
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15), ssl=False) as response:
             if response.status == 200:
@@ -375,6 +392,7 @@ async def monitor_models_task(
     manager: 'FFmpegManager',
     ffmpeg_path: str = "ffmpeg",
     plugin_manager=None,
+    chaturbate_auth=None,
 ):
     """
     Tâche de monitoring en arrière-plan.
@@ -382,6 +400,10 @@ async def monitor_models_task(
     Pour chaque modèle, utilise le plugin correspondant (via le registry) pour
     vérifier son statut. Fallback sur check_model_status direct pour Chaturbate
     si le plugin manager n'est pas disponible (démarrage transitoire).
+
+    ``chaturbate_auth`` est le ChaturbateAuthService partagé ; quand fourni on
+    injecte ses cookies dans le fallback direct pour éviter le redirect login
+    (GH #11).
     """
     logger.background_task("monitor", "Démarrage du monitoring continu")
 
@@ -436,7 +458,17 @@ async def monitor_models_task(
                                 status = {'is_online': False, 'viewers': 0, 'hls_source': None}
                         else:
                             # Fallback direct Chaturbate (startup transitoire)
-                            status = await check_model_status(session, username, csrftoken)
+                            auth_cookies = (
+                                chaturbate_auth.get_cookies()
+                                if chaturbate_auth is not None
+                                else None
+                            )
+                            status = await check_model_status(
+                                session,
+                                username,
+                                csrftoken,
+                                auth_cookies=auth_cookies,
+                            )
                         
                         # Vérifier si en cours d'enregistrement
                         active_session = next(

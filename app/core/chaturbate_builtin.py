@@ -39,9 +39,15 @@ class ChaturbateBuiltinPlugin:
             official=True,
         )
         self._ctx: Optional[PluginContext] = None
+        self._auth_service = None  # ChaturbateAuthService, injecté par main
 
     def init(self, ctx: PluginContext) -> None:
         self._ctx = ctx
+
+    def set_auth_service(self, auth_service) -> None:
+        """Inject the authenticated Chaturbate session so check_status can use
+        the DB-backed cookies instead of env-var fallbacks (GH #11)."""
+        self._auth_service = auth_service
 
     def shutdown(self) -> None:
         pass
@@ -78,7 +84,6 @@ class ChaturbateBuiltinPlugin:
 
     async def check_status(self, username: str) -> ModelStatus:
         from ..tasks.monitor import check_model_status
-        from ..services.chaturbate_auth import ChaturbateAuthService  # noqa: F401
 
         # On ouvre une session dédiée pour respecter l'interface plugin
         # (le monitor_models_task pourra continuer à mutualiser sa session).
@@ -89,9 +94,23 @@ class ChaturbateBuiltinPlugin:
         except Exception:
             csrftoken = None
 
+        # Cookies issus de la session authentifiée (DB) si disponibles.
+        # Sans ça, l'API /api/chatvideocontext/ redirige vers le login et le
+        # check échoue systématiquement (GH #11).
+        auth_cookies = None
+        if self._auth_service is not None:
+            try:
+                cookies = self._auth_service.get_cookies()
+                if cookies:
+                    auth_cookies = cookies
+            except Exception:
+                auth_cookies = None
+
         async with aiohttp.ClientSession() as session:
             try:
-                data = await check_model_status(session, username, csrftoken)
+                data = await check_model_status(
+                    session, username, csrftoken, auth_cookies=auth_cookies
+                )
             except Exception as e:
                 raise PluginStatusError(
                     f"Échec check_status Chaturbate pour '{username}': {e}"

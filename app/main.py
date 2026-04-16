@@ -2369,6 +2369,10 @@ async def startup_event():
     cb_auth = ChaturbateAuthService(db, flaresolverr)
     await cb_auth.initialize()
 
+    # Expose the authenticated session to the builtin Chaturbate plugin so the
+    # model status monitor can reuse DB-backed cookies (GH #11).
+    chaturbate_builtin_plugin.set_auth_service(cb_auth)
+
     # Initialize Chaturbate API client
     global chaturbate_api
     cb_api = ChaturbateAPI(cb_auth, flaresolverr)
@@ -2415,7 +2419,7 @@ async def startup_event():
             logger.warning("Chaturbate auto-login failed", error=result.get("error"))
 
     # Démarrer les tâches de fond
-    asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, plugin_manager))
+    asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, plugin_manager, chaturbate_auth=cb_auth))
     asyncio.create_task(auto_record_task())
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))

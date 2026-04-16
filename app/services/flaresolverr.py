@@ -32,8 +32,10 @@ class FlareSolverrClient:
         """
         try:
             async with aiohttp.ClientSession() as session:
+                # FlareSolverr exposes no /health endpoint; the root "/" returns
+                # {"msg": "FlareSolverr is ready!", ...} when the service is up.
                 async with session.get(
-                    f"{self.base_url}/health",
+                    f"{self.base_url}/",
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status != 200:
