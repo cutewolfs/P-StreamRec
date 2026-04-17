@@ -4,7 +4,7 @@ name: P-StreamRec
 tagline: Automatic Chaturbate & m3u8 stream recorder
 icon: https://raw.githubusercontent.com/raccommode/P-StreamRec/main/p-streamrec-store-p-streamrec/icon.svg
 category: media
-version: "2026.16.10"
+version: "2026.16.11"
 port: 8080
 description: >-
   P-StreamRec is a self-hosted recorder for Chaturbate and any m3u8/HLS live stream, with a modern web interface.
