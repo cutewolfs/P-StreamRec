@@ -1972,14 +1972,13 @@ async def get_recordings_by_model(show_ts: bool = False):
     # Build a set of usernames that have recordings
     usernames_with_recordings = set()
 
-    # Only include models that have auto_record enabled (or are not tracked at all but have recordings)
+    # Any model with recordings is shown here, regardless of auto_record status.
+    # auto_record only controls whether NEW recordings are triggered; past
+    # recordings should never disappear from the list (GH #13).
     result = []
     for group in groups:
         username = group["username"]
         usernames_with_recordings.add(username)
-        # Skip models with auto_record explicitly disabled
-        if username in auto_record_map and not auto_record_map[username]:
-            continue
         thumb_url = f"/api/thumbnail/{username}"
         result.append({
             "username": username,
