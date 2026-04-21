@@ -12,11 +12,16 @@ function isPrivateRoomStatus(rs) {
 }
 
 let currentUsername = '';
+let currentSourceType = '';
 let isFollowing = false;
 let isAutoRecord = false;
 let isModelTracked = false;
 let hlsPlayer = null;
 let statusCheckInterval = null;
+
+function sourceQuery() {
+  return currentSourceType ? ('?source=' + encodeURIComponent(currentSourceType)) : '';
+}
 
 // ============================================
 // Extract username from URL
@@ -35,6 +40,15 @@ async function initWatch() {
   if (!currentUsername) {
     document.getElementById('watchUsername').textContent = 'Error: No username';
     return;
+  }
+
+  // Lit le source_type depuis l'URL (?source=cam4) pour les modèles qui ne
+  // sont pas encore dans le cache SQLite — évite le fallback par défaut vers
+  // Chaturbate qui marque les CAM4 comme Offline.
+  try {
+    currentSourceType = new URLSearchParams(window.location.search).get('source') || '';
+  } catch (e) {
+    currentSourceType = '';
   }
 
   document.title = currentUsername + ' - P-StreamRec';
@@ -56,7 +70,7 @@ async function initWatch() {
 // ============================================
 async function loadModelStatus() {
   try {
-    var res = await fetch('/api/model/' + currentUsername + '/status');
+    var res = await fetch('/api/model/' + currentUsername + '/status' + sourceQuery());
     if (!res.ok) return;
     var data = await res.json();
 
@@ -158,7 +172,7 @@ function formatPrivateText(rs) {
 // ============================================
 async function tryLoadStream() {
   try {
-    var res = await fetch('/api/model/' + currentUsername + '/stream');
+    var res = await fetch('/api/model/' + currentUsername + '/stream' + sourceQuery());
     if (!res.ok) return false;
     var data = await res.json();
     if (!data.streamUrl) return false;
@@ -176,7 +190,7 @@ async function tryLoadStream() {
 // ============================================
 async function startStream() {
   try {
-    var res = await fetch('/api/model/' + currentUsername + '/stream');
+    var res = await fetch('/api/model/' + currentUsername + '/stream' + sourceQuery());
     if (!res.ok) {
       console.error('Failed to get stream URL');
       return;
@@ -246,9 +260,14 @@ async function retryStream() {
 // ============================================
 // Follow status
 // ============================================
+function followBasePath() {
+  // Route vers le bon service selon la plateforme.
+  return currentSourceType === 'cam4' ? '/api/cam4' : '/api/chaturbate';
+}
+
 async function loadFollowStatus() {
   try {
-    var res = await fetch('/api/chaturbate/is-following/' + currentUsername);
+    var res = await fetch(followBasePath() + '/is-following/' + currentUsername);
     if (!res.ok) return;
     var data = await res.json();
     isFollowing = data.isFollowing;
@@ -281,8 +300,8 @@ async function toggleFollow() {
 
   try {
     var endpoint = isFollowing
-      ? '/api/chaturbate/unfollow/' + currentUsername
-      : '/api/chaturbate/follow/' + currentUsername;
+      ? followBasePath() + '/unfollow/' + currentUsername
+      : followBasePath() + '/follow/' + currentUsername;
 
     var res = await fetch(endpoint, { method: 'POST' });
     if (res.ok) {

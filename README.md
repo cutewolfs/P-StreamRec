@@ -4,22 +4,37 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
 [![Open Source](https://img.shields.io/badge/Open%20Source-Yes-green.svg)](https://github.com/raccommode/P-StreamRec)
 
-**Automatic Chaturbate & m3u8 stream recorder with a modern web interface.**
+**Watch, record, and follow live cam streams (Chaturbate, CAM4) + any m3u8 source — with a modern web interface.**
 
 ## Features
 
 - **24/7 automatic recording** — monitors models and records when they go live
 - **Auto MP4 conversion** — converts TS to compressed MP4 in background (50-70% smaller)
-- **Discover** — browse live Chaturbate models with gender, tag, and search filters
-- **Following** — sync and view your followed models from your Chaturbate account
+- **Discover** — browse live models from every supported site with gender, tag, and search filters
+- **Following** — one list aggregating your follows across Chaturbate and CAM4
 - **Recordings** — manage all recordings with built-in video player
 - **Live Watch** — watch streams directly in the browser with HLS player
-- **Chaturbate auth** — login for better stream quality and followed models sync
+- **Account login** — username/password for Chaturbate and CAM4 (better stream quality + follow sync)
 - **FlareSolverr** — automatic Cloudflare bypass via dedicated container
-- **Settings** — manage account, FlareSolverr status, tag blacklist
+- **Settings** — manage accounts, FlareSolverr status, tag blacklist
 - **Password protection** — optional login to secure the interface
 - **GitOps updates** — update the app directly from the UI
 - **Docker ready** — one command to get started
+
+## Supported sites
+
+| Site | Watch | Record | Follow |
+|------|:-----:|:------:|:------:|
+| **Chaturbate** | ✅ | ✅ | ✅ |
+| **CAM4** | ✅ | ✅ | ✅ |
+
+### Coming soon
+
+| Site | Watch | Record | Follow |
+|------|:-----:|:------:|:------:|
+| Stripchat | ⏳ | ⏳ | ⏳ |
+| BongaCams | ⏳ | ⏳ | ⏳ |
+| MyFreeCams | ⏳ | ⏳ | ⏳ |
 
 ## Screenshots
 
@@ -112,38 +127,6 @@ docker run -d --name p-streamrec \
 |--------|---------------|
 | TS (original) | ~2–4 GB |
 | MP4 (converted) | ~600 MB–1.2 GB |
-
-## Plugins
-
-P-StreamRec ships with a plugin system that lets you add new streaming sources without touching the core. Each source (Chaturbate, and any third-party ones) is an independent plugin with its own manifest and Python module.
-
-### How it works
-
-- **Chaturbate is a plugin** — it's bundled with the app under `plugins/chaturbate/` and auto-installed on first launch. You can disable or uninstall it like any other plugin.
-- **Installed plugins** live in `${OUTPUT_DIR}/plugins/<id>/`. Each one is sandboxed to its own folder and data namespace.
-- **Go to Settings → Plugins** to see what's installed, enable/disable, or uninstall.
-
-### Installing extra plugins (advanced)
-
-At the bottom of the Plugins tab, click **Advanced plugin options** to reveal:
-
-- **Plugin Catalog** — browse plugins from the official repository and any custom repositories you've added. Click **Install** next to a plugin, then restart the app when prompted.
-- **Plugin Repositories** — add a third-party index URL (HTTPS only) to make its plugins appear in the catalog.
-
-> **Security warning:** non-verified plugins execute arbitrary Python code with full access to your server. Only install plugins from authors you trust. The UI explicitly asks you to acknowledge this risk for non-official plugins.
-
-### Writing your own plugin
-
-A plugin is a Python package implementing the `SourcePlugin` protocol — see [app/core/plugin_base.py](app/core/plugin_base.py) for the contract (`resolve()`, `check_status()`, `validate_target()`, manifest schema). A plugin folder contains:
-
-```
-my-plugin/
-├── manifest.json    # id, name, version, api_version, source_type, capabilities
-├── __init__.py      # must expose `plugin` (an instance of your class)
-└── plugin.py        # your implementation
-```
-
-To publish, host an `index.json` catalog (see [plugins/index.json](plugins/index.json) for the schema) pointing to a `.tar.gz` archive of your plugin, and share the index URL with users.
 
 ## Development
 

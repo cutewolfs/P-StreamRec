@@ -10,7 +10,6 @@
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
   <script defer src="/static/settings.js"></script>
-  <script defer src="/static/plugins.js"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -25,6 +24,10 @@
           <span class="settings-nav-icon">&#128100;</span>
           <span>Chaturbate</span>
         </button>
+        <button class="settings-nav-item" data-tab="cam4">
+          <span class="settings-nav-icon">&#128101;</span>
+          <span>CAM4</span>
+        </button>
         <button class="settings-nav-item" data-tab="flaresolverr">
           <span class="settings-nav-icon">&#128737;</span>
           <span>FlareSolverr</span>
@@ -32,10 +35,6 @@
         <button class="settings-nav-item" data-tab="tags">
           <span class="settings-nav-icon">&#127991;</span>
           <span>Tags</span>
-        </button>
-        <button class="settings-nav-item" data-tab="plugins">
-          <span class="settings-nav-icon">&#129513;</span>
-          <span>Plugins</span>
         </button>
         <button class="settings-nav-item" data-tab="recording">
           <span class="settings-nav-icon">&#9881;</span>
@@ -96,6 +95,47 @@
           </div>
         </div>
 
+        <!-- CAM4 Tab -->
+        <div class="settings-tab" id="tab-cam4">
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <span class="icon">&#128101;</span>
+              <h3>CAM4 Account</h3>
+            </div>
+            <div class="settings-section-body">
+              <div class="settings-row">
+                <span class="settings-row-label">Status</span>
+                <span class="status-indicator unknown" id="cam4Status">Checking...</span>
+              </div>
+              <div class="settings-row" id="cam4UsernameRow" style="display: none;">
+                <span class="settings-row-label">Username</span>
+                <span class="settings-row-value" id="cam4Username">-</span>
+              </div>
+
+              <div id="cam4LoginForm" style="margin-top: 1.5rem; display: none;">
+                <form class="settings-form" onsubmit="loginCam4(event)">
+                  <div class="form-group">
+                    <label for="cam4User">Username</label>
+                    <input type="text" id="cam4User" placeholder="Your CAM4 username" autocomplete="username" required />
+                  </div>
+                  <div class="form-group">
+                    <label for="cam4Pass">Password</label>
+                    <input type="password" id="cam4Pass" placeholder="Your CAM4 password" autocomplete="current-password" required />
+                  </div>
+                  <div class="settings-actions">
+                    <button type="submit" class="btn-primary" id="cam4LoginBtn">Log In</button>
+                  </div>
+                </form>
+              </div>
+
+              <div id="cam4LoggedInActions" style="margin-top: 1rem; display: none;">
+                <button class="btn-primary" onclick="syncCam4Following()" style="font-size: 0.9rem; padding: 0.6rem 1.25rem; margin-right: 0.5rem;">Sync Favorites</button>
+                <button class="btn-secondary" onclick="logoutCam4()" style="font-size: 0.9rem; padding: 0.6rem 1.25rem;">Disconnect Account</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- FlareSolverr Tab -->
         <div class="settings-tab" id="tab-flaresolverr">
           <div class="settings-section">
@@ -147,82 +187,6 @@
                 <button class="btn-primary" onclick="addBlacklistedTag()" style="padding: 0.6rem 1.25rem; font-size: 0.9rem;">Add</button>
               </div>
               <div class="blacklisted-tags-list" id="blacklistedTagsList" style="margin-top: 1rem; display: flex; flex-wrap: wrap; gap: 0.5rem;"></div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Plugins Tab -->
-        <div class="settings-tab" id="tab-plugins">
-          <!-- Section: Installed -->
-          <div class="settings-section">
-            <div class="settings-section-header">
-              <span class="icon">&#129513;</span>
-              <h3>Installed Plugins</h3>
-              <button class="btn-secondary" onclick="refreshPlugins()" style="margin-left: auto; padding: 0.35rem 0.8rem; font-size: 0.8rem;">Refresh</button>
-            </div>
-            <div class="settings-section-body">
-              <div id="installedPluginsList">
-                <p style="color: var(--text-muted); font-size: 0.9rem;">Loading...</p>
-              </div>
-              <div id="restartBanner" style="display: none; margin-top: 1rem; padding: 0.9rem 1rem; background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); border-radius: 10px; color: #f59e0b; display: none; align-items: center; justify-content: space-between; gap: 1rem;">
-                <span>Changes require a restart to take effect.</span>
-                <button class="btn-primary" onclick="restartForPlugins()" style="padding: 0.5rem 1rem; font-size: 0.85rem;">Restart Now</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- Advanced toggle -->
-          <div style="margin-top: 2rem; text-align: center;">
-            <button type="button" id="toggleAdvancedPlugins" onclick="togglePluginAdvanced()" style="background: none; border: none; color: var(--text-muted); font-size: 0.85rem; cursor: pointer; padding: 0.4rem 0.8rem;">
-              <span id="toggleAdvancedPluginsLabel">Advanced plugin options</span> <span id="toggleAdvancedPluginsCaret">&#9662;</span>
-            </button>
-          </div>
-
-          <!-- Advanced area (hidden by default) -->
-          <div id="advancedPluginsArea" style="display: none;">
-            <!-- Section: Catalog -->
-            <div class="settings-section" style="margin-top: 1rem;">
-              <div class="settings-section-header">
-                <span class="icon">&#128230;</span>
-                <h3>Plugin Catalog</h3>
-                <select id="repoFilter" onchange="loadCatalog()" style="margin-left: auto; padding: 0.4rem 0.75rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-primary); font-size: 0.85rem;">
-                  <option value="">All repositories</option>
-                </select>
-              </div>
-              <div class="settings-section-body">
-                <p style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; margin-bottom: 1rem;">
-                  Browse plugins from the official and custom repositories. Non-verified plugins run arbitrary code &mdash; install only what you trust.
-                </p>
-                <div id="pluginCatalog" class="plugin-grid">
-                  <p style="color: var(--text-muted); font-size: 0.9rem;">Loading catalog...</p>
-                </div>
-              </div>
-            </div>
-
-            <!-- Section: Repositories -->
-            <div class="settings-section" style="margin-top: 1.5rem;">
-              <div class="settings-section-header">
-                <span class="icon">&#128214;</span>
-                <h3>Plugin Repositories</h3>
-              </div>
-              <div class="settings-section-body">
-                <div id="reposList" style="display: flex; flex-direction: column; gap: 0.5rem;">
-                  <p style="color: var(--text-muted); font-size: 0.9rem;">Loading...</p>
-                </div>
-                <form class="settings-form" onsubmit="addRepo(event)" style="margin-top: 1.25rem; display: flex; flex-direction: column; gap: 0.75rem;">
-                  <div class="form-group">
-                    <label for="newRepoName">Repository Name</label>
-                    <input type="text" id="newRepoName" placeholder="My Custom Repo" required />
-                  </div>
-                  <div class="form-group">
-                    <label for="newRepoUrl">Index URL (index.json)</label>
-                    <input type="url" id="newRepoUrl" placeholder="https://example.com/index.json" required />
-                  </div>
-                  <div class="settings-actions">
-                    <button type="submit" class="btn-primary" style="padding: 0.6rem 1.25rem; font-size: 0.9rem;">Add Repository</button>
-                  </div>
-                </form>
-              </div>
             </div>
           </div>
         </div>

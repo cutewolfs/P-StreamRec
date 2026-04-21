@@ -113,16 +113,54 @@ class ChaturbateAPI:
                     logger.error("Request error", url=url, error=str(e))
                     return None
 
+    async def check_status(self, username: str) -> Dict[str, Any]:
+        """Statut Chaturbate d'un username. Renvoie un dict normalisé.
+
+        Utilise le chaturbate_auth du service pour fournir des cookies
+        authentifiés à monitor.check_model_status().
+        """
+        from ..tasks.monitor import check_model_status
+
+        csrftoken = None
+        try:
+            csrftoken = self.auth.get_cookies().get("csrftoken")
+        except Exception:
+            csrftoken = None
+
+        auth_cookies = None
+        try:
+            cookies = self.auth.get_cookies()
+            if cookies:
+                auth_cookies = cookies
+        except Exception:
+            auth_cookies = None
+
+        async with aiohttp.ClientSession() as session:
+            data = await check_model_status(
+                session, username, csrftoken, auth_cookies=auth_cookies
+            )
+        return {
+            "is_online": bool(data.get("is_online", False)),
+            "viewers": int(data.get("viewers", 0) or 0),
+            "hls_source": data.get("hls_source"),
+            "room_status": data.get("room_status"),
+        }
+
     async def get_live_models(
         self,
         page: int = 1,
         limit: int = 24,
         gender: str = "",
-        search: str = ""
+        search: str = "",
+        tag: str = ""
     ) -> Dict[str, Any]:
         """
         Fetch live models from Chaturbate.
         Uses the roomlist API or scrapes the homepage.
+
+        tag: filter by a single tag via the native API (e.g. "french", "18").
+             Le filtrage natif est crucial : sans ça le total_count reflète
+             l'ensemble et la pagination calculée côté backend est fausse.
         """
         try:
             # Try the internal API first
@@ -141,8 +179,14 @@ class ChaturbateAPI:
                 g = gender_map.get(gender.lower(), "")
                 if g:
                     api_url += f"&genders={g}"
-            if search:
-                api_url += f"&keywords={search}"
+            # Chaturbate n'a pas de paramètre `tag` dédié sur cet endpoint; le
+            # seul moyen de filtrer est `keywords` (recherche full-text, qui
+            # matche sur les tags et le subject). Si on a un tag, on le
+            # concatène au search dans keywords.
+            combined_keywords = " ".join(x for x in (tag, search) if x).strip()
+            if combined_keywords:
+                from urllib.parse import quote_plus
+                api_url += f"&keywords={quote_plus(combined_keywords)}"
 
             resp = await self._request("GET", api_url)
 
@@ -154,6 +198,7 @@ class ChaturbateAPI:
 
                     models = []
                     for room in rooms:
+                        room_status = room.get("current_show") or room.get("room_status") or "public"
                         models.append({
                             "username": room.get("username", ""),
                             "display_name": room.get("display_name", ""),
@@ -164,6 +209,7 @@ class ChaturbateAPI:
                             "gender": room.get("gender", ""),
                             "is_online": True,
                             "tags": room.get("tags", []),
+                            "room_status": room_status,
                         })
 
                     total_pages = max(1, (total + limit - 1) // limit)

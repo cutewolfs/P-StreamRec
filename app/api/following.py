@@ -23,20 +23,29 @@ def init(chaturbate_api, auth_service, db):
 
 @router.get("/following")
 async def get_following():
-    """
-    Get followed models with online status and isTracked flag.
-    Requires Chaturbate login.
-    """
-    if not _auth_service:
-        # Service pas encore initialisé : retourner une liste vide plutôt qu'une 500
-        # (évite que le frontend casse pendant le startup)
-        return {"models": [], "isLoggedIn": False, "message": "Initializing"}
-
+    """Returns all followed models (Chaturbate + CAM4 + autres plugins) avec
+    statut online et flag isTracked."""
     try:
-        status = _auth_service.get_status()
-        is_logged_in = bool(status.get("isLoggedIn"))
+        # Login status par source (utilisé par le frontend pour afficher les
+        # bons boutons "se connecter" / "synchroniser").
+        per_source_logins: dict = {}
+        any_logged_in = False
+        if _auth_service:
+            cb_status = _auth_service.get_status()
+            per_source_logins["chaturbate"] = bool(cb_status.get("isLoggedIn"))
+            any_logged_in = per_source_logins["chaturbate"] or any_logged_in
 
-        # Lire le cache local même sans login : évite un affichage vide intermittent
+        # CAM4 status (lazy import pour éviter les cycles)
+        try:
+            from .. import main as app_main  # type: ignore
+            cam4_svc = getattr(app_main, "cam4_auth_service", None)
+            if cam4_svc is not None:
+                per_source_logins["cam4"] = bool(cam4_svc.get_status().get("isLoggedIn"))
+                any_logged_in = per_source_logins["cam4"] or any_logged_in
+        except Exception:
+            pass
+
+        # Lire le cache local de tous les follows (toutes sources confondues)
         followed = []
         tracked_map = {}
         if _db:
@@ -53,11 +62,15 @@ async def get_following():
             tracked = tracked_map.get(model["username"])
             model["isTracked"] = tracked is not None
             model["is_recording"] = bool(tracked and tracked.get("is_recording"))
-            # Surface the cached Chaturbate room_status from the tracked model so
-            # the UI can distinguish "Private" from "Offline" on the following page.
+            # Surface cached room_status for UI (distinguer Private d'Offline)
             if tracked and tracked.get("room_status"):
                 model["room_status"] = tracked.get("room_status")
-            model["source_type"] = (tracked.get("source_type") if tracked else None) or "chaturbate"
+            # Priorité: source_type sur la ligne followed > modèle tracké > chaturbate
+            model["source_type"] = (
+                model.get("source_type")
+                or (tracked.get("source_type") if tracked else None)
+                or "chaturbate"
+            )
 
         online = [m for m in followed if m.get("is_online")]
         offline = [m for m in followed if not m.get("is_online")]
@@ -68,8 +81,9 @@ async def get_following():
             "offline": offline,
             "onlineCount": len(online),
             "offlineCount": len(offline),
-            "isLoggedIn": is_logged_in,
-            "message": None if is_logged_in else "Login required to view followed models",
+            "isLoggedIn": any_logged_in,
+            "perSource": per_source_logins,
+            "message": None if any_logged_in else "Login required to view followed models",
         }
     except Exception as e:
         # Ne jamais renvoyer 500 sur cet endpoint : le front s'affiche mieux avec une
@@ -82,6 +96,7 @@ async def get_following():
             "onlineCount": 0,
             "offlineCount": 0,
             "isLoggedIn": False,
+            "perSource": {},
             "message": "Temporary error, retrying...",
         }
 

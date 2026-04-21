@@ -1,13 +1,22 @@
 """
-API Router: Discover live models
+API Router: Discover live models.
+
+Agrège Chaturbate + CAM4 (deux sources intégrées). Le premier tag est envoyé
+aux API natives (filtrage côté source), les tags supplémentaires et la
+blacklist sont appliqués localement. L'interleave round-robin empêche un
+catalogue plus gros (Chaturbate ~7000) d'écraser le plus petit (CAM4 ~60).
 """
 
+import asyncio
+from typing import Any, Dict, List, Optional
+
 from fastapi import APIRouter, Query
-from typing import Optional, List
+
+from ..logger import logger
+from ..services import cam4_source
 
 router = APIRouter(prefix="/api", tags=["discover"])
 
-# Set by main.py at startup
 _chaturbate_api = None
 _db = None
 
@@ -18,6 +27,48 @@ def init(chaturbate_api, db):
     _db = db
 
 
+async def _fetch_chaturbate(
+    page: int,
+    limit: int,
+    gender: Optional[str],
+    search: Optional[str],
+    first_tag: str,
+) -> Optional[Dict[str, Any]]:
+    if _chaturbate_api is None:
+        return None
+    try:
+        return await _chaturbate_api.get_live_models(
+            page=page,
+            limit=limit,
+            gender=gender or "",
+            search=search or "",
+            tag=first_tag,
+        )
+    except Exception as e:
+        logger.warning("Discover Chaturbate échec", error=str(e))
+        return None
+
+
+async def _fetch_cam4(
+    page: int,
+    limit: int,
+    gender: Optional[str],
+    search: Optional[str],
+    tags: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    try:
+        return await cam4_source.list_live_models(
+            page=page,
+            limit=limit,
+            gender=gender,
+            search=search,
+            tags=tags,
+        )
+    except Exception as e:
+        logger.warning("Discover CAM4 échec", error=str(e))
+        return None
+
+
 @router.get("/discover")
 async def discover_models(
     page: int = Query(1, ge=1),
@@ -26,67 +77,94 @@ async def discover_models(
     search: Optional[str] = Query(None),
     tags: Optional[str] = Query(None),
 ):
-    """
-    Get live models from Chaturbate.
-    Works without login (unauthenticated scraping), enhanced with login.
-    Supports tag filtering (comma-separated) and blacklist from settings.
-    """
-    if not _chaturbate_api:
-        return {
-            "models": [],
-            "total": 0,
-            "page": page,
-            "limit": limit,
-            "total_pages": 1,
-        }
-
-    result = await _chaturbate_api.get_live_models(
-        page=page,
-        limit=limit,
-        gender=gender or "",
-        search=search or ""
-    )
-
-    # Parse included tags filter
-    included_tags = []
+    """Liste agrégée Chaturbate + CAM4 (rooms publiques uniquement)."""
+    included_tags: List[str] = []
     if tags:
         included_tags = [t.strip().lower() for t in tags.split(",") if t.strip()]
+    first_tag = included_tags[0] if included_tags else ""
+    extra_tags = included_tags[1:] if len(included_tags) > 1 else []
 
-    # Get blacklisted tags from settings
-    blacklisted_tags = []
+    n_sources = 2  # chaturbate + cam4
+    per_source_limit = max(1, (limit + n_sources - 1) // n_sources)
+
+    cb_result, cam4_result = await asyncio.gather(
+        _fetch_chaturbate(page, per_source_limit, gender, search, first_tag),
+        _fetch_cam4(page, per_source_limit, gender, search, included_tags or None),
+    )
+
+    blacklisted_tags: List[str] = []
     if _db:
-        blacklisted_tags = await _db.get_blacklisted_tags()
+        try:
+            blacklisted_tags = await _db.get_blacklisted_tags()
+        except Exception:
+            blacklisted_tags = []
+    blacklisted_set = {t.lower() for t in blacklisted_tags}
 
-    # Filter models by tags
-    models = result.get("models", [])
-    if included_tags or blacklisted_tags:
-        filtered = []
-        for model in models:
-            model_tags = [t.lower() for t in model.get("tags", [])]
-
-            # Check blacklist: skip if any blacklisted tag is present
-            if blacklisted_tags and any(bt in model_tags for bt in blacklisted_tags):
+    def _filter_list(result: Optional[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+        if result is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in result.get("models", []):
+            # Room status (public par défaut pour Chaturbate qui renseigne
+            # current_show). On n'exclut QUE les rooms non publiques.
+            rs = (item.get("room_status") or "public").lower()
+            if rs != "public" or not item.get("is_online", True):
                 continue
-
-            # Check included tags: keep only if all included tags are present
-            if included_tags and not all(it in model_tags for it in included_tags):
+            item_tags_lower = [t.lower() for t in (item.get("tags") or [])]
+            if blacklisted_set and any(bt in item_tags_lower for bt in blacklisted_set):
                 continue
+            if extra_tags and not all(t in item_tags_lower for t in extra_tags):
+                continue
+            item = dict(item)
+            item["source_type"] = source
+            out.append(item)
+        return out
 
-            filtered.append(model)
-        models = filtered
-        result["models"] = models
-        result["total"] = len(models)
+    cb_items = _filter_list(cb_result, "chaturbate")
+    cam4_items = _filter_list(cam4_result, "cam4")
 
-    # Add isFollowed and isTracked flags
+    plugin_totals = []
+    plugin_total_pages = []
+    for r in (cb_result, cam4_result):
+        if r is None:
+            continue
+        plugin_totals.append(int(r.get("total") or 0))
+        plugin_total_pages.append(int(r.get("total_pages") or 1))
+
+    # Interleave round-robin pour mélanger les deux sources.
+    combined: List[Dict[str, Any]] = []
+    iters = [iter(cam4_items), iter(cb_items)]
+    while len(combined) < limit and any(iters):
+        next_iters = []
+        for it in iters:
+            try:
+                combined.append(next(it))
+                if len(combined) >= limit:
+                    break
+                next_iters.append(it)
+            except StopIteration:
+                continue
+        iters = next_iters
+
+    total_combined = sum(plugin_totals)
+    total_pages = max(plugin_total_pages) if plugin_total_pages else 1
+
     if _db:
-        tracked_models = await _db.get_all_models()
-        tracked_set = {m["username"] for m in tracked_models}
+        try:
+            tracked_models = await _db.get_all_models()
+            tracked_set = {m["username"] for m in tracked_models}
+            followed_models = await _db.get_all_followed()
+            followed_set = {m["username"] for m in followed_models}
+            for model in combined:
+                model["isTracked"] = model["username"] in tracked_set
+                model["isFollowed"] = model["username"] in followed_set
+        except Exception:
+            pass
 
-        followed_models = await _db.get_all_followed()
-        followed_set = {m["username"] for m in followed_models}
-
-        for model in result.get("models", []):
-            model["isTracked"] = model["username"] in tracked_set
-            model["isFollowed"] = model["username"] in followed_set
-
-    return result
+    return {
+        "models": combined,
+        "total": total_combined,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+    }

@@ -28,12 +28,12 @@ from .tasks.convert import auto_convert_recordings_task
 from .services.flaresolverr import FlareSolverrClient
 from .services.chaturbate_auth import ChaturbateAuthService
 from .services.chaturbate_api import ChaturbateAPI
+from .services.cam4_auth import CAM4AuthService
+from .services import cam4_source
 from .api import auth as auth_router
+from .api import cam4 as cam4_router
 from .api import discover as discover_router
 from .api import following as following_router
-from .api import plugins as plugins_router
-from .core.plugins import PluginManager
-from .core.plugin_base import PluginResolveError
 
 # Environment
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -196,9 +196,9 @@ app.add_middleware(
 
 # Register API routers
 app.include_router(auth_router.router)
+app.include_router(cam4_router.router)
 app.include_router(discover_router.router)
 app.include_router(following_router.router)
-app.include_router(plugins_router.router)
 
 # Static mounts
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -327,7 +327,25 @@ db = Database(DB_FILE)
 chaturbate_api: Optional[ChaturbateAPI] = None
 
 # Plugin manager (initialized at startup)
-plugin_manager: Optional[PluginManager] = None
+# Set at startup via setup_services
+cam4_auth_service: Optional[CAM4AuthService] = None
+
+
+async def _resolve_m3u8(source_type: str, target: str, max_height: Optional[int]) -> Optional[str]:
+    """Résolution directe du M3U8 pour chaturbate/cam4. Lève une exception si
+    la source est inconnue ou si la résolution échoue."""
+    if source_type == "chaturbate":
+        from .resolvers.chaturbate import resolve_m3u8_async, resolve_m3u8
+        try:
+            url = await resolve_m3u8_async(target, max_height=max_height)
+        except Exception:
+            url = None
+        if not url:
+            url = resolve_m3u8(target)
+        return url
+    if source_type == "cam4":
+        return await cam4_source.resolve(target, max_height=max_height)
+    raise ValueError(f"source_type inconnu: {source_type}")
 
 # Fichier de sauvegarde des modèles (côté serveur)
 MODELS_FILE = OUTPUT_DIR / "models.json"
@@ -668,8 +686,7 @@ async def restart_application():
             pass
 
     # Prod (Docker/Umbrel): on quitte proprement. Le container manager relance
-    # l'app via sa restart policy (unless-stopped). Sans ça, les plugins
-    # pending_restart ne sont jamais chargés après un /api/plugins/restart.
+    # l'app via sa restart policy (unless-stopped).
     os._exit(0)
 
 
@@ -721,15 +738,12 @@ async def api_start(body: StartBody):
         m3u8_url = target
     else:
         effective_source = stype or "chaturbate"
-        loaded = plugin_manager.registry.get(effective_source) if plugin_manager else None
-        if loaded is None:
-            known = ", ".join(plugin_manager.registry.list_source_types()) if plugin_manager else ""
+        if effective_source not in ("chaturbate", "cam4"):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"source_type '{effective_source}' inconnu. "
-                    f"Installez le plugin correspondant. "
-                    f"Disponibles: {known or 'aucun'}"
+                    f"Sources disponibles: chaturbate, cam4"
                 ),
             )
         if effective_source == "chaturbate" and not CB_RESOLVER_ENABLED:
@@ -738,11 +752,10 @@ async def api_start(body: StartBody):
                 status_code=400,
                 detail="Résolution Chaturbate désactivée. Fournissez une URL m3u8 directe ou activez CB_RESOLVER_ENABLED.",
             )
-        logger.subsection(f"Résolution via plugin '{loaded.manifest.id}'")
+        logger.subsection(f"Résolution via source '{effective_source}'")
         try:
             max_height = await _get_max_recording_height()
-            result = await loaded.instance.resolve(target, max_height=max_height)
-            m3u8_url = result.m3u8_url
+            m3u8_url = await _resolve_m3u8(effective_source, target, max_height)
             if not m3u8_url:
                 raise HTTPException(
                     status_code=400,
@@ -754,11 +767,8 @@ async def api_start(body: StartBody):
                 logger.debug("Person défini depuis target", person=person)
         except HTTPException:
             raise
-        except PluginResolveError as e:
-            logger.error("Plugin resolve error", plugin=loaded.manifest.id, error=str(e))
-            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            error_detail = f"Échec résolution via plugin '{loaded.manifest.id}': {str(e)}"
+            error_detail = f"Échec résolution {effective_source}: {str(e)}"
             logger.error(error_detail, exc_info=True, username=target)
             raise HTTPException(status_code=400, detail=error_detail)
 
@@ -817,11 +827,13 @@ async def api_stop(session_id: str):
 
 
 @app.get("/api/model/{username}/status")
-async def get_model_status(username: str):
-    """Récupère le statut d'un modèle depuis le cache SQLite, avec fallback sur l'API Chaturbate"""
+async def get_model_status(username: str, source: Optional[str] = None):
+    """Récupère le statut d'un modèle depuis le cache SQLite, avec fallback sur
+    le plugin de la source (query param `source=cam4`) ou sur l'API Chaturbate."""
     # Lire directement depuis le cache SQLite (mis à jour par la tâche de monitoring)
     model = await db.get_model(username)
-    source_type = (model.get('source_type') if model else None) or 'chaturbate'
+    # Priorité: param `source` explicite (depuis le discover) > DB > défaut.
+    source_type = (source or (model.get('source_type') if model else None) or 'chaturbate').lower()
 
     if model and model.get('is_online'):
         return {
@@ -832,6 +844,31 @@ async def get_model_status(username: str):
             "roomStatus": model.get('room_status'),
             "sourceType": source_type,
         }
+
+    # Si source_type == cam4, on délègue directement à la source CAM4 (évite
+    # le fallback Chaturbate qui marque les CAM4 comme offline).
+    if source_type == "cam4":
+        try:
+            from .services import cam4_source
+            status = await cam4_source.check_status(username)
+            return {
+                "username": username,
+                "isOnline": bool(status.get("is_online")),
+                "thumbnail": f"/api/thumbnail/{username}",
+                "viewers": int(status.get("viewers") or 0),
+                "roomStatus": status.get("room_status"),
+                "sourceType": "cam4",
+            }
+        except Exception as e:
+            logger.debug("CAM4 check_status échoué", username=username, error=str(e))
+            return {
+                "username": username,
+                "isOnline": False,
+                "thumbnail": f"/api/thumbnail/{username}",
+                "viewers": 0,
+                "roomStatus": None,
+                "sourceType": "cam4",
+            }
 
     # Modèle non trouvé ou offline dans le cache: vérifier en direct via l'API Chaturbate
     # Try up to 2 attempts with better headers
@@ -888,29 +925,34 @@ async def get_model_status(username: str):
 
 
 @app.get("/api/model/{username}/stream")
-async def get_model_stream(username: str):
-    """Récupère l'URL du stream live pour un modèle (fonctionne même sans être dans le cache local)"""
-    try:
-        # Résolution via le registry (le source_type est lu depuis le modèle s'il existe)
-        source_type = "chaturbate"
-        try:
-            model = await db.get_model(username)
-            if model and model.get("source_type"):
-                source_type = model["source_type"]
-        except Exception:
-            pass
+async def get_model_stream(username: str, source: Optional[str] = None):
+    """Récupère l'URL du stream live pour un modèle.
 
-        loaded = plugin_manager.registry.get(source_type) if plugin_manager else None
-        if loaded is None:
+    Le source_type est déterminé par ordre de priorité: query param `source`
+    (depuis le discover multi-plugin), puis cache SQLite, puis défaut
+    Chaturbate.
+    """
+    try:
+        source_type = "chaturbate"
+        if source:
+            source_type = source.lower()
+        else:
+            try:
+                model = await db.get_model(username)
+                if model and model.get("source_type"):
+                    source_type = model["source_type"]
+            except Exception:
+                pass
+
+        if source_type not in ("chaturbate", "cam4"):
             raise HTTPException(
                 status_code=404,
-                detail=f"Plugin '{source_type}' non disponible",
+                detail=f"Source '{source_type}' non disponible",
             )
         try:
             max_height = await _get_max_recording_height()
-            result = await loaded.instance.resolve(username, max_height=max_height)
-            m3u8_url = result.m3u8_url
-        except PluginResolveError as e:
+            m3u8_url = await _resolve_m3u8(source_type, username, max_height)
+        except Exception as e:
             raise HTTPException(status_code=404, detail=str(e))
 
         if not m3u8_url:
@@ -2169,31 +2211,23 @@ async def auto_record_task():
                 cached_status = await db.get_model(username)
                 
                 if cached_status and cached_status.get('is_online'):
-                    # Modèle en ligne selon le cache, résoudre le flux HLS via le plugin
+                    # Modèle en ligne: résoudre le flux HLS
                     try:
                         hls_source = None
                         max_height = await _get_max_recording_height()
-
                         source_type = cached_status.get("source_type") or "chaturbate"
-                        loaded = (
-                            plugin_manager.registry.get(source_type)
-                            if plugin_manager
-                            else None
-                        )
-                        if loaded is None:
+                        if source_type not in ("chaturbate", "cam4"):
                             logger.warning(
-                                "Plugin introuvable pour auto-record",
+                                "Source inconnue pour auto-record",
                                 task="auto-record",
                                 username=username,
                                 source_type=source_type,
                             )
                             continue
-
                         try:
-                            result = await loaded.instance.resolve(
-                                username, max_height=max_height
+                            hls_source = await _resolve_m3u8(
+                                source_type, username, max_height
                             )
-                            hls_source = result.m3u8_url
                         except Exception as e:
                             logger.debug(
                                 "Auto-record resolve échec",
@@ -2341,10 +2375,41 @@ async def sync_following_task(chaturbate_api, auth_service):
                         is_online=model.get("is_online", False),
                         viewers=model.get("viewers", 0),
                         thumbnail_url=model.get("thumbnail_url"),
+                        source_type="chaturbate",
                     )
                 logger.debug("Following synced", count=len(models), task="following-sync")
         except Exception as e:
             logger.error("Following sync error", task="following-sync", error=str(e))
+            await asyncio.sleep(60)
+
+
+async def sync_cam4_following_task(cam4_auth):
+    """Background task: sync les favoris CAM4 toutes les 5 minutes."""
+    from .services import cam4_source
+    while True:
+        try:
+            await asyncio.sleep(300)
+
+            if cam4_auth is None:
+                continue
+            status = cam4_auth.get_status()
+            if not status.get("isLoggedIn"):
+                continue
+
+            items = await cam4_source.list_followed(cam4_auth.get_cookies())
+            for item in items:
+                await db.upsert_followed_model(
+                    username=item["username"],
+                    display_name=item.get("display_name") or item["username"],
+                    is_online=bool(item.get("is_online", False)),
+                    viewers=int(item.get("viewers") or 0),
+                    thumbnail_url=item.get("thumbnail"),
+                    source_type="cam4",
+                )
+            if items:
+                logger.debug("CAM4 following synced", count=len(items), task="cam4-sync")
+        except Exception as e:
+            logger.error("CAM4 sync error", task="cam4-sync", error=str(e))
             await asyncio.sleep(60)
 
 
@@ -2390,6 +2455,11 @@ async def startup_event():
     cb_auth = ChaturbateAuthService(db, flaresolverr)
     await cb_auth.initialize()
 
+    # Initialize CAM4 auth service (cookie-based session)
+    global cam4_auth_service
+    cam4_auth_service = CAM4AuthService(db)
+    await cam4_auth_service.initialize()
+
     # Initialize Chaturbate API client
     global chaturbate_api
     cb_api = ChaturbateAPI(cb_auth, flaresolverr)
@@ -2404,34 +2474,8 @@ async def startup_event():
     from .resolvers.chaturbate import set_chaturbate_api
     set_chaturbate_api(cb_api)
 
-    # Initialize Plugin Manager (after Chaturbate resolver wired up)
-    global plugin_manager
-    plugin_manager = PluginManager(
-        db=db,
-        plugins_root=OUTPUT_DIR / "plugins",
-        data_root=OUTPUT_DIR,
-        bundled_plugins_dir=BASE_DIR / "plugins",
-    )
-    try:
-        await plugin_manager.ensure_bootstrap()
-        if os.getenv("PLUGINS_ENABLED", "true").lower() in {"1", "true", "yes"}:
-            await plugin_manager.load_all()
-        else:
-            logger.warning("Chargement des plugins désactivé (PLUGINS_ENABLED=false)")
-    except Exception as e:
-        logger.error("Échec initialisation plugins", error=str(e), exc_info=True)
-
-    # Expose the authenticated Chaturbate session to the plugin so check_status
-    # can reuse DB-backed cookies (GH #11). Plugin chargé via load_all() ci-dessus.
-    cb_loaded = plugin_manager.registry.get("chaturbate")
-    if cb_loaded is not None:
-        try:
-            cb_loaded.instance.set_auth_service(cb_auth)
-        except AttributeError:
-            pass  # plugin chaturbate custom sans set_auth_service
-
-    # Wire plugins API router
-    plugins_router.init(plugin_manager, db)
+    # Wire CAM4 router avec auth service
+    cam4_router.init(cam4_auth_service, db)
 
     # Auto-login if env vars are set
     if CHATURBATE_USERNAME and CHATURBATE_PASSWORD:
@@ -2443,10 +2487,11 @@ async def startup_event():
             logger.warning("Chaturbate auto-login failed", error=result.get("error"))
 
     # Démarrer les tâches de fond
-    asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, plugin_manager, chaturbate_auth=cb_auth))
+    asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, chaturbate_auth=cb_auth, cam4_auth=cam4_auth_service))
     asyncio.create_task(auto_record_task())
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))
     asyncio.create_task(sync_following_task(cb_api, cb_auth))
+    asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     logger.info("Background tasks démarrés",
-                tasks=["monitor", "auto-record", "cleanup", "convert", "following-sync"])
+                tasks=["monitor", "auto-record", "cleanup", "convert", "following-sync", "cam4-sync"])

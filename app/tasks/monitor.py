@@ -393,19 +393,18 @@ async def monitor_models_task(
     db: 'Database',
     manager: 'FFmpegManager',
     ffmpeg_path: str = "ffmpeg",
-    plugin_manager=None,
     chaturbate_auth=None,
+    cam4_auth=None,
 ):
     """
     Tâche de monitoring en arrière-plan.
 
-    Pour chaque modèle, utilise le plugin correspondant (via le registry) pour
-    vérifier son statut. Fallback sur check_model_status direct pour Chaturbate
-    si le plugin manager n'est pas disponible (démarrage transitoire).
+    Pour chaque modèle trackée, vérifie son statut via la source appropriée
+    (Chaturbate ou CAM4) en switchant sur le source_type stocké.
 
-    ``chaturbate_auth`` est le ChaturbateAuthService partagé ; quand fourni on
-    injecte ses cookies dans le fallback direct pour éviter le redirect login
-    (GH #11).
+    ``chaturbate_auth`` fournit les cookies authentifiés pour check_model_status
+    Chaturbate (évite le redirect login, GH #11). ``cam4_auth`` est reservé
+    pour d'éventuels besoins futurs côté CAM4.
     """
     logger.background_task("monitor", "Démarrage du monitoring continu")
 
@@ -433,34 +432,19 @@ async def monitor_models_task(
                     source_type = model.get('source_type') or 'chaturbate'
 
                     try:
-                        # Résolution du statut via le plugin approprié
-                        if plugin_manager is not None:
-                            loaded = plugin_manager.registry.get(source_type)
-                            if loaded is None:
-                                logger.debug(
-                                    "Plugin introuvable, skip monitor",
-                                    username=username,
-                                    source_type=source_type,
-                                )
-                                continue
+                        if source_type == "cam4":
                             try:
-                                model_status = await loaded.instance.check_status(username)
-                                status = {
-                                    'is_online': model_status.is_online,
-                                    'viewers': model_status.viewers,
-                                    'hls_source': model_status.hls_source,
-                                    'room_status': getattr(model_status, 'room_status', None),
-                                }
+                                from ..services import cam4_source
+                                status = await cam4_source.check_status(username)
                             except Exception as e:
                                 logger.debug(
-                                    "check_status plugin error",
-                                    plugin=loaded.manifest.id,
+                                    "CAM4 check_status error",
                                     username=username,
                                     error=str(e),
                                 )
                                 status = {'is_online': False, 'viewers': 0, 'hls_source': None, 'room_status': None}
                         else:
-                            # Fallback direct Chaturbate (startup transitoire)
+                            # Chaturbate: check direct avec cookies authentifiés
                             auth_cookies = (
                                 chaturbate_auth.get_cookies()
                                 if chaturbate_auth is not None

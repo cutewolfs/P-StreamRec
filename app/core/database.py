@@ -175,6 +175,7 @@ class Database:
             ("recordings", "last_conversion_attempt", "INTEGER"),
             ("models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("models", "room_status", "TEXT"),
+            ("followed_models", "source_type", "TEXT DEFAULT 'chaturbate'"),
         ]
         for table, column, ddl in migrations:
             try:
@@ -514,7 +515,8 @@ class Database:
         display_name: Optional[str] = None,
         is_online: bool = False,
         viewers: int = 0,
-        thumbnail_url: Optional[str] = None
+        thumbnail_url: Optional[str] = None,
+        source_type: str = "chaturbate",
     ):
         """Add or update a followed model"""
         await self.initialize()
@@ -524,21 +526,22 @@ class Database:
             await db.execute("""
                 INSERT INTO followed_models (
                     username, display_name, is_online, viewers,
-                    thumbnail_url, last_seen_online_at, synced_at
+                    thumbnail_url, last_seen_online_at, synced_at, source_type
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     is_online = ?,
                     viewers = ?,
                     thumbnail_url = COALESCE(?, thumbnail_url),
                     last_seen_online_at = CASE WHEN ? THEN ? ELSE last_seen_online_at END,
-                    synced_at = ?
+                    synced_at = ?,
+                    source_type = ?
             """, (
                 username, display_name, is_online, viewers,
-                thumbnail_url, now if is_online else None, now,
+                thumbnail_url, now if is_online else None, now, source_type,
                 display_name, is_online, viewers, thumbnail_url,
-                is_online, now, now
+                is_online, now, now, source_type,
             ))
             await db.commit()
 
@@ -562,18 +565,43 @@ class Database:
             await db.execute("DELETE FROM followed_models")
             await db.commit()
 
-    async def remove_unfollowed(self, current_usernames: set):
-        """Remove followed models no longer in the followed list"""
+    async def delete_followed_model(
+        self, username: str, source_type: Optional[str] = None
+    ) -> None:
+        """Supprime un followed_model par username (et optionnellement par
+        source_type). Utilisé après unfollow depuis la page watch."""
+        await self.initialize()
+        async with self._connect() as db:
+            if source_type:
+                await db.execute(
+                    "DELETE FROM followed_models WHERE username = ? AND source_type = ?",
+                    (username, source_type),
+                )
+            else:
+                await db.execute(
+                    "DELETE FROM followed_models WHERE username = ?",
+                    (username,),
+                )
+            await db.commit()
+
+    async def remove_unfollowed(
+        self, current_usernames: set, source_type: str = "chaturbate"
+    ):
+        """Remove followed models no longer in the followed list (scoped par
+        source_type pour ne pas toucher les autres sources)."""
         await self.initialize()
 
         async with self._connect() as db:
-            cursor = await db.execute("SELECT username FROM followed_models")
+            cursor = await db.execute(
+                "SELECT username FROM followed_models WHERE source_type = ?",
+                (source_type,),
+            )
             rows = await cursor.fetchall()
             for row in rows:
                 if row[0] not in current_usernames:
                     await db.execute(
-                        "DELETE FROM followed_models WHERE username = ?",
-                        (row[0],)
+                        "DELETE FROM followed_models WHERE username = ? AND source_type = ?",
+                        (row[0], source_type),
                     )
             await db.commit()
 

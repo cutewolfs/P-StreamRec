@@ -94,7 +94,8 @@ function renderGrid(models) {
       }).join('') + '</div>';
     }
 
-    return '<div class="discover-card" onclick="openWatch(\'' + escapeHtml(model.username) + '\')">' +
+    var cardSource = (model.source_type || model.platform || 'chaturbate');
+    return '<div class="discover-card" onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')">' +
       '<div class="discover-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
           'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(model.username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
@@ -113,8 +114,9 @@ function renderGrid(models) {
 // ============================================
 // Open watch page
 // ============================================
-function openWatch(username) {
-  window.location.href = '/watch/' + encodeURIComponent(username);
+function openWatch(username, sourceType) {
+  var qs = sourceType ? ('?source=' + encodeURIComponent(sourceType)) : '';
+  window.location.href = '/watch/' + encodeURIComponent(username) + qs;
 }
 
 // ============================================

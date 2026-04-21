@@ -36,6 +36,106 @@ var logsOffset = 0;
 var statsRefreshInterval = null;
 
 // ============================================
+// CAM4 session management (cookie-based)
+// ============================================
+async function checkCam4Status() {
+  var statusEl = document.getElementById('cam4Status');
+  var usernameRow = document.getElementById('cam4UsernameRow');
+  var usernameEl = document.getElementById('cam4Username');
+  var loginForm = document.getElementById('cam4LoginForm');
+  var loggedInActions = document.getElementById('cam4LoggedInActions');
+  if (!statusEl) return;
+
+  try {
+    var res = await fetch('/api/cam4/status');
+    if (res.ok) {
+      var data = await res.json();
+      if (data.isLoggedIn) {
+        statusEl.className = 'status-indicator connected';
+        statusEl.textContent = 'Connected';
+        if (usernameRow) usernameRow.style.display = data.username ? 'flex' : 'none';
+        if (usernameEl) usernameEl.textContent = data.username || 'Session active';
+        if (loginForm) loginForm.style.display = 'none';
+        if (loggedInActions) loggedInActions.style.display = 'block';
+      } else {
+        statusEl.className = 'status-indicator disconnected';
+        statusEl.textContent = 'Not Connected';
+        if (usernameRow) usernameRow.style.display = 'none';
+        if (loginForm) loginForm.style.display = 'block';
+        if (loggedInActions) loggedInActions.style.display = 'none';
+      }
+    } else {
+      statusEl.className = 'status-indicator unknown';
+      statusEl.textContent = 'Unavailable';
+    }
+  } catch (e) {
+    console.error('Error checking CAM4 status:', e);
+    statusEl.className = 'status-indicator unknown';
+    statusEl.textContent = 'Unavailable';
+  }
+}
+
+async function loginCam4(event) {
+  event.preventDefault();
+  var username = document.getElementById('cam4User').value.trim();
+  var password = document.getElementById('cam4Pass').value;
+  var btn = document.getElementById('cam4LoginBtn');
+  if (!username || !password) {
+    showNotification('Please enter both username and password', 'error');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Logging in...'; }
+  try {
+    var res = await fetch('/api/cam4/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    var data = await res.json().catch(function(){ return {}; });
+    if (res.ok && data.success) {
+      showNotification('CAM4 login successful', 'success');
+      document.getElementById('cam4Pass').value = '';
+      await checkCam4Status();
+    } else {
+      showNotification('Login failed: ' + (data.detail || data.error || 'unknown error'), 'error');
+    }
+  } catch (e) {
+    showNotification('Network error: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Log In'; }
+  }
+}
+
+async function logoutCam4() {
+  if (!confirm('Disconnect CAM4 account?')) return;
+  try {
+    var res = await fetch('/api/cam4/logout', { method: 'POST' });
+    if (res.ok) {
+      showNotification('CAM4 session cleared', 'success');
+      await checkCam4Status();
+    } else {
+      showNotification('Failed to disconnect', 'error');
+    }
+  } catch (e) {
+    showNotification('Network error: ' + e.message, 'error');
+  }
+}
+
+async function syncCam4Following() {
+  try {
+    var res = await fetch('/api/cam4/following/sync', { method: 'POST' });
+    var data = await res.json();
+    if (res.ok) {
+      showNotification(data.message || ('Synced ' + data.synced + ' favorites'), 'success');
+    } else {
+      showNotification('Sync failed: ' + (data.detail || 'unknown'), 'error');
+    }
+  } catch (e) {
+    showNotification('Network error: ' + e.message, 'error');
+  }
+}
+
+// ============================================
 // Check Chaturbate login status
 // ============================================
 async function checkChaturbateStatus() {
@@ -851,6 +951,7 @@ window.addEventListener('DOMContentLoaded', function() {
 
   // Load all data in parallel
   checkChaturbateStatus();
+  checkCam4Status();
   checkFlareSolverr();
   loadAppInfo();
   loadBlacklistedTags();
