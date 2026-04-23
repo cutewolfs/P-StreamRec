@@ -14,10 +14,24 @@ function renderPlatformBadge(sourceType) {
 let currentPage = 1;
 let totalPages = 1;
 let currentGender = '';
-let currentSort = 'viewers';
 let currentSearch = '';
 let activeTags = [];
 let searchTimeout = null;
+// Set des usernames déjà suivis (toutes plateformes). Rempli au chargement
+// par loadFollowedSet(), consulté par renderGrid pour colorer le cœur, et
+// mis à jour par toggleFollowOnCard après chaque action.
+let followedSet = new Set();
+
+async function loadFollowedSet() {
+  try {
+    var res = await fetch('/api/following');
+    if (!res.ok) return;
+    var data = await res.json();
+    followedSet = new Set((data.models || []).map(function(m) { return m.username; }));
+  } catch (e) {
+    // Silencieux: cœurs s'affichent vides par défaut
+  }
+}
 
 // ============================================
 // Fetch discover data
@@ -32,7 +46,6 @@ async function fetchDiscover() {
   });
   if (currentGender) params.set('gender', currentGender);
   if (currentSearch) params.set('search', currentSearch);
-  if (currentSort) params.set('sort', currentSort);
   if (activeTags.length > 0) params.set('tags', activeTags.join(','));
 
   try {
@@ -95,6 +108,11 @@ function renderGrid(models) {
     }
 
     var cardSource = (model.source_type || model.platform || 'chaturbate');
+    var isFollowed = followedSet.has(model.username);
+    var heartBtn = '<button class="discover-follow-heart ' + (isFollowed ? 'is-followed' : '') + '" ' +
+      'title="' + (isFollowed ? 'Unfollow' : 'Follow') + ' ' + escapeHtml(model.username) + '" ' +
+      'onclick="event.stopPropagation(); toggleFollowOnCard(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\', this)">&#9829;</button>';
+
     return '<div class="discover-card" data-username="' + escapeHtml(model.username) + '" onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')">' +
       '<div class="discover-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
@@ -102,6 +120,7 @@ function renderGrid(models) {
         viewerText +
         ageText +
         renderPlatformBadge(model.source_type || model.platform || 'chaturbate') +
+        heartBtn +
       '</div>' +
       '<div class="discover-card-info">' +
         '<span class="discover-username">' + escapeHtml(model.username) + '</span>' +
@@ -117,6 +136,44 @@ function renderGrid(models) {
 function openWatch(username, sourceType) {
   var qs = sourceType ? ('?source=' + encodeURIComponent(sourceType)) : '';
   window.location.href = '/watch/' + encodeURIComponent(username) + qs;
+}
+
+// ============================================
+// Follow / Unfollow depuis la card Discover
+// ============================================
+async function toggleFollowOnCard(username, sourceType, btn) {
+  if (!username || btn.classList.contains('busy')) return;
+  var wasFollowing = followedSet.has(username);
+  var base = (sourceType === 'cam4') ? '/api/cam4' : '/api/chaturbate';
+  var endpoint = base + (wasFollowing ? '/unfollow/' : '/follow/') + encodeURIComponent(username);
+
+  btn.classList.add('busy');
+  try {
+    var res = await fetch(endpoint, { method: 'POST' });
+    if (res.ok) {
+      if (wasFollowing) {
+        followedSet.delete(username);
+        btn.classList.remove('is-followed');
+        btn.title = 'Follow ' + username;
+      } else {
+        followedSet.add(username);
+        btn.classList.add('is-followed');
+        btn.title = 'Unfollow ' + username;
+      }
+      showNotification(
+        wasFollowing ? 'Unfollowed ' + username : 'Now following ' + username,
+        'success'
+      );
+    } else {
+      var detail = wasFollowing ? 'Failed to unfollow' : 'Failed to follow';
+      try { var d = await res.json(); if (d && d.detail) detail = d.detail; } catch (e) {}
+      showNotification(detail, 'error');
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  } finally {
+    btn.classList.remove('busy');
+  }
 }
 
 // ============================================
@@ -229,12 +286,6 @@ function setGender(gender, btn) {
   fetchDiscover();
 }
 
-function setSort(sort) {
-  currentSort = sort;
-  currentPage = 1;
-  fetchDiscover();
-}
-
 function searchModels(query) {
   currentSearch = query;
   currentPage = 1;
@@ -274,7 +325,6 @@ async function refreshLiveThumbnails() {
   var params = new URLSearchParams({ page: currentPage, limit: 24 });
   if (currentGender) params.set('gender', currentGender);
   if (currentSearch) params.set('search', currentSearch);
-  if (currentSort) params.set('sort', currentSort);
   if (activeTags.length > 0) params.set('tags', activeTags.join(','));
 
   try {
@@ -325,8 +375,9 @@ window.addEventListener('DOMContentLoaded', function() {
     tagInput.addEventListener('keydown', handleTagInput);
   }
 
-  // Load data
-  fetchDiscover();
+  // Charger la liste des follows avant le premier render pour que les cœurs
+  // soient coloriés correctement dès l'affichage.
+  loadFollowedSet().finally(fetchDiscover);
 
   // Refresh live thumbnails toutes les 30s
   setInterval(refreshLiveThumbnails, 30000);

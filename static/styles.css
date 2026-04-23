@@ -2804,6 +2804,55 @@ button {
   border-color: rgba(255, 255, 255, 0.25);
 }
 
+/* Cœur follow/unfollow sur les cartes Discover */
+.discover-follow-heart {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 6;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  color: rgba(255, 255, 255, 0.65);
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform var(--transition-normal),
+              background var(--transition-normal),
+              color var(--transition-normal),
+              border-color var(--transition-normal);
+}
+
+.discover-follow-heart:hover {
+  transform: scale(1.1);
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+}
+
+.discover-follow-heart.is-followed {
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(239, 68, 68, 0.55);
+}
+
+.discover-follow-heart.is-followed:hover {
+  background: rgba(239, 68, 68, 0.3);
+  color: #fff;
+}
+
+.discover-follow-heart.busy {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 /* ============================================
    PRIVATE STATUS (online but in private session)
    ============================================ */

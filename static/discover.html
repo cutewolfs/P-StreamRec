@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/discover.js?v=2"></script>
+  <script defer src="/static/discover.js?v=4"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -27,10 +27,6 @@
         <button class="filter-pill" data-gender="couple" onclick="setGender('couple', this)">Couple</button>
         <button class="filter-pill" data-gender="trans" onclick="setGender('trans', this)">Trans</button>
       </div>
-      <select class="sort-select" id="sortSelect" onchange="setSort(this.value)">
-        <option value="viewers">Sort by Viewers</option>
-        <option value="newest">Sort by Newest</option>
-      </select>
     </div>
 
     <!-- Tag Filters -->

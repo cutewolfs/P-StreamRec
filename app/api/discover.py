@@ -76,13 +76,16 @@ async def discover_models(
     gender: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     tags: Optional[str] = Query(None),
+    sort: Optional[str] = Query("viewers"),
 ):
     """Liste agrégée Chaturbate + CAM4 (rooms publiques uniquement)."""
     included_tags: List[str] = []
     if tags:
         included_tags = [t.strip().lower() for t in tags.split(",") if t.strip()]
     first_tag = included_tags[0] if included_tags else ""
-    extra_tags = included_tags[1:] if len(included_tags) > 1 else []
+
+    search_lower = (search or "").strip().lower()
+    sort_mode = (sort or "viewers").strip().lower()
 
     n_sources = 2  # chaturbate + cam4
     per_source_limit = max(1, (limit + n_sources - 1) // n_sources)
@@ -113,8 +116,19 @@ async def discover_models(
             item_tags_lower = [t.lower() for t in (item.get("tags") or [])]
             if blacklisted_set and any(bt in item_tags_lower for bt in blacklisted_set):
                 continue
-            if extra_tags and not all(t in item_tags_lower for t in extra_tags):
+            # Filtrage strict: tous les tags demandés doivent être présents.
+            # Sans ce garde, CAM4 (qui fournit rarement des tags) polluait la
+            # liste filtrée avec des items hors-sujet.
+            if included_tags and not all(t in item_tags_lower for t in included_tags):
                 continue
+            # Filtrage strict: le search doit matcher l'username. Le backend
+            # Chaturbate fait un match full-text sur keywords (subject inclus)
+            # qui renvoie des non-pertinents; on restreint ici.
+            if search_lower:
+                uname = (item.get("username") or "").lower()
+                dname = (item.get("display_name") or "").lower()
+                if search_lower not in uname and search_lower not in dname:
+                    continue
             item = dict(item)
             item["source_type"] = source
             out.append(item)
@@ -145,6 +159,12 @@ async def discover_models(
             except StopIteration:
                 continue
         iters = next_iters
+
+    # Tri final. "newest" privilégie les comptes jeunes (proxy raisonnable
+    # pour "nouveau" sans timestamp côté source). "viewers" respecte l'ordre
+    # interleave qui vient des sources déjà triées par audience.
+    if sort_mode == "newest":
+        combined.sort(key=lambda m: (m.get("age") or 99))
 
     total_combined = sum(plugin_totals)
     total_pages = max(plugin_total_pages) if plugin_total_pages else 1
