@@ -208,7 +208,100 @@
       background: black;
       display: block;
     }
-    
+
+    .model-live-controls {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 9;
+      display: none;
+      align-items: center;
+      gap: 0.75rem;
+      min-height: 56px;
+      padding: 0.65rem 1rem;
+      background: linear-gradient(to top, rgba(0, 0, 0, 0.82), rgba(0, 0, 0, 0.35), transparent);
+      color: white;
+    }
+
+    .model-control-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      width: 40px;
+      height: 40px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      background: rgba(17, 24, 39, 0.82);
+      color: white;
+      font-size: 1rem;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    .model-volume-slider {
+      width: 120px;
+      accent-color: var(--success);
+    }
+
+    .model-live-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      margin-left: auto;
+      padding: 0.45rem 0.7rem;
+      border: 1px solid rgba(16, 185, 129, 0.42);
+      border-radius: 8px;
+      background: rgba(6, 78, 59, 0.72);
+      color: #d1fae5;
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .model-live-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 8px rgba(16, 185, 129, 0.75);
+    }
+
+    @media (max-width: 640px) {
+      .model-live-controls {
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        padding: 0.55rem 0.65rem;
+      }
+
+      .model-control-btn {
+        width: 36px;
+        height: 36px;
+      }
+
+      .model-volume-slider {
+        width: 76px;
+      }
+
+      .model-live-state {
+        margin-left: 0;
+        padding: 0.4rem 0.55rem;
+        font-size: 0.72rem;
+      }
+    }
+
+    @media (max-width: 420px) {
+      .model-volume-slider {
+        display: none;
+      }
+
+      .model-live-state {
+        flex: 1 1 auto;
+        justify-content: center;
+      }
+    }
+
     .player-container .empty-message {
       position: absolute;
       top: 0;
@@ -656,6 +749,19 @@
             <option value="-1">🎯 Best</option>
           </select>
         </div>
+        <div class="model-live-controls" id="modelLiveControls">
+          <button class="model-control-btn" id="modelPlayBtn" type="button" title="Play/Pause" aria-label="Play/Pause">
+            <span id="modelPlayIcon">&#10074;&#10074;</span>
+          </button>
+          <button class="model-control-btn" id="modelMuteBtn" type="button" title="Mute" aria-label="Mute">
+            <span id="modelMuteIcon">&#128266;</span>
+          </button>
+          <input class="model-volume-slider" id="modelVolumeSlider" type="range" min="0" max="1" step="0.01" aria-label="Volume">
+          <div class="model-live-state" aria-label="Live status">
+            <span class="model-live-dot"></span>
+            <span>Online</span>
+          </div>
+        </div>
         <div class="empty-message">
           <div class="icon">📺</div>
           <p>No stream in progress</p>
@@ -935,6 +1041,13 @@
           }
         } else {
           currentSession = null;
+          const video = document.getElementById('player');
+          if (liveStreamLoaded && (hlsPlayer || (video && (video.currentSrc || video.src)))) {
+            // Avoid interrupting playback on a transient offline status.
+            document.getElementById('statusDot').className = 'status-dot online';
+            document.getElementById('statusText').textContent = 'Live (Watching)';
+            return;
+          }
           liveStreamLoaded = false; // Reset when offline
           document.getElementById('statusDot').className = 'status-dot offline';
           document.getElementById('statusText').textContent = 'Offline';
@@ -996,7 +1109,11 @@
     async function loadStream(url) {
       console.log('🎬 Loading stream:', url);
       const video = document.getElementById('player');
-      
+      video.controls = false;
+      video.playbackRate = 1;
+      currentRecordingFile = null;
+      showModelLiveControls(true);
+
       // Wait for manifest to be available (max 10 attempts)
       let retries = 10;
       while (retries > 0) {
@@ -1081,6 +1198,8 @@
                 console.error('💥 Fatal error, reloading...');
                 showNotification('Fatal error, reloading in 2s...', 'error');
                 hlsPlayer.destroy();
+                hlsPlayer = null;
+                liveStreamLoaded = false;
                 setTimeout(() => loadStream(url), 2000);
                 break;
             }
@@ -1329,7 +1448,9 @@
       
       const video = document.getElementById('player');
       const container = document.querySelector('.player-container');
-      
+      video.controls = true;
+      showModelLiveControls(false);
+
       // Stop HLS player if active
       if (hlsPlayer) {
         hlsPlayer.destroy();
@@ -1493,10 +1614,8 @@
     });
     
     // ============================================
-    // Live Player: use native browser controls
+    // Live Player controls
     // ============================================
-    // The <video controls> attribute provides play/pause/volume/fullscreen
-    // natively. We only persist volume & mute state across sessions here.
     (function() {
       const video = document.getElementById('player');
       if (!video) return;
@@ -1527,7 +1646,7 @@
       return 0.5;
     }
     
-    // Setup volume management on video player (native <video controls>)
+    // Setup volume management on video player
     function setupVolumeManagement() {
       const video = document.getElementById('player');
       if (!video) return;
@@ -1558,6 +1677,82 @@
       console.log('🔊 Volume management ready. Saved volume:', savedVolume);
     }
 
+    function setupModelLiveControls() {
+      const video = document.getElementById('player');
+      const playBtn = document.getElementById('modelPlayBtn');
+      const muteBtn = document.getElementById('modelMuteBtn');
+      const volumeSlider = document.getElementById('modelVolumeSlider');
+      if (!video) return;
+
+      if (playBtn) {
+        playBtn.addEventListener('click', () => {
+          if (video.paused) {
+            video.play().catch(() => {});
+          } else {
+            video.pause();
+          }
+        });
+      }
+
+      if (muteBtn) {
+        muteBtn.addEventListener('click', () => {
+          if (video.muted || video.volume === 0) {
+            video.muted = false;
+            if (video.volume === 0) video.volume = getSavedVolume();
+          } else {
+            video.muted = true;
+          }
+        });
+      }
+
+      if (volumeSlider) {
+        volumeSlider.value = String(video.volume);
+        volumeSlider.addEventListener('input', () => {
+          const volume = parseFloat(volumeSlider.value);
+          if (Number.isNaN(volume)) return;
+          video.volume = volume;
+          video.muted = volume === 0;
+        });
+      }
+
+      video.addEventListener('play', updateModelLiveControls);
+      video.addEventListener('pause', updateModelLiveControls);
+      video.addEventListener('volumechange', updateModelLiveControls);
+      video.addEventListener('ratechange', () => {
+        const controls = document.getElementById('modelLiveControls');
+        if (controls && controls.style.display !== 'none' && video.playbackRate !== 1) {
+          video.playbackRate = 1;
+        }
+      });
+
+      updateModelLiveControls();
+    }
+
+    function showModelLiveControls(show) {
+      const controls = document.getElementById('modelLiveControls');
+      if (!controls) return;
+      controls.style.display = show ? 'flex' : 'none';
+      updateModelLiveControls();
+    }
+
+    function updateModelLiveControls() {
+      const video = document.getElementById('player');
+      const playIcon = document.getElementById('modelPlayIcon');
+      const muteIcon = document.getElementById('modelMuteIcon');
+      const volumeSlider = document.getElementById('modelVolumeSlider');
+      if (!video) return;
+
+      if (playIcon) {
+        playIcon.innerHTML = video.paused ? '&#9654;' : '&#10074;&#10074;';
+      }
+      if (muteIcon) {
+        muteIcon.innerHTML = (video.muted || video.volume === 0) ? '&#128263;' : '&#128266;';
+      }
+      if (volumeSlider && document.activeElement !== volumeSlider) {
+        volumeSlider.value = String(video.volume);
+      }
+    }
+
     // NOTE: Auto-recording is now handled by the backend auto_record.py task
     // This prevents forcing a recording when user just wants to watch live
 
@@ -1583,6 +1778,7 @@
     });
 
     // Initialization
+    setupModelLiveControls();
     updateModelStatus();
     loadRecordings();
     

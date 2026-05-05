@@ -2496,6 +2496,95 @@ button {
   background: #000;
 }
 
+.watch-live-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  min-height: 56px;
+  padding: 0.65rem 1rem;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.82), rgba(0, 0, 0, 0.35), transparent);
+  color: #fff;
+}
+
+.watch-control-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.82);
+  color: #fff;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.watch-control-btn:hover {
+  background: rgba(31, 41, 55, 0.92);
+  border-color: rgba(255, 255, 255, 0.42);
+}
+
+.watch-volume-slider {
+  width: 120px;
+  accent-color: var(--success);
+}
+
+.watch-live-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin-left: auto;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid rgba(16, 185, 129, 0.42);
+  border-radius: 8px;
+  background: rgba(6, 78, 59, 0.72);
+  color: #d1fae5;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.watch-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.75);
+}
+
+.watch-quality-select {
+  min-width: 104px;
+  height: 40px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(17, 24, 39, 0.9);
+  color: #fff;
+  padding: 0 0.75rem;
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.watch-quality-select:disabled {
+  opacity: 0.62;
+  cursor: not-allowed;
+}
+
+.watch-quality-select:focus {
+  outline: none;
+  border-color: var(--success);
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+}
+
 .live-badge {
   position: absolute;
   top: 1rem;
@@ -2642,6 +2731,46 @@ button {
 .watch-btn.record-btn.active #recordIcon {
   color: var(--danger);
   animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@media (max-width: 640px) {
+  .watch-live-controls {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.55rem 0.65rem;
+  }
+
+  .watch-control-btn {
+    width: 36px;
+    height: 36px;
+  }
+
+  .watch-volume-slider {
+    width: 76px;
+  }
+
+  .watch-live-state {
+    margin-left: 0;
+    padding: 0.4rem 0.55rem;
+    font-size: 0.72rem;
+  }
+
+  .watch-quality-select {
+    min-width: 88px;
+    height: 36px;
+    font-size: 0.82rem;
+  }
+}
+
+@media (max-width: 420px) {
+  .watch-volume-slider {
+    display: none;
+  }
+
+  .watch-live-state {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
 }
 
 
