@@ -812,7 +812,7 @@ async def api_start(body: StartBody):
 
     logger.subsection("Démarrage Session FFmpeg")
     try:
-        sess = manager.start_session(m3u8_url, person=person, display_name=body.name)
+        sess = manager.start_session(m3u8_url, person=person, display_name=body.name, max_height=max_height)
         duration_ms = (time.time() - start_time) * 1000
         logger.success("Session créée avec succès", 
                       session_id=sess.id,
@@ -2323,7 +2323,8 @@ async def auto_record_task():
                                 sess = manager.start_session(
                                     input_url=hls_source,
                                     display_name=username,
-                                    person=username
+                                    person=username,
+                                    max_height=max_height,
                                 )
 
                                 if sess:

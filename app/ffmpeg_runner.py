@@ -12,6 +12,20 @@ from .core.http_client import (
     is_socks_proxy,
 )
 
+# Chaturbate LL-HLS master playlists multiplex all quality levels into one stream.
+# Each entry maps a max_height ceiling to the ffmpeg video stream index.
+_LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
+
+
+def _llhls_video_stream_index(max_height: Optional[int]) -> int:
+    """Return the ffmpeg 0:v:N index for the desired quality on an LL-HLS master."""
+    if not max_height or max_height <= 0:
+        return _LLHLS_QUALITY_LADDER[-1][1]
+    for height, idx in _LLHLS_QUALITY_LADDER:
+        if max_height <= height:
+            return idx
+    return _LLHLS_QUALITY_LADDER[-1][1]
+
 
 class FFmpegSession:
     def __init__(self, session_id: str, input_url: str, sessions_dir: str, records_dir_for_person: str, person: str, display_name: Optional[str] = None):
@@ -137,7 +151,7 @@ class FFmpegManager:
                    sessions_root=self.sessions_root,
                    records_root=self.records_root)
 
-    def start_session(self, input_url: str, person: str, display_name: Optional[str] = None) -> FFmpegSession:
+    def start_session(self, input_url: str, person: str, display_name: Optional[str] = None, max_height: Optional[int] = None) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
         with self._lock:
@@ -191,9 +205,20 @@ class FFmpegManager:
                     "mais FFmpeg ne supporte ici que les proxys HTTP(S)"
                 )
 
+            # For Chaturbate LL-HLS master playlists, the master URL contains
+            # both video variants and a separate audio rendition group. Passing
+            # only a video-only chunk URL (from _resolve_variant) strips audio.
+            # Instead we pass the master URL and select streams explicitly.
+            is_llhls = 'llhls.m3u8' in sess.input_url
+            if is_llhls:
+                v_idx = _llhls_video_stream_index(max_height)
+                map_args = ["-map", "0:a:0", "-map", f"0:v:{v_idx}"]
+            else:
+                map_args = ["-map", "0"]
+
             cmd.extend([
                 "-i", sess.input_url,
-                "-map", "0",
+                *map_args,
                 "-c", "copy",
                 "-f", "tee", tee_spec,
             ])
