@@ -23,6 +23,23 @@ MONITOR_INTERVAL = 60  # Vérifie toutes les 60 secondes
 THUMBNAIL_UPDATE_INTERVAL = 300  # Miniature offline: toutes les 5 minutes
 THUMBNAIL_UPDATE_INTERVAL_LIVE = 60  # Miniature live: toutes les 60s pour refléter l'activité
 
+async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> bool:
+    """Check if a model is live using the Chaturbate thumbnail CDN.
+
+    This CDN endpoint is not behind Cloudflare and does not require cookies.
+    A 200 response with a non-trivial body means the model is currently streaming.
+    """
+    url = f"https://roomimg.stream.highwebmedia.com/ri/{username}.jpg"
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), ssl=False) as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                return len(content) > 1000
+    except Exception:
+        pass
+    return False
+
+
 async def check_model_status(
     session: aiohttp.ClientSession,
     username: str,
@@ -38,6 +55,10 @@ async def check_model_status(
 
     Without auth cookies Chaturbate redirects ``/api/chatvideocontext/`` to the
     login page and the check silently fails (see GH #11).
+
+    When the chatvideocontext API is blocked by Cloudflare TLS fingerprinting
+    (connection reset, error code 0), the CDN thumbnail endpoint is used as a
+    reliable fallback to detect liveness without any Cloudflare dependency.
     """
     try:
         url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
@@ -114,7 +135,22 @@ async def check_model_status(
                 }
     except Exception as e:
         logger.debug("Erreur vérification statut modèle", username=username, error=str(e))
-    
+
+    # Fallback: chatvideocontext is blocked by Cloudflare TLS fingerprinting.
+    # Use the thumbnail CDN which has no CF protection to detect liveness.
+    try:
+        is_live = await _check_live_via_cdn(session, username)
+        if is_live:
+            logger.debug("Statut détecté via CDN (fallback CF)", username=username, is_online=True)
+        return {
+            "is_online": is_live,
+            "viewers": 0,
+            "hls_source": None,
+            "room_status": "public" if is_live else None,
+        }
+    except Exception as e:
+        logger.debug("Erreur fallback CDN", username=username, error=str(e))
+
     return {
         "is_online": False,
         "viewers": 0,
