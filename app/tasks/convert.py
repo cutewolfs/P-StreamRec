@@ -37,14 +37,16 @@ async def convert_ts_to_mp4(
                mp4_file=mp4_path.name)
 
     # Remux only: the HLS source is already H.264+AAC, so copying codecs
-    # produces a valid MP4 almost instantly with near-zero CPU usage.
+    # produces a valid MP4 almost instantly with near-zero CPU usage. Keep a
+    # conventional video-then-audio stream order for broad player compatibility.
     # -bsf:a aac_adtstoasc : reformat ADTS AAC (TS) into MP4-friendly ASC
     cmd = [
         ffmpeg_path,
         "-nostdin", "-hide_banner", "-loglevel", "error",
         "-fflags", "+genpts+igndts",
         "-i", str(ts_path),
-        "-map", "0",
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+faststart",
