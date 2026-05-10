@@ -10,6 +10,11 @@ let showTsFiles = false;
 let currentPlayingRecordingId = '';
 let currentPlayingUsername = '';
 let currentPlayingFilename = '';
+let currentDetailModel = null;        // cached settings for the open model
+let currentDetailRecordings = [];     // cached recordings used for timeline
+let timelineNowInterval = null;       // setInterval id for the blinking-now line update
+let globalMaxResolution = 0;          // 0 = no global cap; otherwise pixel height
+let globalDefaultResolution = 0;      // 0 = "best"; otherwise pixel height (used when enrolling new models)
 
 // ============================================
 // Load recordings grouped by model
@@ -20,10 +25,28 @@ async function loadShowTsSetting() {
     if (res.ok) {
       var data = await res.json();
       showTsFiles = !!data.show_ts_files;
+      globalMaxResolution = parseInt(data.max_resolution, 10) || 0;
+      globalDefaultResolution = parseInt(data.default_resolution, 10) || 0;
     }
   } catch (e) {
     console.error('Error loading show_ts setting:', e);
   }
+}
+
+// Map "best", "1080p", "480", etc. to a numeric height (0 = best/none).
+function qualityToHeight(q) {
+  if (!q) return 0;
+  var s = String(q).trim().toLowerCase();
+  if (s === 'best' || s === 'auto' || s === 'highest') return 0;
+  var m = s.match(/^(\d+)\s*p?$/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+// Combine per-model quality with the global cap. Mirrors the server logic.
+function effectiveHeight(modelQuality, globalCap) {
+  var perModel = qualityToHeight(modelQuality);
+  if (globalCap && perModel) return Math.min(globalCap, perModel);
+  return perModel || globalCap || 0;  // 0 means "best available"
 }
 
 async function loadRecordingsByModel() {
@@ -133,8 +156,9 @@ async function showModelRecordings(username) {
   document.getElementById('recordingsDetail').style.display = 'block';
   document.getElementById('detailUsername').textContent = username;
 
-  // Load auto-record status for the detail toggle button
+  // Load auto-record status for the detail toggle button + populate edit panel
   loadDetailRecordStatus(username);
+  loadModelSettings(username);
 
   var list = document.getElementById('recordingsList');
   list.innerHTML = '<div class="empty-message"><div class="icon">&#9203;</div><p>Loading...</p></div>';
@@ -160,6 +184,10 @@ async function showModelRecordings(username) {
     recordings.sort(function(a, b) {
       return (b.createdAt || b.date || 0) - (a.createdAt || a.date || 0);
     });
+
+    // Cache for timeline + render it
+    currentDetailRecordings = recordings;
+    renderTimeline(username, recordings);
 
     // Load playback positions
     var positions = {};
@@ -233,6 +261,284 @@ function showModelGrid() {
   document.getElementById('modelGrid').style.display = 'grid';
   document.getElementById('recordingsDetail').style.display = 'none';
   currentDetailUser = '';
+  currentDetailModel = null;
+  currentDetailRecordings = [];
+  if (timelineNowInterval) {
+    clearInterval(timelineNowInterval);
+    timelineNowInterval = null;
+  }
+}
+
+// ============================================
+// Per-model settings (resolution / retention / auto-record)
+// ============================================
+function updateEffectiveHint() {
+  var hint = document.getElementById('effectiveQualityHint');
+  var qSel = document.getElementById('editQuality');
+  if (!hint || !qSel) return;
+  var eff = effectiveHeight(qSel.value, globalMaxResolution);
+  var perModel = qualityToHeight(qSel.value);
+  var capped = !!(globalMaxResolution && (perModel === 0 || globalMaxResolution < perModel));
+  if (eff === 0) {
+    hint.textContent = 'Effective: best available (no cap)';
+    hint.classList.remove('capped');
+  } else if (capped) {
+    hint.textContent = 'Effective: ' + eff + 'p (capped by global max ' + globalMaxResolution + 'p — Settings)';
+    hint.classList.add('capped');
+  } else {
+    hint.textContent = 'Effective: ' + eff + 'p';
+    hint.classList.remove('capped');
+  }
+}
+
+async function loadModelSettings(username) {
+  var qSel = document.getElementById('editQuality');
+  var rInp = document.getElementById('editRetention');
+  var aSel = document.getElementById('editAutoRecord');
+  var saveBtn = document.getElementById('saveModelBtn');
+  if (!qSel || !rInp || !aSel) return;
+
+  // Reset to defaults while loading
+  qSel.value = 'best';
+  rInp.value = 30;
+  aSel.value = 'true';
+  saveBtn.disabled = false;
+  saveBtn.textContent = 'Save Changes';
+
+  // Wire change handler once
+  if (!qSel.dataset.hintBound) {
+    qSel.addEventListener('change', updateEffectiveHint);
+    qSel.dataset.hintBound = '1';
+  }
+
+  // Refresh the global cap + default so the hint is accurate for the open detail.
+  try {
+    var sres = await fetch('/api/settings/recording');
+    if (sres.ok) {
+      var sdata = await sres.json();
+      globalMaxResolution = parseInt(sdata.max_resolution, 10) || 0;
+      globalDefaultResolution = parseInt(sdata.default_resolution, 10) || 0;
+    }
+  } catch (e) { /* keep cached value */ }
+
+  try {
+    var res = await fetch('/api/models');
+    if (!res.ok) return;
+    var data = await res.json();
+    var found = null;
+    for (var i = 0; i < (data.models || []).length; i++) {
+      if (data.models[i].username === username) { found = data.models[i]; break; }
+    }
+    currentDetailModel = found;
+
+    if (found) {
+      var q = found.recordQuality || 'best';
+      // Ensure the value is selectable even if the DB has something not in the
+      // hard-coded list (e.g. legacy values) — append a hidden option.
+      var hasOpt = false;
+      for (var j = 0; j < qSel.options.length; j++) {
+        if (qSel.options[j].value === q) { hasOpt = true; break; }
+      }
+      if (!hasOpt) {
+        var opt = document.createElement('option');
+        opt.value = q; opt.textContent = q;
+        qSel.appendChild(opt);
+      }
+      qSel.value = q;
+      rInp.value = (found.retentionDays != null) ? found.retentionDays : 30;
+      aSel.value = found.autoRecord ? 'true' : 'false';
+      saveBtn.textContent = 'Save Changes';
+      console.debug('[recordings] loaded settings for', username, found, 'globalMax=', globalMaxResolution);
+    } else {
+      // Not tracked yet — preselect the global default so the user sees what
+      // will be applied on enrolment.
+      saveBtn.textContent = 'Add & Save';
+      var defQ = globalDefaultResolution > 0 ? (globalDefaultResolution + 'p') : 'best';
+      var hasDef = false;
+      for (var k = 0; k < qSel.options.length; k++) {
+        if (qSel.options[k].value === defQ) { hasDef = true; break; }
+      }
+      if (!hasDef) {
+        var dopt = document.createElement('option');
+        dopt.value = defQ; dopt.textContent = defQ;
+        qSel.appendChild(dopt);
+      }
+      qSel.value = defQ;
+      console.debug('[recordings] model not tracked yet:', username, 'default=', defQ);
+    }
+    updateEffectiveHint();
+  } catch (e) {
+    console.error('Error loading model settings:', e);
+  }
+}
+
+async function saveModelSettings() {
+  var username = currentDetailUser;
+  if (!username) return;
+  var qSel = document.getElementById('editQuality');
+  var rInp = document.getElementById('editRetention');
+  var aSel = document.getElementById('editAutoRecord');
+  var saveBtn = document.getElementById('saveModelBtn');
+
+  var payload = {
+    recordQuality: qSel.value,
+    retentionDays: Math.max(1, parseInt(rInp.value, 10) || 30),
+    autoRecord: aSel.value === 'true'
+  };
+
+  saveBtn.disabled = true;
+  var originalLabel = saveBtn.textContent;
+  saveBtn.textContent = 'Saving...';
+
+  try {
+    // Try update first; if model is not tracked, fall back to create
+    var res = await fetch('/api/models/' + encodeURIComponent(username), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (res.status === 404) {
+      // Not tracked — create instead
+      res = await fetch('/api/models', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: username,
+          autoRecord: payload.autoRecord,
+          recordQuality: payload.recordQuality,
+          retentionDays: payload.retentionDays
+        })
+      });
+    }
+
+    if (res.ok || res.status === 409) {
+      showNotification('Settings saved', 'success');
+      // Reflect new state in detail header button
+      updateDetailRecordButton(payload.autoRecord);
+      // Refresh cached settings
+      loadModelSettings(username);
+    } else {
+      var err = await res.json().catch(function(){ return {}; });
+      showNotification(err.detail || 'Failed to save settings', 'error');
+    }
+  } catch (e) {
+    console.error('Error saving model settings:', e);
+    showNotification('Connection error', 'error');
+  } finally {
+    saveBtn.disabled = false;
+    saveBtn.textContent = originalLabel;
+  }
+}
+
+// ============================================
+// 7-day recording timeline
+// ============================================
+function renderTimeline(username, recordings) {
+  var grid = document.getElementById('timelineGrid');
+  var ticksEl = document.getElementById('timelineTicks');
+  if (!grid) return;
+
+  // Build the 7 days (oldest -> newest), each starting at local midnight
+  var now = new Date();
+  var days = [];
+  for (var d = 6; d >= 0; d--) {
+    var dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - d, 0, 0, 0, 0);
+    var dayEnd = new Date(dayStart.getTime() + 24 * 3600 * 1000);
+    days.push({ start: dayStart, end: dayEnd });
+  }
+
+  var dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+  // Build rows
+  var todayKey = days[6].start.getTime();
+  grid.innerHTML = days.map(function(day) {
+    var isToday = day.start.getTime() === todayKey;
+    var label = '<div class="timeline-day-label' + (isToday ? ' today' : '') + '">' +
+      '<span class="dow">' + dayNames[day.start.getDay()] + '</span>' +
+      '<span>' + day.start.getDate() + '</span>' +
+    '</div>';
+    var bar = '<div class="timeline-bar" data-day-start="' + day.start.getTime() + '"></div>';
+    return label + bar;
+  }).join('');
+
+  // Place recording segments inside each day's bar
+  var bars = grid.querySelectorAll('.timeline-bar');
+  for (var b = 0; b < bars.length; b++) {
+    var bar = bars[b];
+    var dayStart = parseInt(bar.dataset.dayStart, 10);
+    var dayEnd = dayStart + 24 * 3600 * 1000;
+
+    for (var i = 0; i < recordings.length; i++) {
+      var rec = recordings[i];
+      var startTs = (rec.createdAt || rec.date || 0);
+      if (!startTs) continue;
+      var startMs = startTs * 1000;
+      var durMs = Math.max(0, (rec.duration || 0)) * 1000;
+      // If duration unknown, give it a 1-minute marker so it's visible
+      if (durMs === 0) durMs = 60 * 1000;
+      var endMs = startMs + durMs;
+
+      // Skip if the recording does not overlap with this day
+      if (endMs <= dayStart || startMs >= dayEnd) continue;
+
+      var clampedStart = Math.max(startMs, dayStart);
+      var clampedEnd = Math.min(endMs, dayEnd);
+      var leftPct = ((clampedStart - dayStart) / (24 * 3600 * 1000)) * 100;
+      var widthPct = Math.max(0.4, ((clampedEnd - clampedStart) / (24 * 3600 * 1000)) * 100);
+
+      var startStr = new Date(startMs).toLocaleString();
+      var endStr = new Date(endMs).toLocaleString();
+      var seg = document.createElement('div');
+      seg.className = 'timeline-rec';
+      seg.style.left = leftPct + '%';
+      seg.style.width = widthPct + '%';
+      seg.title = (rec.filename || 'recording') + '\n' + startStr + ' -> ' + endStr +
+                  '\n' + (rec.duration_str || formatDuration(rec.duration));
+      (function(r) {
+        seg.addEventListener('click', function(ev) {
+          ev.stopPropagation();
+          if (r.filename) {
+            playRecording(username, r.filename, r.recordingId || '');
+          }
+        });
+      })(rec);
+      bar.appendChild(seg);
+    }
+  }
+
+  // Hour ticks under the grid (every 3h)
+  if (ticksEl) {
+    var html = '';
+    for (var h = 0; h <= 24; h += 3) {
+      var pct = (h / 24) * 100;
+      var label = (h === 24) ? '24h' : (h + 'h');
+      html += '<span class="tick" style="left:' + pct + '%">' + label + '</span>';
+    }
+    ticksEl.innerHTML = html;
+  }
+
+  // Position the blinking "now" line on today's bar and refresh every 30s
+  function placeNowLine() {
+    var allBars = document.querySelectorAll('#timelineGrid .timeline-bar');
+    for (var i = 0; i < allBars.length; i++) {
+      var existing = allBars[i].querySelector('.timeline-now');
+      if (existing) existing.remove();
+    }
+    if (allBars.length === 0) return;
+    var todayBar = allBars[allBars.length - 1]; // last row is today
+    var nowDate = new Date();
+    var msSinceMidnight = (nowDate.getHours() * 3600 + nowDate.getMinutes() * 60 + nowDate.getSeconds()) * 1000;
+    var pct = (msSinceMidnight / (24 * 3600 * 1000)) * 100;
+    var marker = document.createElement('div');
+    marker.className = 'timeline-now';
+    marker.style.left = pct + '%';
+    marker.title = 'Now: ' + nowDate.toLocaleTimeString();
+    todayBar.appendChild(marker);
+  }
+  placeNowLine();
+  if (timelineNowInterval) clearInterval(timelineNowInterval);
+  timelineNowInterval = setInterval(placeNowLine, 30000);
 }
 
 // ============================================
@@ -505,11 +811,12 @@ async function toggleDetailAutoRecord() {
     }
 
     if (!found) {
-      // Not tracked yet - add model with auto-record on
+      // Not tracked yet - add model with auto-record on. We deliberately omit
+      // recordQuality so the server applies the global default resolution.
       var addRes = await fetch('/api/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: currentDetailUser, autoRecord: true, recordQuality: 'best', retentionDays: 30 })
+        body: JSON.stringify({ username: currentDetailUser, autoRecord: true, retentionDays: 30 })
       });
       if (addRes.ok || addRes.status === 409) {
         updateDetailRecordButton(true);

@@ -26,6 +26,11 @@ function initTabs() {
         loadLogs();
         logsLoaded = true;
       }
+      if (tabId === 'processes') {
+        startProcessesPolling();
+      } else {
+        stopProcessesPolling();
+      }
     });
   });
 }
@@ -377,6 +382,10 @@ async function loadRecordingSettings() {
       var maxResSelect = document.getElementById('maxResolutionSelect');
       if (maxResSelect) {
         maxResSelect.value = String(data.max_resolution || 0);
+      }
+      var defaultResSelect = document.getElementById('defaultResolutionSelect');
+      if (defaultResSelect) {
+        defaultResSelect.value = String(data.default_resolution || 0);
       }
     }
   } catch (e) {
@@ -1053,4 +1062,252 @@ function renderLogs(logs, append) {
 
   container.insertAdjacentHTML('beforeend', html);
   document.getElementById('loadMoreLogs').textContent = 'Load More';
+}
+
+// ============================================
+// Processes tab — live ffmpeg process inspector
+// ============================================
+var processesPollInterval = null;
+var processesExpanded = {};   // session_id -> expanded?
+var processesLastSnap = {};   // session_id -> last snapshot (for partial updates)
+var PROCESSES_REFRESH_MS = 10000;
+
+function startProcessesPolling() {
+  if (processesPollInterval) return;
+  refreshProcesses();
+  processesPollInterval = setInterval(refreshProcesses, PROCESSES_REFRESH_MS);
+}
+
+function stopProcessesPolling() {
+  if (processesPollInterval) {
+    clearInterval(processesPollInterval);
+    processesPollInterval = null;
+  }
+}
+
+function fmtBytes(n) {
+  if (n == null) return '-';
+  var u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var i = 0;
+  var v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return v.toFixed(i === 0 ? 0 : 1) + ' ' + u[i];
+}
+
+function fmtDuration(secs) {
+  if (secs == null) return '-';
+  secs = Math.max(0, Math.floor(secs));
+  var h = Math.floor(secs / 3600);
+  var m = Math.floor((secs % 3600) / 60);
+  var s = secs % 60;
+  if (h > 0) return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
+  if (m > 0) return m + 'm ' + (s < 10 ? '0' : '') + s + 's';
+  return s + 's';
+}
+
+function escapeProcHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function statusDotClass(p) {
+  if (!p.running || !p.pid) return 'stopped';
+  if (p.status === 'Z') return 'zombie';
+  return '';
+}
+
+async function refreshProcesses() {
+  var tbody = document.getElementById('proc-tbody');
+  if (!tbody) return;
+  try {
+    var res = await fetch('/api/processes');
+    if (!res.ok) {
+      tbody.innerHTML = '<tr><td colspan="10" class="proc-empty">Failed to load (' + res.status + ')</td></tr>';
+      return;
+    }
+    var data = await res.json();
+    renderProcesses(data);
+  } catch (e) {
+    console.error('refreshProcesses:', e);
+    tbody.innerHTML = '<tr><td colspan="10" class="proc-empty">Connection error</td></tr>';
+  }
+}
+
+function renderProcesses(data) {
+  var procs = (data && data.processes) || [];
+  var totals = (data && data.totals) || {};
+  var tbody = document.getElementById('proc-tbody');
+  var totalsEl = document.getElementById('proc-totals');
+  var badgeEl = document.getElementById('processesCountBadge');
+
+  if (badgeEl) {
+    badgeEl.textContent = totals.active || 0;
+    if (totals.active > 0) badgeEl.classList.add('active');
+    else badgeEl.classList.remove('active');
+  }
+
+  if (totalsEl) {
+    totalsEl.textContent = (totals.active || 0) + ' active / ' + (totals.total || 0) +
+      ' · CPU ' + (totals.cpu_percent_sum != null ? totals.cpu_percent_sum.toFixed(1) : '?') + '%' +
+      ' · RAM ' + fmtBytes(totals.rss_bytes_sum || 0) +
+      ' · ' + (totals.host_cores || '?') + ' cores';
+  }
+
+  if (procs.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="proc-empty">No active ffmpeg processes</td></tr>';
+    processesLastSnap = {};
+    return;
+  }
+
+  var rows = procs.map(function(p) {
+    processesLastSnap[p.session_id] = p;
+    var dot = '<span class="proc-status-dot ' + statusDotClass(p) + '" title="' + escapeProcHtml(p.status || '?') + '"></span>';
+    var actions =
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procStop(\'' + escapeProcHtml(p.session_id) + '\')"    title="Stop (graceful)">&#9209;</button>' +
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procRestart(\'' + escapeProcHtml(p.session_id) + '\')" title="Restart (stop + monitor re-spawns)">&#8635;</button>' +
+      '<button class="proc-action-btn danger" onclick="event.stopPropagation(); procKill(\'' + escapeProcHtml(p.session_id) + '\')"    title="Force kill (SIGKILL)">&#9760;</button>' +
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procPreview(\'' + escapeProcHtml(p.playback_url || '') + '\')" title="Open HLS preview">&#9654;</button>';
+
+    var row = '<tr class="proc-row" data-sid="' + escapeProcHtml(p.session_id) + '" onclick="toggleProcRow(\'' + escapeProcHtml(p.session_id) + '\')">' +
+      '<td>' + dot + '</td>' +
+      '<td>' + (p.pid != null ? p.pid : '-') + '</td>' +
+      '<td>' + escapeProcHtml(p.person || p.name || '-') + '</td>' +
+      '<td>' + fmtDuration(p.uptime_seconds) + '</td>' +
+      '<td>' + (p.cpu_percent != null ? p.cpu_percent.toFixed(1) : '-') + '</td>' +
+      '<td>' + fmtBytes(p.rss_bytes) + '</td>' +
+      '<td>' + escapeProcHtml(p.quality || '-') + '</td>' +
+      '<td>' + fmtBytes(p.record_size_bytes) + '</td>' +
+      '<td>' + (p.segment_count != null ? p.segment_count : '-') + '</td>' +
+      '<td class="proc-actions">' + actions + '</td>' +
+    '</tr>';
+    var detail = '';
+    if (processesExpanded[p.session_id]) {
+      detail = '<tr class="proc-detail-row" data-sid="' + escapeProcHtml(p.session_id) + '">' +
+                 '<td colspan="10" style="padding:0;"><div class="proc-detail" id="proc-detail-' + escapeProcHtml(p.session_id) + '">' +
+                   renderProcDetail(p) +
+                 '</div></td>' +
+               '</tr>';
+    }
+    return row + detail;
+  });
+
+  tbody.innerHTML = rows.join('');
+
+  // Refresh log tail for each currently-expanded row (fire-and-forget)
+  Object.keys(processesExpanded).forEach(function(sid) {
+    if (processesExpanded[sid]) loadProcessLog(sid);
+  });
+}
+
+function renderProcDetail(p) {
+  var input = p.input_url || '-';
+  var inputShort = input.length > 80 ? input.slice(0, 80) + '…' : input;
+  var io = '';
+  if (p.io_read_bytes != null || p.io_write_bytes != null) {
+    io = '<div class="kv"><span class="k">IO read</span><span class="v">' + fmtBytes(p.io_read_bytes) + '</span></div>' +
+         '<div class="kv"><span class="k">IO write</span><span class="v">' + fmtBytes(p.io_write_bytes) + '</span></div>';
+  }
+  return '' +
+    '<h4>Process</h4>' +
+    '<div class="kv"><span class="k">Session</span><span class="v">' + escapeProcHtml(p.session_id) + '</span></div>' +
+    '<div class="kv"><span class="k">PID</span><span class="v">' + (p.pid != null ? p.pid : '-') + '</span></div>' +
+    '<div class="kv"><span class="k">State</span><span class="v">' + escapeProcHtml(p.status || '?') + '</span></div>' +
+    '<div class="kv"><span class="k">Started</span><span class="v">' + escapeProcHtml(p.start_date || '-') + '</span></div>' +
+    '<div class="kv"><span class="k">Uptime</span><span class="v">' + fmtDuration(p.uptime_seconds) + '</span></div>' +
+    '<div class="kv"><span class="k">Threads</span><span class="v">' + (p.num_threads != null ? p.num_threads : '-') + '</span></div>' +
+    '<div class="kv"><span class="k">FDs</span><span class="v">' + (p.num_fds != null ? p.num_fds : '-') + '</span></div>' +
+    '<div class="kv"><span class="k">Nice</span><span class="v">' + (p.nice != null ? p.nice : '-') + '</span></div>' +
+    '<h4>Resources</h4>' +
+    '<div class="kv"><span class="k">CPU</span><span class="v">' + (p.cpu_percent != null ? p.cpu_percent.toFixed(1) + ' %' : '-') + '</span></div>' +
+    '<div class="kv"><span class="k">RSS</span><span class="v">' + fmtBytes(p.rss_bytes) + '</span></div>' +
+    '<div class="kv"><span class="k">VSZ</span><span class="v">' + fmtBytes(p.vsz_bytes) + '</span></div>' +
+    io +
+    '<h4>Paths</h4>' +
+    '<div class="kv"><span class="k">Quality</span><span class="v">' + escapeProcHtml(p.record_quality || '?') + ' &rarr; ' + escapeProcHtml(p.quality || '?') + ' (effective)</span></div>' +
+    '<div class="kv"><span class="k">Input m3u8</span><span class="v">' + escapeProcHtml(inputShort) +
+      '<button class="copy-btn" onclick="event.stopPropagation(); navigator.clipboard.writeText(' + JSON.stringify(input) + ').catch(function(){})">copy</button>' +
+    '</span></div>' +
+    '<div class="kv"><span class="k">Output</span><span class="v">' + escapeProcHtml(p.record_path || '-') + '</span></div>' +
+    '<div class="kv"><span class="k">HLS</span><span class="v">' + escapeProcHtml(p.playback_url || '-') + '</span></div>' +
+    '<div class="kv"><span class="k">Segments</span><span class="v">' + (p.segment_count != null ? p.segment_count : '-') +
+      ' (' + fmtBytes(p.segment_bytes || 0) + ')</span></div>' +
+    '<h4>FFmpeg log (tail)</h4>' +
+    '<pre class="proc-log" id="proc-log-' + escapeProcHtml(p.session_id) + '">loading…</pre>';
+}
+
+function toggleProcRow(sid) {
+  processesExpanded[sid] = !processesExpanded[sid];
+  refreshProcesses();
+}
+
+async function loadProcessLog(sid) {
+  var el = document.getElementById('proc-log-' + sid);
+  if (!el) return;
+  try {
+    var res = await fetch('/api/processes/' + encodeURIComponent(sid) + '/log?lines=30');
+    if (!res.ok) { el.textContent = '(log unavailable: ' + res.status + ')'; return; }
+    var data = await res.json();
+    var lines = data.lines || [];
+    el.textContent = lines.length ? lines.join('\n') : '(empty)';
+  } catch (e) {
+    el.textContent = '(log fetch error)';
+  }
+}
+
+async function procStop(sid) {
+  if (!confirm('Stop ffmpeg session ' + sid + '? The auto-monitor may re-spawn it shortly if auto-record is on.')) return;
+  try {
+    var res = await fetch('/api/processes/' + encodeURIComponent(sid) + '/stop', { method: 'POST' });
+    if (res.ok) showNotification('Stopped ' + sid, 'success');
+    else        showNotification('Failed to stop', 'error');
+  } catch (e) { showNotification('Connection error', 'error'); }
+  setTimeout(refreshProcesses, 500);
+}
+
+async function procKill(sid) {
+  if (!confirm('Force-kill (SIGKILL) ffmpeg session ' + sid + '?\n\nUse only if a graceful stop is hanging.')) return;
+  try {
+    var res = await fetch('/api/processes/' + encodeURIComponent(sid) + '/kill', { method: 'POST' });
+    if (res.ok) showNotification('Killed ' + sid, 'success');
+    else        showNotification('Failed to kill', 'error');
+  } catch (e) { showNotification('Connection error', 'error'); }
+  setTimeout(refreshProcesses, 500);
+}
+
+async function procRestart(sid) {
+  if (!confirm('Restart ffmpeg session ' + sid + '?\n\nThis stops the current process; the auto-monitor will re-spawn it within a few seconds with a freshly-resolved URL.')) return;
+  try {
+    var res = await fetch('/api/processes/' + encodeURIComponent(sid) + '/restart', { method: 'POST' });
+    if (res.ok) showNotification('Restart queued for ' + sid, 'success');
+    else        showNotification('Failed to restart', 'error');
+  } catch (e) { showNotification('Connection error', 'error'); }
+  setTimeout(refreshProcesses, 1500);
+}
+
+function procPreview(url) {
+  if (!url) { showNotification('No HLS URL for this session', 'error'); return; }
+  // Open in a new tab; the existing /watch page can render arbitrary HLS via Hls.js,
+  // but the simplest reliable fallback is opening the m3u8 directly.
+  window.open(url, '_blank', 'noopener');
+}
+
+async function stopAllProcesses() {
+  var snap = Object.keys(processesLastSnap);
+  if (snap.length === 0) { showNotification('Nothing to stop', 'success'); return; }
+  if (!confirm('Stop ALL ' + snap.length + ' ffmpeg sessions?\n\nAuto-monitor may re-spawn them if auto-record is on.')) return;
+  for (var i = 0; i < snap.length; i++) {
+    try {
+      await fetch('/api/processes/' + encodeURIComponent(snap[i]) + '/stop', { method: 'POST' });
+    } catch (e) {}
+  }
+  showNotification('Stop requested for ' + snap.length + ' sessions', 'success');
+  setTimeout(refreshProcesses, 800);
+}
+
+// Reuse the global notification helper if present, else fall back to alert.
+if (typeof showNotification !== 'function') {
+  // minimal fallback so the file is self-contained even if loaded standalone
+  window.showNotification = function(msg) { console.log(msg); };
 }

@@ -9,7 +9,131 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js"></script>
+  <script defer src="/static/settings.js?v=2"></script>
+  <style>
+    /* --- Processes tab --- */
+    .proc-count-badge {
+      display: inline-block;
+      min-width: 1.4em;
+      padding: 0 0.4em;
+      margin-left: 0.25rem;
+      border-radius: 999px;
+      background: #1f2547;
+      color: #cbd5e1;
+      font-size: 0.7rem;
+      line-height: 1.4em;
+      text-align: center;
+    }
+    .proc-count-badge.active {
+      background: #16a34a;
+      color: white;
+    }
+    .proc-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    .proc-table th, .proc-table td {
+      padding: 0.5rem 0.6rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      text-align: left;
+      vertical-align: top;
+    }
+    .proc-table th {
+      color: #94a3b8;
+      font-weight: 500;
+      font-size: 0.7rem;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .proc-table tbody tr.proc-row { cursor: pointer; }
+    .proc-table tbody tr.proc-row:hover { background: rgba(255,255,255,0.03); }
+    .proc-status-dot {
+      display: inline-block;
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #16a34a;
+      box-shadow: 0 0 6px #16a34a;
+    }
+    .proc-status-dot.stopped { background: #6b7280; box-shadow: none; }
+    .proc-status-dot.zombie  { background: #f59e0b; box-shadow: 0 0 6px #f59e0b; }
+    .proc-actions { white-space: nowrap; text-align: right; }
+    .proc-action-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px; height: 28px;
+      margin-left: 4px;
+      background: #0f1330;
+      color: #cbd5e1;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    .proc-action-btn:hover { background: #1c2350; color: white; }
+    .proc-action-btn.danger:hover { background: #7f1d1d; color: white; border-color: #7f1d1d; }
+    .proc-action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .proc-detail {
+      background: rgba(15, 19, 48, 0.5);
+      padding: 0.75rem 1rem 1rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .proc-detail h4 {
+      margin: 0.5rem 0 0.25rem;
+      font-size: 0.72rem;
+      color: #94a3b8;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    .proc-detail .kv {
+      display: grid;
+      grid-template-columns: 130px 1fr;
+      row-gap: 0.25rem;
+      column-gap: 0.5rem;
+      font-size: 0.82rem;
+    }
+    .proc-detail .kv .k { color: #94a3b8; }
+    .proc-detail .kv .v { color: #e2e8f0; word-break: break-all; }
+    .proc-detail .copy-btn {
+      margin-left: 0.4rem;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.1);
+      color: #cbd5e1;
+      border-radius: 4px;
+      padding: 0 0.4rem;
+      font-size: 0.7rem;
+      cursor: pointer;
+    }
+    .proc-detail .copy-btn:hover { background: rgba(255,255,255,0.05); }
+    .proc-log {
+      background: #05070f;
+      color: #cbd5e1;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+      font-size: 0.72rem;
+      line-height: 1.4;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre;
+    }
+    .proc-empty {
+      color: var(--text-muted);
+      padding: 1rem;
+      text-align: center;
+    }
+    .btn-danger {
+      background: #b91c1c; color: white; border: none;
+      padding: 0.45rem 0.85rem; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+    }
+    .btn-danger:hover { background: #991b1b; }
+    .btn-secondary {
+      background: #1c2350; color: #cbd5e1; border: 1px solid rgba(255,255,255,0.08);
+      padding: 0.45rem 0.85rem; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+    }
+    .btn-secondary:hover { background: #2a3470; color: white; }
+  </style>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -39,6 +163,10 @@
         <button class="settings-nav-item" data-tab="recording">
           <span class="settings-nav-icon">&#9881;</span>
           <span>Recording</span>
+        </button>
+        <button class="settings-nav-item" data-tab="processes">
+          <span class="settings-nav-icon">&#9881;&#65039;</span>
+          <span>Processes <span class="proc-count-badge" id="processesCountBadge"></span></span>
         </button>
         <button class="settings-nav-item" data-tab="application">
           <span class="settings-nav-icon">&#8505;</span>
@@ -213,8 +341,21 @@
               </div>
               <div class="settings-row">
                 <div>
+                  <span class="settings-row-label">Default Recording Resolution</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Resolution assigned to a model when auto-record is turned on (newly added models, or toggling auto-record off &rarr; on). Per-model values can still be edited afterward.</p>
+                </div>
+                <select id="defaultResolutionSelect" onchange="updateRecordingSetting('default_resolution', parseInt(this.value))" style="padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;">
+                  <option value="0">Best available</option>
+                  <option value="1080">1080p</option>
+                  <option value="720">720p</option>
+                  <option value="480">480p</option>
+                  <option value="360">360p</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <div>
                   <span class="settings-row-label">Max Recording Resolution</span>
-                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Cap the height of recorded streams to save disk space. Falls back to the closest lower resolution when the stream has no exact match.</p>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Hard cap on the height of recorded streams &mdash; no model can exceed this even if its per-model setting is higher.</p>
                 </div>
                 <select id="maxResolutionSelect" onchange="updateRecordingSetting('max_resolution', parseInt(this.value))" style="padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;">
                   <option value="0">Best available</option>
@@ -277,6 +418,47 @@
               <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-muted); line-height: 1.5;">
                 Changes take effect immediately without restart. Set a model's retention to 0 to keep recordings forever.
               </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Processes Tab -->
+        <div class="settings-tab" id="tab-processes">
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <span class="icon">&#9881;&#65039;</span>
+              <h3>FFmpeg Processes</h3>
+              <div style="margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
+                <span id="proc-totals" style="color: var(--text-muted); font-size: 0.85rem;">&mdash;</span>
+                <button class="btn btn-secondary" onclick="refreshProcesses()">Refresh</button>
+                <button class="btn btn-danger" onclick="stopAllProcesses()">Stop all</button>
+              </div>
+            </div>
+            <div class="settings-section-body">
+              <p style="color: var(--text-muted); font-size: 0.85rem; margin: 0 0 0.75rem;">
+                Live ffmpeg recording processes. Auto-refresh: 10s. Click a row to expand details.
+              </p>
+              <div id="proc-table-wrap">
+                <table class="proc-table" id="proc-table">
+                  <thead>
+                    <tr>
+                      <th></th>
+                      <th>PID</th>
+                      <th>User</th>
+                      <th>Up</th>
+                      <th>CPU %</th>
+                      <th>RAM</th>
+                      <th>Q</th>
+                      <th>Bytes</th>
+                      <th>Segs</th>
+                      <th style="text-align:right;">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody id="proc-tbody">
+                    <tr><td colspan="10" style="color: var(--text-muted); padding: 1rem;">Loading&hellip;</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>

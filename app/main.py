@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from urllib.parse import urlparse
 import os
 import asyncio
@@ -873,6 +873,260 @@ async def api_stop(session_id: str):
     return {"stopped": True, "id": session_id}
 
 
+# ============================================
+# FFmpeg process inspection endpoints
+# ============================================
+
+def _proc_state_letter(status: str) -> str:
+    """psutil status string -> short Linux state letter."""
+    mapping = {
+        "running": "R",
+        "sleeping": "S",
+        "disk-sleep": "D",
+        "stopped": "T",
+        "tracing-stop": "t",
+        "zombie": "Z",
+        "dead": "X",
+        "wake-kill": "K",
+        "waking": "W",
+        "idle": "I",
+        "parked": "P",
+    }
+    return mapping.get(status, status[:1].upper() if status else "?")
+
+
+def _safe_dir_size(path: str) -> Tuple[int, int]:
+    """Return (segment_count, bytes) for files under `path`. Best effort."""
+    try:
+        total = 0
+        count = 0
+        for entry in os.scandir(path):
+            if entry.is_file() and entry.name.endswith(".ts"):
+                try:
+                    total += entry.stat().st_size
+                    count += 1
+                except OSError:
+                    continue
+        return count, total
+    except OSError:
+        return 0, 0
+
+
+async def _build_process_snapshot(sess_status: dict) -> dict:
+    """Augment a manager.list_status() entry with /proc + psutil + disk stats."""
+    import psutil
+
+    out = {
+        "session_id": sess_status.get("id"),
+        "person": sess_status.get("person"),
+        "name": sess_status.get("name"),
+        "input_url": sess_status.get("input_url"),
+        "record_path": sess_status.get("record_path"),
+        "playback_url": sess_status.get("playback_url"),
+        "running": bool(sess_status.get("running")),
+        "started_at": sess_status.get("created_at"),
+        "start_date": sess_status.get("start_date"),
+        # filled below
+        "pid": None,
+        "uptime_seconds": None,
+        "cpu_percent": None,
+        "rss_bytes": None,
+        "vsz_bytes": None,
+        "num_threads": None,
+        "num_fds": None,
+        "status": None,
+        "nice": None,
+        "io_read_bytes": None,
+        "io_write_bytes": None,
+        "record_size_bytes": None,
+        "segment_count": None,
+        "quality": None,
+    }
+
+    # Resolve the underlying FFmpegSession to grab the live process
+    sess = manager._sessions.get(sess_status.get("id")) if hasattr(manager, "_sessions") else None
+    proc = getattr(sess, "process", None) if sess else None
+    pid = proc.pid if proc and proc.poll() is None else None
+    out["pid"] = pid
+
+    if pid:
+        try:
+            p = psutil.Process(pid)
+            with p.oneshot():
+                out["cpu_percent"] = round(p.cpu_percent(interval=0.0), 1)
+                mem = p.memory_info()
+                out["rss_bytes"] = mem.rss
+                out["vsz_bytes"] = mem.vms
+                out["num_threads"] = p.num_threads()
+                try:
+                    out["num_fds"] = p.num_fds()
+                except (psutil.AccessDenied, AttributeError):
+                    out["num_fds"] = None
+                out["status"] = _proc_state_letter(p.status())
+                try:
+                    out["nice"] = p.nice()
+                except psutil.AccessDenied:
+                    out["nice"] = None
+                try:
+                    io = p.io_counters()
+                    out["io_read_bytes"] = io.read_bytes
+                    out["io_write_bytes"] = io.write_bytes
+                except (psutil.AccessDenied, AttributeError):
+                    pass
+                out["uptime_seconds"] = max(0, int(time.time() - p.create_time()))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    if out["uptime_seconds"] is None and out["started_at"]:
+        try:
+            out["uptime_seconds"] = max(0, int(time.time() - float(out["started_at"])))
+        except (TypeError, ValueError):
+            pass
+
+    # Recorded TS file size (output)
+    rp = sess_status.get("record_path")
+    if rp:
+        try:
+            out["record_size_bytes"] = os.path.getsize(rp)
+        except OSError:
+            out["record_size_bytes"] = None
+
+    # HLS segment dir stats
+    if sess and getattr(sess, "sessions_dir", None):
+        seg_count, seg_size = _safe_dir_size(sess.sessions_dir)
+        out["segment_count"] = seg_count
+        out["segment_bytes"] = seg_size
+
+    # Effective quality from the model's current setting (plus global cap)
+    person = sess_status.get("person")
+    if person:
+        try:
+            model = await db.get_model(person)
+            if model:
+                rq = model.get("record_quality") or "best"
+                eff = await _get_recording_height_for_quality(rq)
+                out["quality"] = f"{eff}p" if eff else "best"
+                out["record_quality"] = rq
+        except Exception:
+            pass
+
+    return out
+
+
+@app.get("/api/processes")
+async def api_processes():
+    """List ffmpeg recording processes with detailed metrics."""
+    import psutil
+    statuses = manager.list_status()
+    procs = []
+    total_cpu = 0.0
+    total_rss = 0
+    for s in statuses:
+        snap = await _build_process_snapshot(s)
+        procs.append(snap)
+        if snap.get("cpu_percent") is not None:
+            total_cpu += snap["cpu_percent"]
+        if snap.get("rss_bytes") is not None:
+            total_rss += snap["rss_bytes"]
+    active = sum(1 for p in procs if p.get("running"))
+    try:
+        cores = psutil.cpu_count(logical=True) or 1
+    except Exception:
+        cores = 1
+    return {
+        "processes": procs,
+        "totals": {
+            "active": active,
+            "total": len(procs),
+            "cpu_percent_sum": round(total_cpu, 1),
+            "rss_bytes_sum": total_rss,
+            "host_cores": cores,
+        },
+    }
+
+
+@app.get("/api/processes/{session_id}/log")
+async def api_process_log(session_id: str, lines: int = 30):
+    """Return the last `lines` lines of the session's ffmpeg.log."""
+    sess = manager._sessions.get(session_id) if hasattr(manager, "_sessions") else None
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session introuvable")
+    log_path = getattr(sess, "log_path", None)
+    if not log_path or not os.path.exists(log_path):
+        return {"session_id": session_id, "lines": [], "path": log_path}
+    lines = max(1, min(int(lines or 30), 500))
+    try:
+        # Tail without loading the whole file
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = 4096
+            data = b""
+            while size > 0 and data.count(b"\n") <= lines:
+                read = min(block, size)
+                size -= read
+                f.seek(size)
+                data = f.read(read) + data
+        text = data.decode("utf-8", errors="replace")
+        tail = text.splitlines()[-lines:]
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Lecture log: {e}")
+    return {"session_id": session_id, "lines": tail, "path": log_path}
+
+
+@app.post("/api/processes/{session_id}/stop")
+async def api_process_stop(session_id: str):
+    """Graceful stop (SIGTERM, then SIGKILL on timeout). Same as /api/stop."""
+    ok = manager.stop_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Session introuvable")
+    return {"stopped": True, "session_id": session_id}
+
+
+@app.post("/api/processes/{session_id}/kill")
+async def api_process_kill(session_id: str):
+    """Force SIGKILL on the ffmpeg process. Use when graceful stop hangs."""
+    sess = manager._sessions.get(session_id) if hasattr(manager, "_sessions") else None
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session introuvable")
+    proc = getattr(sess, "process", None)
+    if not proc or proc.poll() is not None:
+        # Already gone — fall back to graceful stop to clean up bookkeeping
+        manager.stop_session(session_id)
+        return {"killed": False, "reason": "already-exited", "session_id": session_id}
+    try:
+        proc.kill()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur kill: {e}")
+    # Run the manager's stop to release locks / threads
+    manager.stop_session(session_id)
+    return {"killed": True, "session_id": session_id}
+
+
+@app.post("/api/processes/{session_id}/restart")
+async def api_process_restart(session_id: str):
+    """Stop the session — the auto-monitor will re-spawn it on its next tick.
+
+    Restart is implemented as a clean stop on purpose: Chaturbate URLs are
+    token-bearing and may have expired, so respawning with the cached URL
+    can fail. The monitor task re-resolves a fresh URL when it picks the
+    model back up (typically within a few seconds).
+    """
+    sess = manager._sessions.get(session_id) if hasattr(manager, "_sessions") else None
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session introuvable")
+    person = sess.person
+    ok = manager.stop_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Stop échoué")
+    return {
+        "restarted": True,
+        "session_id": session_id,
+        "person": person,
+        "note": "monitor will re-spawn within a few seconds",
+    }
+
+
 @app.get("/api/model/{username}/status")
 async def get_model_status(username: str, source: Optional[str] = None):
     """Récupère le statut d'un modèle depuis le cache SQLite, avec fallback sur
@@ -1385,17 +1639,27 @@ async def add_model(model: dict):
     username = model.get('username')
     if not username:
         raise HTTPException(status_code=400, detail="Username requis")
-    
+
     # Vérifier si le modèle existe déjà
     existing = await db.get_model(username)
     if existing:
         raise HTTPException(status_code=409, detail="Modèle déjà existant")
-    
+
+    auto_record = bool(model.get('autoRecord', True))
+    # When auto-record is enabled and the caller did not pin a per-model
+    # resolution, fall back to the global default. Otherwise keep "best".
+    if 'recordQuality' in model and model.get('recordQuality') is not None:
+        record_quality = model['recordQuality']
+    elif auto_record:
+        record_quality = await _get_default_record_quality()
+    else:
+        record_quality = 'best'
+
     # Ajouter dans SQLite
     await db.add_or_update_model(
         username=username,
-        auto_record=model.get('autoRecord', True),
-        record_quality=model.get('recordQuality', 'best'),
+        auto_record=auto_record,
+        record_quality=record_quality,
         retention_days=model.get('retentionDays', 30)
     )
     
@@ -1948,6 +2212,14 @@ async def get_recording_settings():
     except (ValueError, TypeError):
         max_resolution = 0
 
+    # Default recording resolution applied to a model when auto-record is
+    # turned on (0 = best available).
+    default_res_val = await db.get_setting("default_resolution")
+    try:
+        default_resolution = int(default_res_val) if default_res_val is not None else 0
+    except (ValueError, TypeError):
+        default_resolution = 0
+
     return {
         "auto_convert": auto_convert,
         "keep_ts": keep_ts,
@@ -1955,6 +2227,7 @@ async def get_recording_settings():
         "auto_delete_watched": auto_delete_watched,
         "auto_delete_threshold": auto_delete_threshold,
         "max_resolution": max_resolution,
+        "default_resolution": default_resolution,
     }
 
 
@@ -1972,6 +2245,24 @@ async def _get_max_recording_height() -> Optional[int]:
         return val if val > 0 else None
     except (ValueError, TypeError):
         return None
+
+
+async def _get_default_record_quality() -> str:
+    """Return the global default record quality as a string ("best"/"720p"/...).
+
+    Used to populate `record_quality` when a model is enrolled or has
+    auto-record turned on without an explicit per-model value.
+    """
+    try:
+        raw = await db.get_setting("default_resolution")
+        if raw is None:
+            return "best"
+        val = int(raw)
+        if val <= 0:
+            return "best"
+        return f"{val}p"
+    except (ValueError, TypeError):
+        return "best"
 
 
 def _record_quality_to_height(record_quality: Optional[str]) -> Optional[int]:
@@ -2028,6 +2319,17 @@ async def update_recording_settings(body: dict):
                 detail=f"max_resolution must be one of {sorted(_ALLOWED_MAX_RESOLUTIONS)}"
             )
         await db.set_setting("max_resolution", str(max_res))
+    if "default_resolution" in body:
+        try:
+            default_res = int(body["default_resolution"])
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="default_resolution must be an integer")
+        if default_res not in _ALLOWED_MAX_RESOLUTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"default_resolution must be one of {sorted(_ALLOWED_MAX_RESOLUTIONS)}"
+            )
+        await db.set_setting("default_resolution", str(default_res))
 
     # Return current state
     return await get_recording_settings()
@@ -2083,13 +2385,25 @@ async def toggle_auto_record(username: str, body: dict):
     if auto_record is None:
         raise HTTPException(status_code=400, detail="autoRecord field required")
 
+    new_auto = bool(auto_record)
+    was_auto = bool(existing.get("auto_record", False))
+    record_quality = existing.get("record_quality", "best")
+    # On the off -> on transition, apply the global default resolution so the
+    # model immediately starts recording at the configured default.
+    if new_auto and not was_auto:
+        record_quality = await _get_default_record_quality()
+
     await db.add_or_update_model(
         username=username,
-        auto_record=bool(auto_record),
-        record_quality=existing.get("record_quality", "best"),
+        auto_record=new_auto,
+        record_quality=record_quality,
         retention_days=existing.get("retention_days", 30)
     )
-    return {"success": True, "autoRecord": bool(auto_record)}
+    return {
+        "success": True,
+        "autoRecord": new_auto,
+        "recordQuality": record_quality,
+    }
 
 
 # ============================================
