@@ -10,6 +10,19 @@ const PRIVATE_STATUSES = [
   'hidden', 'true_private', 'private_spy'
 ];
 
+function isPrivateRoomStatus(roomStatus) {
+  return PRIVATE_STATUSES.indexOf((roomStatus || '').toLowerCase()) !== -1;
+}
+
+function isPubliclyOnline(model) {
+  return !isPrivateRoomStatus(model.room_status || model.roomStatus) &&
+    Boolean(model.isOnline || model.is_online);
+}
+
+function isPrivateModel(model) {
+  return isPrivateRoomStatus(model.room_status || model.roomStatus);
+}
+
 // Render a small platform badge overlaid on the thumbnail.
 function renderPlatformBadge(sourceType) {
   var t = (sourceType || '').toLowerCase();
@@ -91,21 +104,17 @@ function renderFollowing(models) {
   emptyFollowing.style.display = 'none';
 
   var online = models.filter(function(m) {
-    if (m.isOnline || m.is_online) return true;
-    var rs = (m.room_status || m.roomStatus || '').toLowerCase();
-    return PRIVATE_STATUSES.indexOf(rs) !== -1;
+    return isPubliclyOnline(m) || isPrivateModel(m);
   });
   var offline = models.filter(function(m) {
-    if (m.isOnline || m.is_online) return false;
-    var rs = (m.room_status || m.roomStatus || '').toLowerCase();
-    return PRIVATE_STATUSES.indexOf(rs) === -1;
+    return !isPubliclyOnline(m) && !isPrivateModel(m);
   });
 
   // Online section
   if (online.length > 0) {
     onlineSection.style.display = 'block';
     onlineCount.textContent = online.length;
-    onlineGrid.innerHTML = online.map(function(model) { return renderFollowingCard(model, true); }).join('');
+    onlineGrid.innerHTML = online.map(function(model) { return renderFollowingCard(model); }).join('');
   } else {
     onlineSection.style.display = 'none';
   }
@@ -114,21 +123,19 @@ function renderFollowing(models) {
   if (offline.length > 0) {
     offlineSection.style.display = 'block';
     offlineCount.textContent = offline.length;
-    offlineGrid.innerHTML = offline.map(function(model) { return renderFollowingCard(model, false); }).join('');
+    offlineGrid.innerHTML = offline.map(function(model) { return renderFollowingCard(model); }).join('');
   } else {
     offlineSection.style.display = 'none';
   }
 }
 
-function renderFollowingCard(model, isOnline) {
+function renderFollowingCard(model) {
   var username = model.username || model.name || '';
   var thumbUrl = model.thumbnail_url || model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + username + '.jpg');
   var isTracked = trackedModels.has(username);
   var isRecording = model.isRecording || model.is_recording || false;
-
-  var roomStatus = (model.room_status || model.roomStatus || '').toLowerCase();
-  var isPrivate = !isOnline && PRIVATE_STATUSES.indexOf(roomStatus) !== -1;
-  if (isPrivate) isOnline = false;
+  var isPrivate = isPrivateModel(model);
+  var isOnline = isPubliclyOnline(model);
 
   var statusBadge = '';
   if (isRecording) {
@@ -142,6 +149,7 @@ function renderFollowingCard(model, isOnline) {
   }
 
   var platformBadge = renderPlatformBadge(model.source_type || model.platform || 'chaturbate');
+  var privateRibbon = isPrivate ? '<div class="following-private-ribbon">Private show</div>' : '';
 
   var imgFilter = (isOnline || isPrivate) ? '' : 'filter: grayscale(60%) brightness(0.75);';
 
@@ -149,15 +157,19 @@ function renderFollowingCard(model, isOnline) {
   var subtitleHtml = '';
   if (isOnline && model.viewers > 0) {
     subtitleHtml = '<span style="font-size: 0.8rem; color: var(--text-secondary);">&#128065; ' + Number(model.viewers).toLocaleString() + ' viewers</span>';
+  } else if (isPrivate) {
+    subtitleHtml = '<span style="font-size: 0.8rem; color: #c084fc;">Currently in a private show</span>';
   } else if (!isOnline && model.last_seen_online_at) {
     subtitleHtml = '<span style="font-size: 0.8rem; color: var(--text-muted);">' + formatLastSeen(model.last_seen_online_at) + '</span>';
   }
 
-  return '<div class="following-card ' + (isOnline ? 'is-online' : 'is-offline') + '" data-username="' + escapeHtml(username) + '">' +
-    '<div class="following-card-thumb" onclick="window.location.href=\'/watch/' + escapeHtml(username) + '\'">' +
+  var cardClass = isOnline ? 'is-online' : (isPrivate ? 'is-private' : 'is-offline');
+  return '<div class="following-card ' + cardClass + '" data-username="' + escapeHtml(username) + '">' +
+    '<div class="following-card-thumb" title="' + (isPrivate ? 'Private show' : 'Watch live') + '" onclick="window.location.href=\'/watch/' + escapeHtml(username) + '\'">' +
       '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(username) + '" style="' + imgFilter + '" ' +
         'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22180%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22180%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
       platformBadge +
+      privateRibbon +
     '</div>' +
     '<div class="following-card-info">' +
       '<div class="following-card-header">' +

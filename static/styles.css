@@ -1578,6 +1578,15 @@ button {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3), 0 0 15px rgba(34, 197, 94, 0.2);
 }
 
+.following-card.is-private {
+  border-color: rgba(168, 85, 247, 0.5);
+}
+
+.following-card.is-private:hover {
+  border-color: #c084fc;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3), 0 0 15px rgba(168, 85, 247, 0.24);
+}
+
 .following-card-thumb {
   position: relative;
   cursor: pointer;
@@ -1593,6 +1602,23 @@ button {
 
 .following-card:hover .following-card-thumb img {
   transform: scale(1.05);
+}
+
+.following-private-ribbon {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  padding: 0.5rem 0.75rem;
+  background: linear-gradient(90deg, rgba(88, 28, 135, 0.96), rgba(147, 51, 234, 0.92));
+  color: white;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  text-align: center;
+  text-transform: uppercase;
+  box-shadow: 0 -8px 20px rgba(0, 0, 0, 0.35);
 }
 
 .following-card-info {

@@ -407,6 +407,7 @@ class ChaturbateAPI:
             thumb = "https:" + thumb
         if not thumb:
             thumb = f"https://roomimg.stream.highwebmedia.com/ri/{username}.jpg"
+        room_status = item.get("current_show") or item.get("room_status") or None
 
         return {
             "username": username,
@@ -414,6 +415,7 @@ class ChaturbateAPI:
             "is_online": is_online or item.get("current_show") == "public",
             "viewers": item.get("num_users", 0),
             "thumbnail_url": thumb,
+            "room_status": room_status,
             "tags": item.get("tags", []),
             "subject": item.get("room_subject") or item.get("subject", ""),
             "gender": item.get("gender", ""),

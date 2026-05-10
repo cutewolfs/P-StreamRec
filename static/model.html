@@ -100,6 +100,7 @@
     .status-dot.online { background: var(--success); }
     .status-dot.offline { background: #6b7280; animation: none; }
     .status-dot.recording { background: var(--danger); }
+    .status-dot.private { background: #a855f7; }
     
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -762,9 +763,9 @@
             <span>Online</span>
           </div>
         </div>
-        <div class="empty-message">
-          <div class="icon">📺</div>
-          <p>No stream in progress</p>
+        <div class="empty-message" id="playerEmptyMessage">
+          <div class="icon" id="playerEmptyIcon">📺</div>
+          <p id="playerEmptyText">No stream in progress</p>
         </div>
       </div>
     </div>
@@ -862,6 +863,14 @@
     let liveStreamLoaded = false; // Track if we loaded a live stream without recording
     let modelPlaybackVolume = null;
     let volumeSaveTimeout = null;
+    const PRIVATE_STATUSES = [
+      'private', 'group', 'password_protected', 'password protected',
+      'hidden', 'true_private', 'private_spy'
+    ];
+
+    function isPrivateRoomStatus(roomStatus) {
+      return PRIVATE_STATUSES.includes((roomStatus || '').toLowerCase());
+    }
 
     if (!username) {
       window.location.href = '/';
@@ -997,11 +1006,21 @@
         // Get online status
         const statusRes = await fetch(`/api/model/${username}/status`);
         const modelInfo = statusRes.ok ? await statusRes.json() : { isOnline: false };
+        const privateStatus = isPrivateRoomStatus(modelInfo.roomStatus);
 
-        if (session && session.running) {
+        if (privateStatus) {
+          currentSession = session && session.running ? session : null;
+          document.getElementById('statusDot').className = 'status-dot private';
+          document.getElementById('statusText').textContent = 'Private';
+          if (!currentRecordingFile) {
+            clearLivePlayerForStatusChange();
+            setPlayerEmptyMessage('&#128274;', 'Model is in a Private Show');
+          }
+        } else if (session && session.running) {
           const wasRecording = currentSession && currentSession.id === session.id;
           currentSession = session;
           liveStreamLoaded = false; // Reset since we have a recording session
+          setPlayerEmptyMessage('&#128250;', 'No stream in progress');
           
           console.log('📊 Session found:', session);
           console.log('📺 Playback URL:', session.playback_url);
@@ -1019,6 +1038,7 @@
           }
         } else if (modelInfo.isOnline) {
           currentSession = null;
+          setPlayerEmptyMessage('&#128250;', 'No stream in progress');
           document.getElementById('statusDot').className = 'status-dot online';
           document.getElementById('statusText').textContent = 'Live (Watching)';
           
@@ -1051,11 +1071,39 @@
             return;
           }
           liveStreamLoaded = false; // Reset when offline
+          setPlayerEmptyMessage('&#128250;', 'No stream in progress');
           document.getElementById('statusDot').className = 'status-dot offline';
           document.getElementById('statusText').textContent = 'Offline';
         }
       } catch (e) {
         console.error('Status error:', e);
+      }
+    }
+
+    function setPlayerEmptyMessage(iconHtml, text) {
+      const icon = document.getElementById('playerEmptyIcon');
+      const copy = document.getElementById('playerEmptyText');
+      if (icon) icon.innerHTML = iconHtml;
+      if (copy) copy.textContent = text;
+    }
+
+    function clearLivePlayerForStatusChange() {
+      const video = document.getElementById('player');
+      const container = document.querySelector('.player-container');
+      if (hlsPlayer) {
+        hlsPlayer.destroy();
+        hlsPlayer = null;
+      }
+      liveStreamLoaded = false;
+      showModelLiveControls(false);
+      const qualitySelector = document.getElementById('qualitySelector');
+      if (qualitySelector) qualitySelector.style.display = 'none';
+      const theaterBtn = document.getElementById('theaterBtn');
+      if (theaterBtn) theaterBtn.style.display = 'none';
+      if (container) container.classList.remove('has-video');
+      if (video) {
+        video.removeAttribute('src');
+        video.load();
       }
     }
 

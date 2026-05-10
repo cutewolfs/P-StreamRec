@@ -139,6 +139,7 @@ async def sync_following():
             is_online=is_online,
             viewers=model.get("viewers", 0),
             thumbnail_url=thumb,
+            room_status=model.get("room_status"),
         )
         synced_usernames.add(model["username"])
 

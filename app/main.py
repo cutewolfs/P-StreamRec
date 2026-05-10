@@ -2842,6 +2842,7 @@ async def sync_following_task(chaturbate_api, auth_service):
                         viewers=model.get("viewers", 0),
                         thumbnail_url=model.get("thumbnail_url"),
                         source_type="chaturbate",
+                        room_status=model.get("room_status"),
                     )
                 logger.debug("Following synced", count=len(models), task="following-sync")
         except Exception as e:
@@ -2871,6 +2872,7 @@ async def sync_cam4_following_task(cam4_auth):
                     viewers=int(item.get("viewers") or 0),
                     thumbnail_url=item.get("thumbnail"),
                     source_type="cam4",
+                    room_status=item.get("room_status"),
                 )
             if items:
                 logger.debug("CAM4 following synced", count=len(items), task="cam4-sync")

@@ -22,6 +22,7 @@ let hlsPlayer = null;
 let streamLoaded = false;
 let currentStreamUrl = '';
 let statusCheckInterval = null;
+let streamProblemStatusTimeout = null;
 
 function sourceQuery() {
   return currentSourceType ? ('?source=' + encodeURIComponent(currentSourceType)) : '';
@@ -92,9 +93,23 @@ async function loadModelStatus() {
     var offlineText = document.getElementById('offlineText');
     var offlineIcon = document.getElementById('offlineIcon');
 
-    var priv = !data.isOnline && isPrivateRoomStatus(data.roomStatus);
+    var retryBtn = document.getElementById('retryBtn');
+    var priv = isPrivateRoomStatus(data.roomStatus);
     if (data.sourceType) currentSourceType = data.sourceType;
     updatePlatformBadge(data.sourceType);
+
+    if (priv) {
+      statusDot.className = 'status-dot private';
+      statusText.textContent = 'Private';
+      viewerCount.style.display = 'none';
+      if (offlineIcon) offlineIcon.innerHTML = '&#128274;';
+      if (offlineTitle) offlineTitle.textContent = 'Model is in a Private Show';
+      if (offlineText) offlineText.textContent = formatPrivateText(data.roomStatus);
+      if (retryBtn) retryBtn.style.display = 'none';
+      offlineOverlay.style.display = 'flex';
+      stopStream();
+      return;
+    }
 
     if (data.isOnline) {
       statusDot.className = 'status-dot online';
@@ -111,9 +126,9 @@ async function loadModelStatus() {
       if (hasActiveStream()) {
         // The status API can briefly report offline while the HLS stream is
         // still healthy. Keep the existing player alive instead of pausing it.
-        statusDot.className = priv ? 'status-dot private' : 'status-dot online';
-        statusText.textContent = priv ? 'Private' : 'Live';
-        viewerCount.style.display = priv ? 'none' : 'inline';
+        statusDot.className = 'status-dot online';
+        statusText.textContent = 'Live';
+        viewerCount.style.display = 'inline';
         viewerNum.textContent = Number(data.viewers || 0).toLocaleString();
         offlineOverlay.style.display = 'none';
         return;
@@ -121,7 +136,7 @@ async function loadModelStatus() {
 
       // Status says offline, but try loading the stream anyway
       // The status API can return false negatives (rate limiting, cache miss)
-      if (!hasActiveStream() && !priv) {
+      if (!hasActiveStream()) {
         var loaded = await tryLoadStream();
         if (loaded) {
           statusDot.className = 'status-dot online';
@@ -133,21 +148,13 @@ async function loadModelStatus() {
         }
       }
 
-      if (priv) {
-        statusDot.className = 'status-dot private';
-        statusText.textContent = 'Private';
-        viewerCount.style.display = 'none';
-        if (offlineIcon) offlineIcon.innerHTML = '&#128274;';
-        if (offlineTitle) offlineTitle.textContent = 'Model is in a Private Show';
-        if (offlineText) offlineText.textContent = formatPrivateText(data.roomStatus);
-      } else {
-        statusDot.className = 'status-dot offline';
-        statusText.textContent = 'Offline';
-        viewerCount.style.display = 'none';
-        if (offlineIcon) offlineIcon.innerHTML = '&#128308;';
-        if (offlineTitle) offlineTitle.textContent = 'Model is Offline';
-        if (offlineText) offlineText.textContent = 'This model is currently not streaming.';
-      }
+      statusDot.className = 'status-dot offline';
+      statusText.textContent = 'Offline';
+      viewerCount.style.display = 'none';
+      if (offlineIcon) offlineIcon.innerHTML = '&#128308;';
+      if (offlineTitle) offlineTitle.textContent = 'Model is Offline';
+      if (offlineText) offlineText.textContent = 'This model is currently not streaming.';
+      if (retryBtn) retryBtn.style.display = 'inline-flex';
       offlineOverlay.style.display = 'flex';
 
       // Stop stream if playing
@@ -156,6 +163,14 @@ async function loadModelStatus() {
   } catch (e) {
     console.error('Error loading model status:', e);
   }
+}
+
+function scheduleStatusRefreshAfterStreamProblem() {
+  if (streamProblemStatusTimeout) return;
+  streamProblemStatusTimeout = setTimeout(function() {
+    streamProblemStatusTimeout = null;
+    loadModelStatus();
+  }, 250);
 }
 
 function renderPlatformBadge(sourceType) {
@@ -258,6 +273,7 @@ function startStreamWithUrl(streamUrl) {
     hlsPlayer.on(Hls.Events.ERROR, function(event, data) {
       if (data.fatal) {
         console.error('HLS fatal error:', data.type);
+        scheduleStatusRefreshAfterStreamProblem();
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
             hlsPlayer.startLoad();
@@ -802,6 +818,7 @@ function showNotification(message, type) {
 // ============================================
 window.addEventListener('beforeunload', function() {
   if (statusCheckInterval) clearInterval(statusCheckInterval);
+  if (streamProblemStatusTimeout) clearTimeout(streamProblemStatusTimeout);
   if (volumeSaveTimeout && profilePlaybackVolume !== null) {
     clearTimeout(volumeSaveTimeout);
     persistProfileVolume(profilePlaybackVolume);
@@ -825,10 +842,15 @@ window.addEventListener('DOMContentLoaded', function() {
     video.addEventListener('error', function() {
       streamLoaded = false;
       currentStreamUrl = '';
+      scheduleStatusRefreshAfterStreamProblem();
     });
     video.addEventListener('ended', function() {
       streamLoaded = false;
       currentStreamUrl = '';
+      scheduleStatusRefreshAfterStreamProblem();
+    });
+    video.addEventListener('stalled', function() {
+      scheduleStatusRefreshAfterStreamProblem();
     });
   }
 

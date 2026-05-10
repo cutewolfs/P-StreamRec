@@ -107,7 +107,8 @@ class Database:
                     viewers INTEGER DEFAULT 0,
                     thumbnail_url TEXT,
                     last_seen_online_at INTEGER,
-                    synced_at INTEGER
+                    synced_at INTEGER,
+                    room_status TEXT
                 )
             """)
 
@@ -176,6 +177,7 @@ class Database:
             ("models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("models", "room_status", "TEXT"),
             ("followed_models", "source_type", "TEXT DEFAULT 'chaturbate'"),
+            ("followed_models", "room_status", "TEXT"),
         ]
         for table, column, ddl in migrations:
             try:
@@ -517,6 +519,7 @@ class Database:
         viewers: int = 0,
         thumbnail_url: Optional[str] = None,
         source_type: str = "chaturbate",
+        room_status: Optional[str] = None,
     ):
         """Add or update a followed model"""
         await self.initialize()
@@ -526,9 +529,10 @@ class Database:
             await db.execute("""
                 INSERT INTO followed_models (
                     username, display_name, is_online, viewers,
-                    thumbnail_url, last_seen_online_at, synced_at, source_type
+                    thumbnail_url, last_seen_online_at, synced_at, source_type,
+                    room_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     is_online = ?,
@@ -536,12 +540,14 @@ class Database:
                     thumbnail_url = COALESCE(?, thumbnail_url),
                     last_seen_online_at = CASE WHEN ? THEN ? ELSE last_seen_online_at END,
                     synced_at = ?,
-                    source_type = ?
+                    source_type = ?,
+                    room_status = ?
             """, (
                 username, display_name, is_online, viewers,
                 thumbnail_url, now if is_online else None, now, source_type,
+                room_status,
                 display_name, is_online, viewers, thumbnail_url,
-                is_online, now, now, source_type,
+                is_online, now, now, source_type, room_status,
             ))
             await db.commit()
 

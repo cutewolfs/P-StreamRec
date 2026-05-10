@@ -97,6 +97,7 @@ async def cam4_follow(username: str):
                 viewers=int(status.get("viewers") or 0),
                 thumbnail_url=thumb,
                 source_type="cam4",
+                room_status=status.get("room_status"),
             )
         except Exception as e:
             logger.debug("CAM4 upsert après follow échec", username=username, error=str(e))
@@ -147,6 +148,7 @@ async def cam4_sync_following():
             viewers=int(item.get("viewers") or 0),
             thumbnail_url=item.get("thumbnail"),
             source_type="cam4",
+            room_status=item.get("room_status"),
         )
         synced.add(item["username"])
 
