@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js?v=2"></script>
+  <script defer src="/static/settings.js?v=3"></script>
   <style>
     /* --- Processes tab --- */
     .proc-count-badge {
@@ -123,6 +123,34 @@
       padding: 1rem;
       text-align: center;
     }
+    .tests-list {
+      display: flex;
+      flex-direction: column;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      background: rgba(0,0,0,0.12);
+    }
+    .test-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 1rem;
+      padding: 0.9rem 1rem;
+      border-bottom: 1px solid var(--border);
+      align-items: center;
+    }
+    .test-row:last-child { border-bottom: none; }
+    .test-name {
+      color: var(--text-primary);
+      font-weight: 600;
+      font-size: 0.92rem;
+    }
+    .test-detail {
+      color: var(--text-muted);
+      font-size: 0.8rem;
+      line-height: 1.4;
+      margin-top: 0.2rem;
+    }
     .btn-danger {
       background: #b91c1c; color: white; border: none;
       padding: 0.45rem 0.85rem; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
@@ -167,6 +195,10 @@
         <button class="settings-nav-item" data-tab="processes">
           <span class="settings-nav-icon">&#9881;&#65039;</span>
           <span>Processes <span class="proc-count-badge" id="processesCountBadge"></span></span>
+        </button>
+        <button class="settings-nav-item" data-tab="tests">
+          <span class="settings-nav-icon">&#129514;</span>
+          <span>Tests</span>
         </button>
         <button class="settings-nav-item" data-tab="application">
           <span class="settings-nav-icon">&#8505;</span>
@@ -463,6 +495,29 @@
           </div>
         </div>
 
+        <!-- Tests Tab -->
+        <div class="settings-tab" id="tab-tests">
+          <div class="settings-section">
+            <div class="settings-section-header">
+              <span class="icon">&#129514;</span>
+              <h3>Tests</h3>
+              <div style="margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
+                <button class="btn-primary" id="runAllTestsBtn" onclick="runAllTests()" style="padding: 0.45rem 1rem; font-size: 0.85rem;">Run all tests</button>
+              </div>
+            </div>
+            <div class="settings-section-body">
+              <div class="settings-row">
+                <div>
+                  <span class="settings-row-label">Test Suite</span>
+                  <p id="testsSummary" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Not run</p>
+                </div>
+                <span class="status-indicator unknown" id="testsOverallStatus">Not run</span>
+              </div>
+              <div class="tests-list" id="testsList"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Application Tab -->
         <div class="settings-tab" id="tab-application">
           <div class="settings-section">
@@ -482,62 +537,6 @@
             </div>
           </div>
 
-          <!-- Update Section -->
-          <div class="settings-section" style="margin-top: 1.5rem;">
-            <div class="settings-section-header">
-              <span class="icon">&#128259;</span>
-              <h3>Updates</h3>
-            </div>
-            <div class="settings-section-body">
-              <div id="update-status">
-                <div class="settings-row">
-                  <span class="settings-row-label">Update Status</span>
-                  <span class="status-indicator unknown" id="update-check-status">Not checked</span>
-                </div>
-                <div class="settings-row" id="update-latest-row" style="display: none;">
-                  <span class="settings-row-label">Latest Version</span>
-                  <span class="settings-row-value" id="update-latest-version">-</span>
-                </div>
-                <div class="settings-row" id="update-published-row" style="display: none;">
-                  <span class="settings-row-label">Published</span>
-                  <span class="settings-row-value" id="update-published-at">-</span>
-                </div>
-              </div>
-
-              <!-- Release Notes -->
-              <div id="update-release-notes" style="display: none; margin-top: 1rem;">
-                <p style="font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.5rem;">Release Notes</p>
-                <div id="update-notes-content" style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.6; padding: 0.75rem; background: rgba(0,0,0,0.2); border-radius: 10px; max-height: 200px; overflow-y: auto; white-space: pre-wrap;"></div>
-              </div>
-
-              <!-- Manual Commands (shown when Docker socket unavailable) -->
-              <div id="update-manual-commands" style="display: none; margin-top: 1rem;">
-                <p style="font-size: 0.85rem; font-weight: 600; color: var(--text-secondary); margin-bottom: 0.5rem;">Run these commands on your host:</p>
-                <div style="display: flex; align-items: center; gap: 0.5rem;">
-                  <code id="update-commands-text" style="flex: 1; display: block; font-size: 0.85rem; color: var(--accent-light); padding: 0.75rem; background: rgba(0,0,0,0.3); border-radius: 10px; border: 1px solid var(--border); font-family: monospace; white-space: pre-wrap;"></code>
-                  <button class="btn-secondary" onclick="copyUpdateCommands()" style="padding: 0.5rem 0.75rem; font-size: 0.8rem; flex-shrink: 0;">Copy</button>
-                </div>
-              </div>
-
-              <!-- Progress bar -->
-              <div id="update-progress" style="display: none; margin-top: 1rem;">
-                <div style="background: rgba(255,255,255,0.06); border-radius: 8px; height: 6px; overflow: hidden;">
-                  <div id="update-progress-bar" style="height: 100%; background: var(--accent); border-radius: 8px; transition: width 0.3s ease; width: 0%;"></div>
-                </div>
-                <p id="update-progress-text" style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.5rem;">Preparing...</p>
-              </div>
-
-              <!-- Action Buttons -->
-              <div class="settings-actions" style="margin-top: 1.25rem;">
-                <button class="btn-primary" id="check-update-btn" onclick="checkForUpdate()" style="padding: 0.6rem 1.25rem; font-size: 0.9rem;">Check for Updates</button>
-                <button class="btn-primary" id="apply-update-btn" onclick="applyUpdate()" style="padding: 0.6rem 1.25rem; font-size: 0.9rem; display: none; background: linear-gradient(135deg, #10b981 0%, #059669 100%);">Update Now</button>
-              </div>
-
-              <p style="margin-top: 1rem; font-size: 0.8rem; color: var(--text-muted); line-height: 1.5;">
-                For automatic updates, mount the Docker socket: <code style="color: var(--accent-light); font-size: 0.8rem;">-v /var/run/docker.sock:/var/run/docker.sock</code>
-              </p>
-            </div>
-          </div>
         </div>
 
         <!-- Statistics Tab -->

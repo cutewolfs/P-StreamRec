@@ -981,6 +981,8 @@ async def _build_process_snapshot(sess_status: dict) -> dict:
         "record_size_bytes": None,
         "segment_count": None,
         "quality": None,
+        "bytes_written": sess_status.get("bytes_written"),
+        "seconds_since_progress": sess_status.get("seconds_since_progress"),
     }
 
     # Resolve the underlying FFmpegSession to grab the live process
@@ -2720,6 +2722,34 @@ async def _recalculate_durations_task():
 # Background Task - Auto-enregistrement
 # ============================================
 
+async def ffmpeg_watchdog_task():
+    """Stop FFmpeg sessions that stay alive without writing any TS data."""
+    timeout = getattr(manager, "stall_timeout_seconds", 180)
+    if timeout <= 0:
+        logger.info("FFmpeg watchdog désactivé", task="ffmpeg-watchdog")
+        return
+
+    while True:
+        try:
+            stopped = manager.stop_stalled_sessions(timeout)
+            if stopped:
+                logger.warning(
+                    "Sessions FFmpeg bloquées arrêtées",
+                    task="ffmpeg-watchdog",
+                    count=len(stopped),
+                    sessions=stopped,
+                )
+            await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(
+                "Erreur watchdog FFmpeg",
+                task="ffmpeg-watchdog",
+                error=str(e),
+                exc_info=True,
+            )
+            await asyncio.sleep(60)
+
+
 async def auto_record_task():
     """Vérifie automatiquement les modèles et lance les enregistrements (utilise SQLite)"""
     while True:
@@ -3041,10 +3071,11 @@ async def startup_event():
 
     # Démarrer les tâches de fond
     asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, chaturbate_auth=cb_auth, cam4_auth=cam4_auth_service))
+    asyncio.create_task(ffmpeg_watchdog_task())
     asyncio.create_task(auto_record_task())
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))
     asyncio.create_task(sync_following_task(cb_api, cb_auth))
     asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     logger.info("Background tasks démarrés",
-                tasks=["monitor", "auto-record", "cleanup", "convert", "following-sync", "cam4-sync"])
+                tasks=["monitor", "ffmpeg-watchdog", "auto-record", "cleanup", "convert", "following-sync", "cam4-sync"])

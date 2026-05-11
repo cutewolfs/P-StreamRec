@@ -26,6 +26,11 @@ function initTabs() {
         loadLogs();
         logsLoaded = true;
       }
+      if (tabId === 'tests' && !testsLoaded) {
+        renderTestsList();
+        runAllTests();
+        testsLoaded = true;
+      }
       if (tabId === 'processes') {
         startProcessesPolling();
       } else {
@@ -37,6 +42,7 @@ function initTabs() {
 
 var statsLoaded = false;
 var logsLoaded = false;
+var testsLoaded = false;
 var logsOffset = 0;
 var statsRefreshInterval = null;
 
@@ -759,191 +765,210 @@ function renderStats(data) {
 }
 
 // ============================================
-// Update System
+// Tests Center
 // ============================================
 
-var lastUpdateData = null;
+var testStates = {};
 
-async function checkForUpdate() {
-  var btn = document.getElementById('check-update-btn');
-  var statusEl = document.getElementById('update-check-status');
-  var latestRow = document.getElementById('update-latest-row');
-  var latestEl = document.getElementById('update-latest-version');
-  var publishedRow = document.getElementById('update-published-row');
-  var publishedEl = document.getElementById('update-published-at');
-  var applyBtn = document.getElementById('apply-update-btn');
-  var notesContainer = document.getElementById('update-release-notes');
-  var notesContent = document.getElementById('update-notes-content');
-  var manualEl = document.getElementById('update-manual-commands');
-
-  btn.disabled = true;
-  btn.textContent = 'Checking...';
-  statusEl.className = 'status-indicator unknown';
-  statusEl.textContent = 'Checking...';
-  applyBtn.style.display = 'none';
-  notesContainer.style.display = 'none';
-  manualEl.style.display = 'none';
-
-  try {
-    var res = await fetch('/api/system/check-update');
-    if (!res.ok) {
-      statusEl.className = 'status-indicator disconnected';
-      statusEl.textContent = 'Error';
-      showNotification('Failed to check for updates', 'error');
-      return;
-    }
-
-    var data = await res.json();
-    lastUpdateData = data;
-
-    if (data.error && !data.latest_version) {
-      statusEl.className = 'status-indicator disconnected';
-      statusEl.textContent = 'Error';
-      showNotification('Update check failed: ' + data.error, 'error');
-      return;
-    }
-
-    // Show latest version
-    latestRow.style.display = 'flex';
-    latestEl.textContent = 'v' + (data.latest_version || 'unknown');
-
-    if (data.published_at) {
-      publishedRow.style.display = 'flex';
-      var date = new Date(data.published_at);
-      publishedEl.textContent = date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
-    }
-
-    if (data.update_available) {
-      statusEl.className = 'status-indicator unknown';
-      statusEl.textContent = 'Update available';
-
-      if (data.release_notes) {
-        notesContainer.style.display = 'block';
-        notesContent.textContent = data.release_notes;
+function fetchJsonNoCache(url) {
+  return fetch(url, { cache: 'no-store' }).then(function(res) {
+    return res.json().catch(function() { return {}; }).then(function(data) {
+      if (!res.ok) {
+        throw new Error('HTTP ' + res.status);
       }
-
-      if (data.docker_available) {
-        applyBtn.style.display = 'inline-flex';
-      } else {
-        // Docker socket not mounted — show manual commands directly
-        applyBtn.style.display = 'none';
-        var commandsText = document.getElementById('update-commands-text');
-        manualEl.style.display = 'block';
-        commandsText.textContent = 'docker compose pull && docker compose up -d';
-      }
-
-      showNotification('Update available: v' + data.latest_version, 'success');
-    } else {
-      statusEl.className = 'status-indicator connected';
-      statusEl.textContent = 'Up to date';
-      showNotification('You are running the latest version', 'success');
-    }
-  } catch (e) {
-    console.error('Error checking for updates:', e);
-    statusEl.className = 'status-indicator disconnected';
-    statusEl.textContent = 'Error';
-    showNotification('Connection error', 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Check for Updates';
-  }
-}
-
-async function applyUpdate() {
-  var applyBtn = document.getElementById('apply-update-btn');
-  var progressEl = document.getElementById('update-progress');
-  var progressBar = document.getElementById('update-progress-bar');
-  var progressText = document.getElementById('update-progress-text');
-  var manualEl = document.getElementById('update-manual-commands');
-  var commandsText = document.getElementById('update-commands-text');
-
-  if (!confirm('Update to the latest version? The application will restart.')) return;
-
-  applyBtn.disabled = true;
-  applyBtn.textContent = 'Updating...';
-  progressEl.style.display = 'block';
-  progressBar.style.width = '10%';
-  progressText.textContent = 'Pulling latest image...';
-
-  try {
-    progressBar.style.width = '30%';
-    var res = await fetch('/api/system/update', { method: 'POST' });
-    var data = await res.json();
-
-    if (data.success) {
-      progressBar.style.width = '80%';
-      progressText.textContent = 'Restarting application...';
-
-      showNotification('Update in progress! Page will reload shortly...', 'success');
-
-      // Poll for the app to come back
-      progressBar.style.width = '90%';
-      progressText.textContent = 'Waiting for restart...';
-
-      setTimeout(function() {
-        progressBar.style.width = '100%';
-        waitForRestart();
-      }, 5000);
-    } else {
-      progressBar.style.width = '0%';
-      progressEl.style.display = 'none';
-      applyBtn.disabled = false;
-      applyBtn.textContent = 'Update Now';
-
-      if (data.manual_commands) {
-        manualEl.style.display = 'block';
-        commandsText.textContent = data.manual_commands;
-      }
-
-      showNotification(data.message || 'Update failed', 'error');
-    }
-  } catch (e) {
-    console.error('Error applying update:', e);
-    progressBar.style.width = '0%';
-    progressEl.style.display = 'none';
-    applyBtn.disabled = false;
-    applyBtn.textContent = 'Update Now';
-    showNotification('Connection error during update', 'error');
-  }
-}
-
-function waitForRestart() {
-  var progressText = document.getElementById('update-progress-text');
-  var attempts = 0;
-  var maxAttempts = 30;
-
-  var interval = setInterval(function() {
-    attempts++;
-    if (attempts > maxAttempts) {
-      clearInterval(interval);
-      progressText.textContent = 'Restart is taking longer than expected. Please refresh manually.';
-      return;
-    }
-
-    progressText.textContent = 'Waiting for restart... (' + attempts + 's)';
-
-    fetch('/api/version', { signal: AbortSignal.timeout(3000) })
-      .then(function(res) {
-        if (res.ok) {
-          clearInterval(interval);
-          progressText.textContent = 'Updated successfully! Reloading...';
-          showNotification('Update complete!', 'success');
-          setTimeout(function() { window.location.reload(); }, 1000);
-        }
-      })
-      .catch(function() {
-        // Still restarting
-      });
-  }, 2000);
-}
-
-function copyUpdateCommands() {
-  var text = document.getElementById('update-commands-text').textContent;
-  navigator.clipboard.writeText(text).then(function() {
-    showNotification('Commands copied to clipboard', 'success');
-  }).catch(function() {
-    showNotification('Failed to copy', 'error');
+      return data;
+    });
   });
+}
+
+function testResult(state, detail) {
+  return { state: state, detail: detail || '-' };
+}
+
+var testDefinitions = [
+  {
+    id: 'api',
+    name: 'API',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/version');
+      return testResult('pass', 'v' + (data.version || 'unknown') + ' - ' + (data.output_dir || 'output dir unknown'));
+    }
+  },
+  {
+    id: 'system',
+    name: 'System stats',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/system/stats');
+      var disk = data.disk || {};
+      var cpu = data.cpu || {};
+      return testResult('pass', 'Disk ' + (disk.percent != null ? disk.percent + '%' : '-') + ' - CPU ' + (cpu.usage_percent != null ? cpu.usage_percent + '%' : '-'));
+    }
+  },
+  {
+    id: 'recording',
+    name: 'Recording settings',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/settings/recording');
+      var maxRes = data.max_resolution ? data.max_resolution + 'p max' : 'best max';
+      var defaultRes = data.default_resolution ? data.default_resolution + 'p default' : 'best default';
+      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + defaultRes + ' - ' + maxRes);
+    }
+  },
+  {
+    id: 'processes',
+    name: 'FFmpeg processes',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/processes');
+      var totals = data.totals || {};
+      return testResult('pass', (totals.active || 0) + ' active / ' + (totals.total || 0) + ' total');
+    }
+  },
+  {
+    id: 'chaturbate',
+    name: 'Chaturbate account',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/chaturbate/status');
+      if (data.isLoggedIn) {
+        return testResult('pass', 'Connected as ' + (data.username || 'saved session'));
+      }
+      return testResult('warn', 'Not connected');
+    }
+  },
+  {
+    id: 'cam4',
+    name: 'CAM4 account',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/cam4/status');
+      if (data.isLoggedIn) {
+        return testResult('pass', 'Connected as ' + (data.username || 'saved session'));
+      }
+      return testResult('warn', data.lastError || 'Not connected');
+    }
+  },
+  {
+    id: 'flaresolverr',
+    name: 'FlareSolverr',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/chaturbate/status');
+      if (data.flaresolverrAvailable) {
+        return testResult('pass', data.flaresolverrVersion ? 'Healthy - ' + data.flaresolverrVersion : 'Healthy');
+      }
+      return testResult('warn', data.flaresolverrMessage || 'Not available');
+    }
+  },
+  {
+    id: 'recordings',
+    name: 'Recordings index',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/all-recordings?limit=1');
+      return testResult('pass', (data.total || 0) + ' recordings - ' + (data.totalSizeFormatted || '0 B'));
+    }
+  }
+];
+
+function testStatusClass(state) {
+  if (state === 'pass') return 'connected';
+  if (state === 'fail') return 'disconnected';
+  return 'unknown';
+}
+
+function testStatusText(state) {
+  if (state === 'pass') return 'Passed';
+  if (state === 'warn') return 'Warning';
+  if (state === 'fail') return 'Failed';
+  if (state === 'running') return 'Running';
+  return 'Not run';
+}
+
+function renderTestsList() {
+  var list = document.getElementById('testsList');
+  if (!list) return;
+
+  list.innerHTML = testDefinitions.map(function(test) {
+    var state = testStates[test.id] || { state: 'not-run', detail: '-' };
+    return '<div class="test-row" id="test-row-' + test.id + '">' +
+      '<div>' +
+        '<div class="test-name">' + escapeHtml(test.name) + '</div>' +
+        '<div class="test-detail" id="test-detail-' + test.id + '">' + escapeHtml(state.detail) + '</div>' +
+      '</div>' +
+      '<span class="status-indicator ' + testStatusClass(state.state) + '" id="test-status-' + test.id + '">' + testStatusText(state.state) + '</span>' +
+    '</div>';
+  }).join('');
+}
+
+function setTestState(id, state, detail) {
+  testStates[id] = { state: state, detail: detail || '-' };
+
+  var statusEl = document.getElementById('test-status-' + id);
+  var detailEl = document.getElementById('test-detail-' + id);
+  if (statusEl) {
+    statusEl.className = 'status-indicator ' + testStatusClass(state);
+    statusEl.textContent = testStatusText(state);
+  }
+  if (detailEl) {
+    detailEl.textContent = detail || '-';
+  }
+}
+
+function updateTestsSummary() {
+  var passed = 0;
+  var warned = 0;
+  var failed = 0;
+  var finished = 0;
+
+  testDefinitions.forEach(function(test) {
+    var state = (testStates[test.id] || {}).state;
+    if (state === 'pass') passed++;
+    if (state === 'warn') warned++;
+    if (state === 'fail') failed++;
+    if (state === 'pass' || state === 'warn' || state === 'fail') finished++;
+  });
+
+  var summaryEl = document.getElementById('testsSummary');
+  var overallEl = document.getElementById('testsOverallStatus');
+  if (summaryEl) {
+    summaryEl.textContent = finished + '/' + testDefinitions.length + ' complete - ' + passed + ' passed - ' + warned + ' warnings - ' + failed + ' failed';
+  }
+  if (overallEl) {
+    var overallState = failed > 0 ? 'fail' : (warned > 0 ? 'warn' : (finished === testDefinitions.length ? 'pass' : 'running'));
+    overallEl.className = 'status-indicator ' + testStatusClass(overallState);
+    overallEl.textContent = testStatusText(overallState);
+  }
+}
+
+async function runSingleTest(test) {
+  setTestState(test.id, 'running', 'Running...');
+  updateTestsSummary();
+  try {
+    var result = await test.run();
+    setTestState(test.id, result.state || 'pass', result.detail || '-');
+  } catch (e) {
+    setTestState(test.id, 'fail', e.message || 'Failed');
+  }
+  updateTestsSummary();
+}
+
+async function runAllTests() {
+  var btn = document.getElementById('runAllTestsBtn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Running...';
+  }
+
+  renderTestsList();
+  testDefinitions.forEach(function(test) {
+    setTestState(test.id, 'running', 'Queued...');
+  });
+  updateTestsSummary();
+
+  await Promise.all(testDefinitions.map(function(test) {
+    return runSingleTest(test);
+  }));
+
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Run all tests';
+  }
 }
 
 // ============================================
@@ -1115,6 +1140,7 @@ function escapeProcHtml(s) {
 function statusDotClass(p) {
   if (!p.running || !p.pid) return 'stopped';
   if (p.status === 'Z') return 'zombie';
+  if (p.seconds_since_progress != null && p.seconds_since_progress > 120) return 'zombie';
   return '';
 }
 
@@ -1204,6 +1230,7 @@ function renderProcesses(data) {
 function renderProcDetail(p) {
   var input = p.input_url || '-';
   var inputShort = input.length > 80 ? input.slice(0, 80) + '…' : input;
+  var lastData = p.seconds_since_progress != null ? fmtDuration(p.seconds_since_progress) + ' ago' : '-';
   var io = '';
   if (p.io_read_bytes != null || p.io_write_bytes != null) {
     io = '<div class="kv"><span class="k">IO read</span><span class="v">' + fmtBytes(p.io_read_bytes) + '</span></div>' +
@@ -1223,6 +1250,8 @@ function renderProcDetail(p) {
     '<div class="kv"><span class="k">CPU</span><span class="v">' + (p.cpu_percent != null ? p.cpu_percent.toFixed(1) + ' %' : '-') + '</span></div>' +
     '<div class="kv"><span class="k">RSS</span><span class="v">' + fmtBytes(p.rss_bytes) + '</span></div>' +
     '<div class="kv"><span class="k">VSZ</span><span class="v">' + fmtBytes(p.vsz_bytes) + '</span></div>' +
+    '<div class="kv"><span class="k">Written</span><span class="v">' + fmtBytes(p.bytes_written) + '</span></div>' +
+    '<div class="kv"><span class="k">Last data</span><span class="v">' + lastData + '</span></div>' +
     io +
     '<h4>Paths</h4>' +
     '<div class="kv"><span class="k">Quality</span><span class="v">' + escapeProcHtml(p.record_quality || '?') + ' &rarr; ' + escapeProcHtml(p.quality || '?') + ' (effective)</span></div>' +

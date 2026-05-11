@@ -51,6 +51,8 @@ class FFmpegSession:
         self._stop_evt = threading.Event()
         self._writer_thread: Optional[threading.Thread] = None
         self.bytes_written = 0
+        self.last_progress_at = self.start_time
+        self.exit_returncode: Optional[int] = None
         self.completed_at: Optional[str] = None
         
         logger.debug("FFmpegSession initialisée", 
@@ -61,7 +63,16 @@ class FFmpegSession:
                     records_dir=records_dir_for_person)
 
     def is_running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
+        if self.process is None:
+            return False
+        rc = self.process.poll()
+        if rc is not None:
+            self.exit_returncode = rc
+            return False
+        return True
+
+    def seconds_since_progress(self) -> float:
+        return max(0.0, time.time() - self.last_progress_at)
     
     def record_path_today(self) -> str:
         # Utilise la date de début du stream (pas de rotation)
@@ -104,6 +115,7 @@ class FFmpegSession:
                 total_bytes += len(chunk)
                 chunk_count += 1
                 self.bytes_written = total_bytes
+                self.last_progress_at = time.time()
 
                 # Log tous les 100MB (compteur monotone, évite les faux positifs du modulo)
                 threshold_100mb = total_bytes // (100 * 1024 * 1024)
@@ -134,6 +146,8 @@ class FFmpegSession:
                            session_id=self.id, 
                            error=str(e))
             self.bytes_written = total_bytes
+            if self.process:
+                self.exit_returncode = self.process.poll()
             self.completed_at = datetime.utcnow().isoformat() + "Z"
             self._cleanup_short_recording(total_bytes, elapsed)
 
@@ -175,6 +189,10 @@ class FFmpegManager:
         self.hls_list_size = hls_list_size
         self._lock = threading.Lock()
         self._sessions: Dict[str, FFmpegSession] = {}
+        try:
+            self.stall_timeout_seconds = int(os.getenv("FFMPEG_STALL_TIMEOUT_SECONDS", "180"))
+        except ValueError:
+            self.stall_timeout_seconds = 180
         # Create subdirectories for sessions (HLS) and records (TS by person/day)
         self.sessions_root = os.path.join(self.base_output_dir, "sessions")
         self.records_root = os.path.join(self.base_output_dir, "records")
@@ -186,6 +204,7 @@ class FFmpegManager:
                    ffmpeg_path=ffmpeg_path,
                    hls_time=hls_time,
                    hls_list_size=hls_list_size,
+                   stall_timeout_seconds=self.stall_timeout_seconds,
                    sessions_root=self.sessions_root,
                    records_root=self.records_root)
 
@@ -193,6 +212,8 @@ class FFmpegManager:
         logger.ffmpeg_start("new", person, input_url)
         
         with self._lock:
+            self._prune_finished_locked()
+
             # Prevent concurrent session for the same person to avoid TS conflicts
             for s in self._sessions.values():
                 if getattr(s, "person", None) == person and s.is_running():
@@ -232,7 +253,10 @@ class FFmpegManager:
                 "-reconnect", "1",
                 "-reconnect_at_eof", "1",
                 "-reconnect_on_network_error", "1",
-                "-reconnect_on_http_error", "4xx,5xx",
+                # 403/404 generally mean an expired HLS token/segment. Retrying
+                # the same URL keeps a dead session around; let the monitor
+                # re-resolve instead. 5xx remains worth retrying briefly.
+                "-reconnect_on_http_error", "5xx",
                 "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "10",
                 "-reconnect_delay_total_max", "120",
@@ -293,6 +317,8 @@ class FFmpegManager:
             try:
                 logger.progress("Lancement processus FFmpeg", session_id=session_id, person=person)
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log_f)
+                log_f.close()
+                log_f = None
                 sess.process = proc
                 self._sessions[sess.id] = sess
                 
@@ -320,6 +346,7 @@ class FFmpegManager:
                     if sess._writer_thread and sess._writer_thread.is_alive():
                         sess._writer_thread.join(timeout=2)
                     self._sessions.pop(sess.id, None)
+                    sess.exit_returncode = proc.returncode
                     logger.warning(
                         "FFmpeg arrêté immédiatement",
                         session_id=session_id,
@@ -337,10 +364,44 @@ class FFmpegManager:
                               session_id=session_id,
                               person=person,
                               error=str(e))
-                log_f.close()
+                if log_f is not None:
+                    log_f.close()
+                if sess.process and sess.process.poll() is None:
+                    try:
+                        sess.process.terminate()
+                        sess.process.wait(timeout=5)
+                    except Exception:
+                        try:
+                            sess.process.kill()
+                        except Exception:
+                            pass
+                self._sessions.pop(sess.id, None)
                 raise
 
             return sess
+
+    def _finalize_session_locked(self, sess: FFmpegSession, join_timeout: float = 0.2):
+        if sess.process:
+            sess.exit_returncode = sess.process.poll()
+        if sess._writer_thread and sess._writer_thread.is_alive():
+            sess._writer_thread.join(timeout=join_timeout)
+
+    def _prune_finished_locked(self) -> int:
+        pruned = 0
+        for session_id, sess in list(self._sessions.items()):
+            if sess.is_running():
+                continue
+            self._finalize_session_locked(sess)
+            self._sessions.pop(session_id, None)
+            pruned += 1
+            logger.info(
+                "Session FFmpeg terminée retirée du registre",
+                session_id=session_id,
+                person=sess.person,
+                returncode=sess.exit_returncode,
+                bytes_written=sess.bytes_written,
+            )
+        return pruned
 
     def stop_session(self, session_id: str) -> bool:
         with self._lock:
@@ -366,6 +427,11 @@ class FFmpegManager:
                     except subprocess.TimeoutExpired:
                         logger.warning("Timeout terminate, kill forcé", session_id=session_id)
                         sess.process.kill()
+                        try:
+                            sess.process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            logger.error("Processus FFmpeg toujours vivant après kill", session_id=session_id)
+                    sess.exit_returncode = sess.process.poll()
                 except Exception as e:
                     logger.error("Erreur arrêt processus FFmpeg", 
                                session_id=session_id, 
@@ -388,10 +454,54 @@ class FFmpegManager:
                           session_id=session_id, 
                           person=sess.person,
                           duration_seconds=f"{duration:.1f}")
+            self._sessions.pop(session_id, None)
             return True
+
+    def stalled_session_ids(self, max_idle_seconds: Optional[int] = None) -> List[str]:
+        if max_idle_seconds is None:
+            max_idle_seconds = self.stall_timeout_seconds
+        if max_idle_seconds <= 0:
+            return []
+
+        with self._lock:
+            self._prune_finished_locked()
+            stalled = []
+            for sess in self._sessions.values():
+                if not sess.is_running():
+                    continue
+                runtime = time.time() - sess.start_time
+                idle = sess.seconds_since_progress()
+                if runtime >= max_idle_seconds and idle >= max_idle_seconds:
+                    stalled.append(sess.id)
+            return stalled
+
+    def stop_stalled_sessions(self, max_idle_seconds: Optional[int] = None) -> List[dict]:
+        stopped = []
+        for session_id in self.stalled_session_ids(max_idle_seconds):
+            with self._lock:
+                sess = self._sessions.get(session_id)
+                if not sess:
+                    continue
+                info = {
+                    "id": sess.id,
+                    "person": sess.person,
+                    "bytes_written": sess.bytes_written,
+                    "idle_seconds": int(sess.seconds_since_progress()),
+                }
+                logger.warning(
+                    "Session FFmpeg sans progression, arrêt watchdog",
+                    session_id=sess.id,
+                    person=sess.person,
+                    bytes_written=sess.bytes_written,
+                    idle_seconds=info["idle_seconds"],
+                )
+            if self.stop_session(session_id):
+                stopped.append(info)
+        return stopped
 
     def list_status(self) -> List[dict]:
         with self._lock:
+            self._prune_finished_locked()
             out = []
             for sess in self._sessions.values():
                 out.append({
@@ -404,6 +514,8 @@ class FFmpegManager:
                     "playback_url": sess.playback_url,
                     "record_path": sess.record_path,
                     "start_date": sess.start_date,
+                    "bytes_written": sess.bytes_written,
+                    "seconds_since_progress": int(sess.seconds_since_progress()),
                 })
             logger.debug("Liste status sessions", count=len(out), sessions=[s["id"] for s in out])
             return out
