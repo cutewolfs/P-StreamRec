@@ -219,8 +219,7 @@ async function trackFollowedModel(username, btn) {
         body: JSON.stringify({
           username: username,
           autoRecord: true,
-          recordQuality: 'best',
-          retentionDays: 30
+          recordQuality: 'best'
         })
       });
     }

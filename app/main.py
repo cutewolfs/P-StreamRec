@@ -1744,12 +1744,17 @@ async def add_model(model: dict):
             detail=f"Source '{source_type}' non disponible",
         )
 
+    if "retentionDays" in model and model.get("retentionDays") is not None:
+        retention_days = _normalize_retention_days(model.get("retentionDays"))
+    else:
+        retention_days = await _get_default_retention_days()
+
     # Ajouter dans SQLite
     await db.add_or_update_model(
         username=username,
         auto_record=auto_record,
         record_quality=record_quality,
-        retention_days=model.get('retentionDays', 30),
+        retention_days=retention_days,
         source_type=source_type,
     )
     
@@ -1775,12 +1780,20 @@ async def update_model(username: str, model_data: dict):
     if not existing:
         raise HTTPException(status_code=404, detail="Modèle introuvable")
     
+    if "retentionDays" in model_data and model_data.get("retentionDays") is not None:
+        retention_days = _normalize_retention_days(
+            model_data.get("retentionDays"),
+            existing.get("retention_days", 30),
+        )
+    else:
+        retention_days = existing.get("retention_days", 30)
+
     # Mettre à jour dans SQLite
     await db.add_or_update_model(
         username=username,
         auto_record=model_data.get('autoRecord', existing.get('auto_record', True)),
         record_quality=model_data.get('recordQuality', existing.get('record_quality', 'best')),
-        retention_days=model_data.get('retentionDays', existing.get('retention_days', 30)),
+        retention_days=retention_days,
         source_type=_normalize_source_type(
             model_data.get('sourceType') or model_data.get('source_type')
         ),
@@ -2276,7 +2289,7 @@ async def set_blacklisted_tags(body: dict):
 
 @app.get("/api/settings/recording")
 async def get_recording_settings():
-    """Get recording settings (auto_convert, keep_ts, show_ts_files, auto_delete_watched, auto_delete_threshold)"""
+    """Get recording settings."""
     from .core.config import AUTO_CONVERT, KEEP_TS
 
     auto_convert_val = await db.get_setting("auto_convert")
@@ -2319,6 +2332,8 @@ async def get_recording_settings():
     except (ValueError, TypeError):
         default_resolution = 0
 
+    default_retention_days = await _get_default_retention_days()
+
     return {
         "auto_convert": auto_convert,
         "keep_ts": keep_ts,
@@ -2327,11 +2342,36 @@ async def get_recording_settings():
         "auto_delete_threshold": auto_delete_threshold,
         "max_resolution": max_resolution,
         "default_resolution": default_resolution,
+        "default_retention_days": default_retention_days,
     }
 
 
 # Allowed HLS heights. 0 means "best available".
 _ALLOWED_MAX_RESOLUTIONS = {0, 360, 480, 720, 1080, 1440, 2160}
+_DEFAULT_RETENTION_DAYS = 30
+_MAX_RETENTION_DAYS = 365
+
+
+def _normalize_retention_days(value, default: int = _DEFAULT_RETENTION_DAYS) -> int:
+    """Return a valid retention window. 0 means keep forever."""
+    try:
+        retention_days = int(value)
+    except (ValueError, TypeError):
+        retention_days = default
+
+    if retention_days < 0:
+        raise HTTPException(status_code=400, detail="retentionDays must be 0 or greater")
+    if retention_days > _MAX_RETENTION_DAYS:
+        raise HTTPException(status_code=400, detail=f"retentionDays must be <= {_MAX_RETENTION_DAYS}")
+    return retention_days
+
+
+async def _get_default_retention_days() -> int:
+    raw = await db.get_setting("default_retention_days")
+    try:
+        return _normalize_retention_days(raw if raw is not None else _DEFAULT_RETENTION_DAYS)
+    except HTTPException:
+        return _DEFAULT_RETENTION_DAYS
 
 
 async def _get_max_recording_height() -> Optional[int]:
@@ -2396,6 +2436,9 @@ async def _get_recording_height_for_quality(
 @app.put("/api/settings/recording")
 async def update_recording_settings(body: dict):
     """Update recording settings."""
+    applied_retention_models = None
+    default_retention_days = None
+
     if "auto_convert" in body:
         await db.set_setting("auto_convert", str(body["auto_convert"]).lower())
     if "keep_ts" in body:
@@ -2429,9 +2472,19 @@ async def update_recording_settings(body: dict):
                 detail=f"default_resolution must be one of {sorted(_ALLOWED_MAX_RESOLUTIONS)}"
             )
         await db.set_setting("default_resolution", str(default_res))
+    if "default_retention_days" in body:
+        default_retention_days = _normalize_retention_days(body["default_retention_days"])
+        await db.set_setting("default_retention_days", str(default_retention_days))
+    if body.get("apply_default_retention_to_models"):
+        if default_retention_days is None:
+            default_retention_days = await _get_default_retention_days()
+        applied_retention_models = await db.update_all_models_retention_days(default_retention_days)
 
     # Return current state
-    return await get_recording_settings()
+    settings = await get_recording_settings()
+    if applied_retention_models is not None:
+        settings["applied_retention_models"] = applied_retention_models
+    return settings
 
 
 # ============================================

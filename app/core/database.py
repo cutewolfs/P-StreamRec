@@ -343,6 +343,19 @@ class Database:
             await db.commit()
         
         logger.info("Modèle supprimé", username=username)
+
+    async def update_all_models_retention_days(self, retention_days: int) -> int:
+        """Apply one retention window to every tracked model."""
+        await self.initialize()
+
+        now = int(datetime.now().timestamp())
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                UPDATE models
+                SET retention_days = ?, updated_at = ?
+            """, (retention_days, now))
+            await db.commit()
+            return cursor.rowcount or 0
     
     async def add_or_update_recording(
         self,

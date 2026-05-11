@@ -19,6 +19,7 @@ let currentDetailRecordings = [];     // cached recordings used for timeline
 let timelineNowInterval = null;       // setInterval id for the blinking-now line update
 let globalMaxResolution = 0;          // 0 = no global cap; otherwise pixel height
 let globalDefaultResolution = 0;      // 0 = "best"; otherwise pixel height (used when enrolling new models)
+let globalDefaultRetention = 30;      // 0 = keep forever
 
 // ============================================
 // Load recordings grouped by model
@@ -31,6 +32,7 @@ async function loadShowTsSetting() {
       showTsFiles = !!data.show_ts_files;
       globalMaxResolution = parseInt(data.max_resolution, 10) || 0;
       globalDefaultResolution = parseInt(data.default_resolution, 10) || 0;
+      globalDefaultRetention = normalizeRetentionDays(data.default_retention_days, 30);
     }
   } catch (e) {
     console.error('Error loading show_ts setting:', e);
@@ -44,6 +46,12 @@ function qualityToHeight(q) {
   if (s === 'best' || s === 'auto' || s === 'highest') return 0;
   var m = s.match(/^(\d+)\s*p?$/);
   return m ? parseInt(m[1], 10) : 0;
+}
+
+function normalizeRetentionDays(value, fallback) {
+  var parsed = parseInt(value, 10);
+  if (isNaN(parsed)) parsed = fallback;
+  return Math.max(0, Math.min(365, parsed));
 }
 
 // Combine per-model quality with the global cap. Mirrors the server logic.
@@ -308,7 +316,7 @@ async function loadModelSettings(username) {
 
   // Reset to defaults while loading
   qSel.value = 'best';
-  rInp.value = 30;
+  rInp.value = globalDefaultRetention;
   aSel.value = 'true';
   saveBtn.disabled = false;
   saveBtn.textContent = 'Save Changes';
@@ -326,6 +334,7 @@ async function loadModelSettings(username) {
       var sdata = await sres.json();
       globalMaxResolution = parseInt(sdata.max_resolution, 10) || 0;
       globalDefaultResolution = parseInt(sdata.default_resolution, 10) || 0;
+      globalDefaultRetention = normalizeRetentionDays(sdata.default_retention_days, 30);
     }
   } catch (e) { /* keep cached value */ }
 
@@ -373,6 +382,7 @@ async function loadModelSettings(username) {
         qSel.appendChild(dopt);
       }
       qSel.value = defQ;
+      rInp.value = globalDefaultRetention;
       console.debug('[recordings] model not tracked yet:', username, 'default=', defQ);
     }
     updateEffectiveHint();
@@ -391,7 +401,7 @@ async function saveModelSettings() {
 
   var payload = {
     recordQuality: qSel.value,
-    retentionDays: Math.max(1, parseInt(rInp.value, 10) || 30),
+    retentionDays: normalizeRetentionDays(rInp.value, globalDefaultRetention),
     autoRecord: aSel.value === 'true'
   };
 
@@ -940,7 +950,7 @@ async function toggleDetailAutoRecord() {
         body: JSON.stringify({
           username: currentDetailUser,
           autoRecord: true,
-          retentionDays: 30,
+          retentionDays: globalDefaultRetention,
           sourceType: currentDetailSourceType || 'chaturbate'
         })
       });

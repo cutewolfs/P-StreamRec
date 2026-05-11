@@ -12,6 +12,8 @@ router = APIRouter(prefix="/api", tags=["following"])
 _chaturbate_api = None
 _auth_service = None
 _db = None
+_DEFAULT_RETENTION_DAYS = 30
+_MAX_RETENTION_DAYS = 365
 
 
 def init(chaturbate_api, auth_service, db):
@@ -19,6 +21,17 @@ def init(chaturbate_api, auth_service, db):
     _chaturbate_api = chaturbate_api
     _auth_service = auth_service
     _db = db
+
+
+async def _get_default_retention_days() -> int:
+    if not _db:
+        return _DEFAULT_RETENTION_DAYS
+    try:
+        raw = await _db.get_setting("default_retention_days")
+        retention_days = int(raw) if raw is not None else _DEFAULT_RETENTION_DAYS
+        return max(0, min(_MAX_RETENTION_DAYS, retention_days))
+    except (ValueError, TypeError):
+        return _DEFAULT_RETENTION_DAYS
 
 
 @router.get("/following")
@@ -170,7 +183,7 @@ async def track_followed_model(username: str):
         username=username,
         auto_record=True,
         record_quality="best",
-        retention_days=30,
+        retention_days=await _get_default_retention_days(),
         source_type=source_type,
     )
 

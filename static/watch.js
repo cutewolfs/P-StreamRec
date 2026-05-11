@@ -561,7 +561,6 @@ async function toggleAutoRecord() {
           username: currentUsername,
           autoRecord: true,
           recordQuality: 'best',
-          retentionDays: 30,
           sourceType: currentSourceType || 'chaturbate'
         })
       });

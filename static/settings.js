@@ -359,6 +359,11 @@ async function loadAppInfo() {
 // ============================================
 // Recording Settings (auto_convert, keep_ts)
 // ============================================
+function normalizeRetentionDays(value, fallback) {
+  var parsed = parseInt(value, 10);
+  if (isNaN(parsed)) parsed = fallback;
+  return Math.max(0, Math.min(365, parsed));
+}
 
 async function loadRecordingSettings() {
   try {
@@ -372,6 +377,7 @@ async function loadRecordingSettings() {
       var autoDeleteThreshold = document.getElementById('autoDeleteThreshold');
       var thresholdRow = document.getElementById('autoDeleteThresholdRow');
       var thresholdValue = document.getElementById('thresholdValue');
+      var defaultRetentionInput = document.getElementById('defaultRetentionInput');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
       if (keepTsToggle) keepTsToggle.checked = !!data.keep_ts;
@@ -393,6 +399,9 @@ async function loadRecordingSettings() {
       if (defaultResSelect) {
         defaultResSelect.value = String(data.default_resolution || 0);
       }
+      if (defaultRetentionInput) {
+        defaultRetentionInput.value = normalizeRetentionDays(data.default_retention_days, 30);
+      }
     }
   } catch (e) {
     console.error('Error loading recording settings:', e);
@@ -410,6 +419,10 @@ async function updateRecordingSetting(key, value) {
     });
     if (res.ok) {
       showNotification('Setting updated', 'success');
+      if (key === 'default_retention_days') {
+        var defaultRetentionInput = document.getElementById('defaultRetentionInput');
+        if (defaultRetentionInput) defaultRetentionInput.value = normalizeRetentionDays(value, 30);
+      }
       // Toggle threshold row visibility when auto_delete_watched changes
       if (key === 'auto_delete_watched') {
         var thresholdRow = document.getElementById('autoDeleteThresholdRow');
@@ -421,6 +434,33 @@ async function updateRecordingSetting(key, value) {
     }
   } catch (e) {
     console.error('Error updating recording setting:', e);
+    showNotification('Connection error', 'error');
+    loadRecordingSettings();
+  }
+}
+
+async function applyDefaultRetentionToModels() {
+  var input = document.getElementById('defaultRetentionInput');
+  var retentionDays = normalizeRetentionDays(input ? input.value : 30, 30);
+  try {
+    var res = await fetch('/api/settings/recording', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        default_retention_days: retentionDays,
+        apply_default_retention_to_models: true
+      })
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (res.ok) {
+      if (input) input.value = normalizeRetentionDays(data.default_retention_days, retentionDays);
+      showNotification('Retention applied to ' + (data.applied_retention_models || 0) + ' models', 'success');
+    } else {
+      showNotification(data.detail || 'Failed to apply retention', 'error');
+      loadRecordingSettings();
+    }
+  } catch (e) {
+    console.error('Error applying default retention:', e);
     showNotification('Connection error', 'error');
     loadRecordingSettings();
   }

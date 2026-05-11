@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js?v=3"></script>
+  <script defer src="/static/settings.js?v=4"></script>
   <style>
     /* --- Processes tab --- */
     .proc-count-badge {
@@ -396,6 +396,28 @@
                   <option value="480">480p</option>
                   <option value="360">360p</option>
                 </select>
+              </div>
+              <div class="settings-row">
+                <div>
+                  <span class="settings-row-label">Default Retention</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Days assigned to newly tracked models. Use 0 to keep recordings forever.</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end;">
+                  <input
+                    type="number"
+                    id="defaultRetentionInput"
+                    min="0"
+                    max="365"
+                    step="1"
+                    value="30"
+                    onchange="updateRecordingSetting('default_retention_days', normalizeRetentionDays(this.value, 30))"
+                    style="width: 6rem; padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;"
+                  />
+                  <span style="font-size: 0.9rem; color: var(--text-secondary);">days</span>
+                  <button type="button" class="btn-secondary" onclick="applyDefaultRetentionToModels()" style="padding: 0.5rem 0.75rem; font-size: 0.85rem;">
+                    Apply to All
+                  </button>
+                </div>
               </div>
               <div class="settings-row">
                 <div>

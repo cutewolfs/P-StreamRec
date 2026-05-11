@@ -109,13 +109,29 @@ function extractUsername(url) {
 // Modal
 // ============================================
 
-function openAddModal() {
+function normalizeRetentionDays(value, fallback) {
+  const parsed = parseInt(value, 10);
+  if (Number.isNaN(parsed)) return fallback;
+  return Math.max(0, Math.min(365, parsed));
+}
+
+async function openAddModal() {
   document.getElementById('addModal').classList.add('active');
   document.getElementById('modelUrl').value = '';
   document.getElementById('recordQuality').value = 'best';
   document.getElementById('retentionDays').value = '30';
   document.getElementById('autoRecord').checked = true;
   document.getElementById('modelUrl').focus();
+
+  try {
+    const res = await fetch('/api/settings/recording');
+    if (res.ok) {
+      const data = await res.json();
+      document.getElementById('retentionDays').value = normalizeRetentionDays(data.default_retention_days, 30);
+    }
+  } catch (e) {
+    console.debug('Using built-in retention default:', e);
+  }
 }
 
 function closeAddModal() {
@@ -132,7 +148,7 @@ async function addModel(event) {
   const url = document.getElementById('modelUrl').value.trim();
   const username = extractUsername(url);
   const quality = document.getElementById('recordQuality').value;
-  const retentionDays = parseInt(document.getElementById('retentionDays').value);
+  const retentionDays = normalizeRetentionDays(document.getElementById('retentionDays').value, 30);
   const autoRecord = document.getElementById('autoRecord').checked;
   
   if (!username) {
