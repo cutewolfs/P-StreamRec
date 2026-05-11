@@ -45,8 +45,12 @@ function getModelsCache() {
 }
 
 // Save model info
-function saveModelInfoCache(username, info) {
-  const key = `model_info_${username}`;
+function modelInfoCacheKey(username, sourceType = '') {
+  return `model_info_${sourceType || 'auto'}_${username}`;
+}
+
+function saveModelInfoCache(username, info, sourceType = '') {
+  const key = modelInfoCacheKey(username, sourceType);
   localStorage.setItem(key, JSON.stringify({
     ...info,
     timestamp: Date.now()
@@ -54,8 +58,8 @@ function saveModelInfoCache(username, info) {
 }
 
 // Get cached info
-function getModelInfoCache(username) {
-  const key = `model_info_${username}`;
+function getModelInfoCache(username, sourceType = '') {
+  const key = modelInfoCacheKey(username, sourceType);
   const cached = localStorage.getItem(key);
   if (cached) {
     const data = JSON.parse(cached);
@@ -180,15 +184,19 @@ async function addModel(event) {
 // Get model information
 // ============================================
 
-async function getModelInfo(username, useCache = true) {
+function sourceQuery(sourceType) {
+  return sourceType ? `?source=${encodeURIComponent(sourceType)}` : '';
+}
+
+async function getModelInfo(username, useCache = true, sourceType = '') {
   // Try cache first for instant display
   if (useCache) {
-    const cached = getModelInfoCache(username);
+    const cached = getModelInfoCache(username, sourceType);
     if (cached) {
       // Return cache immediately
       // and update in background
-      getModelInfo(username, false).then(freshData => {
-        saveModelInfoCache(username, freshData);
+      getModelInfo(username, false, sourceType).then(freshData => {
+        saveModelInfoCache(username, freshData, sourceType);
       });
       return cached;
     }
@@ -196,16 +204,17 @@ async function getModelInfo(username, useCache = true) {
   
   try {
     // Use our backend API to avoid CORS issues
-    const response = await fetch(`/api/model/${username}/status`);
+    const response = await fetch(`/api/model/${username}/status${sourceQuery(sourceType)}`);
     if (response.ok) {
       const data = await response.json();
       const info = {
         username: data.username,
         thumbnail: data.thumbnail,
         isOnline: data.isOnline,
-        viewers: data.viewers || 0
+        viewers: data.viewers || 0,
+        sourceType: data.sourceType || sourceType || 'chaturbate'
       };
-      saveModelInfoCache(username, info);
+      saveModelInfoCache(username, info, sourceType);
       return info;
     }
   } catch (e) {
@@ -219,7 +228,7 @@ async function getModelInfo(username, useCache = true) {
     isOnline: false,
     viewers: 0
   };
-  saveModelInfoCache(username, fallback);
+  saveModelInfoCache(username, fallback, sourceType);
   return fallback;
 }
 
@@ -279,7 +288,11 @@ async function updateModelsStatus() {
       // Check if model just went live (offline -> online)
       const previousStatus = previousModelStatuses[modelInfo.username];
       if (previousStatus !== undefined && !previousStatus && modelInfo.isOnline) {
-        showLiveNotification(modelInfo.username, modelInfo.viewers || 0);
+        showLiveNotification(
+          modelInfo.username,
+          modelInfo.viewers || 0,
+          modelInfo.sourceType || modelInfo.source_type || ''
+        );
       }
       
       // Update stored status
@@ -403,7 +416,10 @@ async function renderModels() {
       const card = document.createElement('div');
       card.className = 'model-card offline';
       card.setAttribute('data-username', modelInfo.username);
-      card.onclick = () => openModelPage(modelInfo.username);
+      card.onclick = () => openModelPage(
+        modelInfo.username,
+        modelInfo.sourceType || modelInfo.source_type || ''
+      );
 
       const priv = !modelInfo.isOnline && isPrivateStatus(modelInfo);
       const statusText = modelInfo.isOnline ? 'Live' : priv ? 'Private' : 'Offline';
@@ -470,7 +486,10 @@ async function renderModels() {
       const card = document.createElement('div');
       card.className = 'model-card offline';
       card.setAttribute('data-username', modelInfo.username);
-      card.onclick = () => openModelPage(modelInfo.username);
+      card.onclick = () => openModelPage(
+        modelInfo.username,
+        modelInfo.sourceType || modelInfo.source_type || ''
+      );
 
       const priv = !modelInfo.isOnline && isPrivateStatus(modelInfo);
       const statusText = modelInfo.isOnline ? 'Live' : priv ? 'Private' : 'Offline';
@@ -530,9 +549,10 @@ async function getActiveSessions() {
 // Open model page
 // ============================================
 
-function openModelPage(username) {
+function openModelPage(username, sourceType = '') {
   // Create a new page or redirect
-  window.location.href = `/model.html?username=${username}`;
+  const qs = sourceType ? `&source=${encodeURIComponent(sourceType)}` : '';
+  window.location.href = `/model.html?username=${encodeURIComponent(username)}${qs}`;
 }
 
 // ============================================
@@ -565,7 +585,7 @@ function showNotification(message, type = 'success') {
 }
 
 // Show live notification with enhanced styling
-function showLiveNotification(username, viewers = 0) {
+function showLiveNotification(username, viewers = 0, sourceType = '') {
   // Check if notifications are enabled
   const notifEnabled = localStorage.getItem('notifications_enabled') !== 'false';
   if (!notifEnabled) {
@@ -603,7 +623,7 @@ function showLiveNotification(username, viewers = 0) {
   
   // Click to open model page
   notif.onclick = () => {
-    window.location.href = `/model.html?username=${username}`;
+    openModelPage(username, sourceType);
   };
   
   document.body.appendChild(notif);
@@ -636,6 +656,7 @@ async function checkAndStartRecordings() {
   
   for (const model of models) {
     const username = model.username;
+    const sourceType = model.sourceType || model.source_type || 'chaturbate';
     const autoRecord = model.autoRecord !== false; // Par défaut true si non défini
     const session = sessions.find(s => s.person === username);
     const isRecording = session && session.running;
@@ -648,7 +669,7 @@ async function checkAndStartRecordings() {
     
     if (!isRecording) {
       // Check if model is online
-      const info = await getModelInfo(username);
+      const info = await getModelInfo(username, true, sourceType);
       if (info.isOnline) {
         // Start recording automatically
         console.log(`🔴 ${username} is online, starting automatically...`);
@@ -658,7 +679,7 @@ async function checkAndStartRecordings() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               target: username,
-              source_type: 'chaturbate',
+              source_type: sourceType,
               person: username,
               name: username,
               auto_start: true  // Indiquer que c'est un démarrage automatique

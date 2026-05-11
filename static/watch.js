@@ -561,7 +561,8 @@ async function toggleAutoRecord() {
           username: currentUsername,
           autoRecord: true,
           recordQuality: 'best',
-          retentionDays: 30
+          retentionDays: 30,
+          sourceType: currentSourceType || 'chaturbate'
         })
       });
       if (addRes.ok || addRes.status === 409) {
@@ -581,7 +582,10 @@ async function toggleAutoRecord() {
     var res = await fetch('/api/models/' + currentUsername + '/auto-record', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ autoRecord: newValue })
+      body: JSON.stringify({
+        autoRecord: newValue,
+        sourceType: currentSourceType || 'chaturbate'
+      })
     });
 
     if (res.ok) {

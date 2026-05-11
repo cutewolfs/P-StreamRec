@@ -162,12 +162,16 @@ async def track_followed_model(username: str):
     if existing:
         return {"message": f"{username} is already tracked", "alreadyTracked": True}
 
+    followed = await _db.get_followed_model(username)
+    source_type = (followed or {}).get("source_type") or "chaturbate"
+
     # Add to models table
     await _db.add_or_update_model(
         username=username,
         auto_record=True,
         record_quality="best",
-        retention_days=30
+        retention_days=30,
+        source_type=source_type,
     )
 
     return {"message": f"{username} added to tracking", "tracked": True}

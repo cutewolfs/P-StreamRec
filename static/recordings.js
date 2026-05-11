@@ -5,6 +5,7 @@
 // State
 let allRecordings = {};
 let currentDetailUser = '';
+let currentDetailSourceType = '';
 let currentPlayer = null;
 let showTsFiles = false;
 let currentPlayingRecordingId = '';
@@ -135,7 +136,9 @@ function renderModelGrid(models) {
       countLabel = 'No recordings';
     }
 
-    return '<div class="rec-model-card" onclick="showModelRecordings(\'' + escapeHtml(model.username) + '\')">' +
+    var sourceType = model.sourceType || model.source_type || '';
+
+    return '<div class="rec-model-card" onclick="showModelRecordings(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(sourceType) + '\')">' +
       '<div class="rec-model-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
           'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(model.username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
@@ -152,8 +155,9 @@ function renderModelGrid(models) {
 // ============================================
 // Show recordings for a specific model
 // ============================================
-async function showModelRecordings(username) {
+async function showModelRecordings(username, sourceType) {
   currentDetailUser = username;
+  currentDetailSourceType = sourceType || currentDetailSourceType || '';
 
   document.getElementById('modelGrid').style.display = 'none';
   document.getElementById('recordingsDetail').style.display = 'block';
@@ -264,6 +268,7 @@ function showModelGrid() {
   document.getElementById('modelGrid').style.display = 'grid';
   document.getElementById('recordingsDetail').style.display = 'none';
   currentDetailUser = '';
+  currentDetailSourceType = '';
   currentDetailModel = null;
   currentDetailRecordings = [];
   if (timelineNowInterval) {
@@ -335,6 +340,7 @@ async function loadModelSettings(username) {
     currentDetailModel = found;
 
     if (found) {
+      currentDetailSourceType = found.sourceType || found.source_type || currentDetailSourceType;
       var q = found.recordQuality || 'best';
       // Ensure the value is selectable even if the DB has something not in the
       // hard-coded list (e.g. legacy values) — append a hidden option.
@@ -410,7 +416,8 @@ async function saveModelSettings() {
           username: username,
           autoRecord: payload.autoRecord,
           recordQuality: payload.recordQuality,
-          retentionDays: payload.retentionDays
+          retentionDays: payload.retentionDays,
+          sourceType: currentDetailSourceType || 'chaturbate'
         })
       });
     }
@@ -930,7 +937,12 @@ async function toggleDetailAutoRecord() {
       var addRes = await fetch('/api/models', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: currentDetailUser, autoRecord: true, retentionDays: 30 })
+        body: JSON.stringify({
+          username: currentDetailUser,
+          autoRecord: true,
+          retentionDays: 30,
+          sourceType: currentDetailSourceType || 'chaturbate'
+        })
       });
       if (addRes.ok || addRes.status === 409) {
         updateDetailRecordButton(true);
@@ -944,7 +956,10 @@ async function toggleDetailAutoRecord() {
       var res = await fetch('/api/models/' + encodeURIComponent(currentDetailUser) + '/auto-record', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ autoRecord: newValue })
+        body: JSON.stringify({
+          autoRecord: newValue,
+          sourceType: (found.sourceType || found.source_type || currentDetailSourceType || 'chaturbate')
+        })
       });
       if (res.ok) {
         updateDetailRecordButton(newValue);

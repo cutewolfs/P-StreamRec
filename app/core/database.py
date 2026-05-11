@@ -58,6 +58,8 @@ class Database:
                     auto_record BOOLEAN DEFAULT 1,
                     record_quality TEXT DEFAULT 'best',
                     retention_days INTEGER DEFAULT 30,
+                    source_type TEXT DEFAULT 'chaturbate',
+                    room_status TEXT,
                     created_at INTEGER,
                     updated_at INTEGER
                 )
@@ -108,6 +110,7 @@ class Database:
                     thumbnail_url TEXT,
                     last_seen_online_at INTEGER,
                     synced_at INTEGER,
+                    source_type TEXT DEFAULT 'chaturbate',
                     room_status TEXT
                 )
             """)
@@ -193,34 +196,66 @@ class Database:
         display_name: Optional[str] = None,
         auto_record: bool = True,
         record_quality: str = "best",
-        retention_days: int = 30
+        retention_days: int = 30,
+        source_type: Optional[str] = None,
     ):
         """Ajoute ou met à jour un modèle"""
         await self.initialize()
         
         now = int(datetime.now().timestamp())
+        source_type = (source_type or "").strip().lower() or None
         
         async with self._connect() as db:
             await db.execute("""
                 INSERT INTO models (
                     username, display_name, auto_record, record_quality, 
-                    retention_days, created_at, updated_at
+                    retention_days, source_type, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     auto_record = ?,
                     record_quality = ?,
                     retention_days = ?,
+                    source_type = COALESCE(?, source_type),
                     updated_at = ?
             """, (
                 username, display_name, auto_record, record_quality,
-                retention_days, now, now,
-                display_name, auto_record, record_quality, retention_days, now
+                retention_days, source_type or "chaturbate", now, now,
+                display_name, auto_record, record_quality, retention_days, source_type, now
             ))
             await db.commit()
         
-        logger.debug("Modèle ajouté/mis à jour", username=username)
+        logger.debug("Modèle ajouté/mis à jour", username=username, source_type=source_type)
+
+    async def reconcile_model_sources_from_followed(self) -> int:
+        """Repair tracked models whose platform can be inferred from followed rows."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            cursor = await db.execute("""
+                UPDATE models
+                SET source_type = (
+                    SELECT fm.source_type
+                    FROM followed_models fm
+                    WHERE fm.username = models.username
+                      AND fm.source_type IS NOT NULL
+                      AND fm.source_type != ''
+                      AND fm.source_type != 'chaturbate'
+                    LIMIT 1
+                )
+                WHERE (source_type IS NULL OR source_type = '' OR source_type = 'chaturbate')
+                  AND EXISTS (
+                    SELECT 1
+                    FROM followed_models fm
+                    WHERE fm.username = models.username
+                      AND fm.source_type IS NOT NULL
+                      AND fm.source_type != ''
+                      AND fm.source_type != 'chaturbate'
+                  )
+            """)
+            await db.commit()
+            return cursor.rowcount or 0
     
     async def update_model_status(
         self,
@@ -962,7 +997,8 @@ class Database:
                         username=username,
                         auto_record=model.get('autoRecord', True),
                         record_quality=model.get('recordQuality', 'best'),
-                        retention_days=model.get('retentionDays', 30)
+                        retention_days=model.get('retentionDays', 30),
+                        source_type=model.get('sourceType') or model.get('source_type'),
                     )
             
             logger.info("Migration JSON vers SQLite terminée", models_count=len(models))

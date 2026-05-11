@@ -366,6 +366,41 @@ chaturbate_api: Optional[ChaturbateAPI] = None
 # Set at startup via setup_services
 cam4_auth_service: Optional[CAM4AuthService] = None
 
+SOURCE_TYPES = {"chaturbate", "cam4"}
+
+
+def _normalize_source_type(source_type: Optional[str]) -> Optional[str]:
+    value = (source_type or "").strip().lower()
+    if not value or value == "auto":
+        return None
+    return value
+
+
+async def _infer_source_type(
+    username: Optional[str],
+    model: Optional[dict] = None,
+) -> str:
+    """Pick the platform for a username, repairing old CAM4 rows when possible."""
+    model_source = _normalize_source_type(model.get("source_type") if model else None)
+    if model_source and model_source != "chaturbate":
+        return model_source
+
+    if username:
+        try:
+            followed = await db.get_followed_model(username)
+            followed_source = _normalize_source_type(
+                followed.get("source_type") if followed else None
+            )
+            if followed_source and (
+                not model_source
+                or (model_source == "chaturbate" and followed_source != "chaturbate")
+            ):
+                return followed_source
+        except Exception:
+            pass
+
+    return model_source or "chaturbate"
+
 
 async def _resolve_m3u8(source_type: str, target: str, max_height: Optional[int]) -> Optional[str]:
     """Résolution directe du M3U8 pour chaturbate/cam4. Lève une exception si
@@ -406,7 +441,7 @@ def save_models_to_file(models):
 
 class StartBody(BaseModel):
     target: str  # Either an m3u8 URL or a username (if resolver enabled)
-    source_type: Optional[str] = None  # "m3u8" or "chaturbate" or None for auto
+    source_type: Optional[str] = None  # "m3u8", "chaturbate", "cam4", or None/"auto"
     name: Optional[str] = None  # display name
     person: Optional[str] = None  # recording bucket (per person)
     auto_start: Optional[bool] = False  # True si démarrage automatique
@@ -782,20 +817,21 @@ async def api_start(body: StartBody):
     max_height = await _get_recording_height_for_quality(record_quality)
 
     # Determine source type
-    stype = (body.source_type or "").lower().strip()
+    requested_source = _normalize_source_type(body.source_type)
+    stype = requested_source or await _infer_source_type(person or target, model_settings)
     logger.debug("Détermination type source", source_type=stype or 'auto', target=target)
 
     if stype == "m3u8" or target.startswith("http://") or target.startswith("https://"):
         logger.info("URL M3U8 directe détectée", url=target[:80])
         m3u8_url = target
     else:
-        effective_source = stype or "chaturbate"
-        if effective_source not in ("chaturbate", "cam4"):
+        effective_source = stype
+        if effective_source not in SOURCE_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"source_type '{effective_source}' inconnu. "
-                    f"Sources disponibles: chaturbate, cam4"
+                    f"Sources disponibles: {', '.join(sorted(SOURCE_TYPES))}"
                 ),
             )
         if effective_source == "chaturbate" and not CB_RESOLVER_ENABLED:
@@ -1148,7 +1184,9 @@ async def get_model_status(username: str, source: Optional[str] = None):
             else:
                 model = {**model, 'source_type': followed['source_type']}
     # Priorité: param `source` explicite (depuis le discover) > DB > défaut.
-    source_type = (source or (model.get('source_type') if model else None) or 'chaturbate').lower()
+    source_type = _normalize_source_type(source)
+    if not source_type:
+        source_type = await _infer_source_type(username, model)
 
     if model and model.get('is_online'):
         return {
@@ -1253,18 +1291,16 @@ async def get_model_stream(username: str, source: Optional[str] = None):
     Chaturbate.
     """
     try:
-        source_type = "chaturbate"
-        if source:
-            source_type = source.lower()
-        else:
-            try:
-                model = await db.get_model(username)
-                if model and model.get("source_type"):
-                    source_type = model["source_type"]
-            except Exception:
-                pass
+        model = None
+        try:
+            model = await db.get_model(username)
+        except Exception:
+            pass
+        source_type = _normalize_source_type(source)
+        if not source_type:
+            source_type = await _infer_source_type(username, model)
 
-        if source_type not in ("chaturbate", "cam4"):
+        if source_type not in SOURCE_TYPES:
             raise HTTPException(
                 status_code=404,
                 detail=f"Source '{source_type}' non disponible",
@@ -1281,7 +1317,8 @@ async def get_model_stream(username: str, source: Optional[str] = None):
         return {
             "username": username,
             "streamUrl": m3u8_url,
-            "isOnline": True
+            "isOnline": True,
+            "sourceType": source_type,
         }
     except HTTPException:
         raise
@@ -1357,6 +1394,7 @@ async def get_dashboard():
         
         for model in models:
             username = model['username']
+            source_type = await _infer_source_type(username, model)
             
             # Récupérer le nombre d'enregistrements depuis SQLite
             recordings_count = await db.get_recordings_count(username)
@@ -1372,7 +1410,8 @@ async def get_dashboard():
                 "retentionDays": model.get('retention_days', 30),
                 "autoRecord": bool(model.get('auto_record', True)),
                 "roomStatus": model.get('room_status'),
-                "sourceType": model.get('source_type') or 'chaturbate',
+                "sourceType": source_type,
+                "source_type": source_type,
             }
             
             models_info.append(model_info)
@@ -1625,11 +1664,14 @@ async def get_models():
         models = await db.get_all_models()
         formatted_models = []
         for model in models:
+            source_type = await _infer_source_type(model.get("username"), model)
             formatted_models.append({
                 "username": model['username'],
                 "autoRecord": bool(model.get('auto_record', True)),
                 "recordQuality": model.get('record_quality', 'best'),
-                "retentionDays": model.get('retention_days', 30)
+                "retentionDays": model.get('retention_days', 30),
+                "sourceType": source_type,
+                "source_type": source_type,
             })
         return {"models": formatted_models}
     except Exception as e:
@@ -1690,13 +1732,23 @@ async def add_model(model: dict):
         record_quality = await _get_default_record_quality()
     else:
         record_quality = 'best'
+    requested_source = _normalize_source_type(
+        model.get("sourceType") or model.get("source_type")
+    )
+    source_type = requested_source or await _infer_source_type(username)
+    if source_type not in SOURCE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{source_type}' non disponible",
+        )
 
     # Ajouter dans SQLite
     await db.add_or_update_model(
         username=username,
         auto_record=auto_record,
         record_quality=record_quality,
-        retention_days=model.get('retentionDays', 30)
+        retention_days=model.get('retentionDays', 30),
+        source_type=source_type,
     )
     
     # Récupérer tous les modèles pour retourner
@@ -1705,7 +1757,9 @@ async def add_model(model: dict):
         "username": m['username'],
         "autoRecord": bool(m.get('auto_record', True)),
         "recordQuality": m.get('record_quality', 'best'),
-        "retentionDays": m.get('retention_days', 30)
+        "retentionDays": m.get('retention_days', 30),
+        "sourceType": m.get('source_type') or 'chaturbate',
+        "source_type": m.get('source_type') or 'chaturbate',
     } for m in all_models]
     
     return {"success": True, "models": formatted}
@@ -1724,7 +1778,10 @@ async def update_model(username: str, model_data: dict):
         username=username,
         auto_record=model_data.get('autoRecord', existing.get('auto_record', True)),
         record_quality=model_data.get('recordQuality', existing.get('record_quality', 'best')),
-        retention_days=model_data.get('retentionDays', existing.get('retention_days', 30))
+        retention_days=model_data.get('retentionDays', existing.get('retention_days', 30)),
+        source_type=_normalize_source_type(
+            model_data.get('sourceType') or model_data.get('source_type')
+        ),
     )
     
     # Récupérer le modèle mis à jour
@@ -1736,7 +1793,9 @@ async def update_model(username: str, model_data: dict):
             "username": updated['username'],
             "autoRecord": bool(updated.get('auto_record', True)),
             "recordQuality": updated.get('record_quality', 'best'),
-            "retentionDays": updated.get('retention_days', 30)
+            "retentionDays": updated.get('retention_days', 30),
+            "sourceType": updated.get('source_type') or 'chaturbate',
+            "source_type": updated.get('source_type') or 'chaturbate',
         }
     }
 
@@ -1758,7 +1817,9 @@ async def delete_model(username: str):
         "username": m['username'],
         "autoRecord": bool(m.get('auto_record', True)),
         "recordQuality": m.get('record_quality', 'best'),
-        "retentionDays": m.get('retention_days', 30)
+        "retentionDays": m.get('retention_days', 30),
+        "sourceType": m.get('source_type') or 'chaturbate',
+        "source_type": m.get('source_type') or 'chaturbate',
     } for m in all_models]
     
     return {"success": True, "models": formatted}
@@ -2422,6 +2483,14 @@ async def toggle_auto_record(username: str, body: dict):
         raise HTTPException(status_code=400, detail="autoRecord field required")
 
     new_auto = bool(auto_record)
+    requested_source = _normalize_source_type(
+        body.get("sourceType") or body.get("source_type")
+    )
+    if requested_source and requested_source not in SOURCE_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{requested_source}' non disponible",
+        )
     was_auto = bool(existing.get("auto_record", False))
     record_quality = existing.get("record_quality", "best")
     # On the off -> on transition, apply the global default resolution so the
@@ -2433,12 +2502,14 @@ async def toggle_auto_record(username: str, body: dict):
         username=username,
         auto_record=new_auto,
         record_quality=record_quality,
-        retention_days=existing.get("retention_days", 30)
+        retention_days=existing.get("retention_days", 30),
+        source_type=requested_source,
     )
     return {
         "success": True,
         "autoRecord": new_auto,
         "recordQuality": record_quality,
+        "sourceType": requested_source or existing.get("source_type") or "chaturbate",
     }
 
 
@@ -2496,6 +2567,10 @@ async def get_recordings_by_model(show_ts: bool = False):
     # Build a lookup of auto_record status
     all_models = await db.get_all_models()
     auto_record_map = {m["username"]: bool(m.get("auto_record")) for m in all_models}
+    source_type_map = {
+        m["username"]: await _infer_source_type(m.get("username"), m)
+        for m in all_models
+    }
 
     # Build a set of usernames that have recordings
     usernames_with_recordings = set()
@@ -2516,6 +2591,8 @@ async def get_recordings_by_model(show_ts: bool = False):
             "totalDuration": group["total_duration"],
             "thumbnail": thumb_url,
             "autoRecord": auto_record_map.get(username, True),
+            "sourceType": source_type_map.get(username, "chaturbate"),
+            "source_type": source_type_map.get(username, "chaturbate"),
         })
 
     # Also include tracked models (auto_record=1) that have 0 recordings
@@ -2530,6 +2607,8 @@ async def get_recordings_by_model(show_ts: bool = False):
                 "totalDuration": 0,
                 "thumbnail": f"/api/thumbnail/{username}",
                 "autoRecord": True,
+                "sourceType": source_type_map.get(username, "chaturbate"),
+                "source_type": source_type_map.get(username, "chaturbate"),
             })
 
     return {"models": result}
@@ -2680,8 +2759,8 @@ async def auto_record_task():
                         max_height = await _get_recording_height_for_quality(
                             cached_status.get("record_quality")
                         )
-                        source_type = cached_status.get("source_type") or "chaturbate"
-                        if source_type not in ("chaturbate", "cam4"):
+                        source_type = await _infer_source_type(username, cached_status)
+                        if source_type not in SOURCE_TYPES:
                             logger.warning(
                                 "Source inconnue pour auto-record",
                                 task="auto-record",
@@ -2875,7 +2954,10 @@ async def sync_cam4_following_task(cam4_auth):
                     room_status=item.get("room_status"),
                 )
             if items:
+                repaired = await db.reconcile_model_sources_from_followed()
                 logger.debug("CAM4 following synced", count=len(items), task="cam4-sync")
+                if repaired:
+                    logger.info("Sources modèles réparées depuis CAM4", count=repaired, task="cam4-sync")
         except Exception as e:
             logger.error("CAM4 sync error", task="cam4-sync", error=str(e))
             await asyncio.sleep(60)
@@ -2889,6 +2971,9 @@ async def startup_event():
 
     # Migrer les données depuis le JSON si nécessaire
     await db.migrate_from_json(MODELS_FILE)
+    repaired_sources = await db.reconcile_model_sources_from_followed()
+    if repaired_sources:
+        logger.info("Sources modèles réparées depuis les favoris", count=repaired_sources)
 
     # Initialize FlareSolverr client.
     # The docker-compose healthcheck normally guarantees FlareSolverr is

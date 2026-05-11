@@ -569,6 +569,14 @@ async def monitor_models_task(
                 for model in models:
                     username = model['username']
                     source_type = model.get('source_type') or 'chaturbate'
+                    if source_type == 'chaturbate':
+                        try:
+                            followed = await db.get_followed_model(username)
+                            followed_source = (followed or {}).get('source_type') or ''
+                            if followed_source and followed_source != 'chaturbate':
+                                source_type = followed_source
+                        except Exception:
+                            pass
 
                     try:
                         if source_type == "cam4":

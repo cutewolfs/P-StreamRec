@@ -99,6 +99,7 @@ async def cam4_follow(username: str):
                 source_type="cam4",
                 room_status=status.get("room_status"),
             )
+            await _db.reconcile_model_sources_from_followed()
         except Exception as e:
             logger.debug("CAM4 upsert après follow échec", username=username, error=str(e))
     return result
@@ -151,6 +152,7 @@ async def cam4_sync_following():
             room_status=item.get("room_status"),
         )
         synced.add(item["username"])
+    await _db.reconcile_model_sources_from_followed()
 
     # On ne supprime PAS les follows CAM4 absents: sans état fiable de la page
     # /favorites (redirection silencieuse si la session expire), un scrape

@@ -858,6 +858,7 @@
   <script>
     const urlParams = new URLSearchParams(window.location.search);
     const username = urlParams.get('username');
+    let currentSourceType = urlParams.get('source') || '';
     let currentSession = null;
     let hlsPlayer = null;
     let liveStreamLoaded = false; // Track if we loaded a live stream without recording
@@ -870,6 +871,10 @@
 
     function isPrivateRoomStatus(roomStatus) {
       return PRIVATE_STATUSES.includes((roomStatus || '').toLowerCase());
+    }
+
+    function sourceQuery() {
+      return currentSourceType ? `?source=${encodeURIComponent(currentSourceType)}` : '';
     }
 
     if (!username) {
@@ -1004,8 +1009,9 @@
         const session = sessions.find(s => s.person === username);
 
         // Get online status
-        const statusRes = await fetch(`/api/model/${username}/status`);
+        const statusRes = await fetch(`/api/model/${username}/status${sourceQuery()}`);
         const modelInfo = statusRes.ok ? await statusRes.json() : { isOnline: false };
+        if (modelInfo.sourceType) currentSourceType = modelInfo.sourceType;
         const privateStatus = isPrivateRoomStatus(modelInfo.roomStatus);
 
         if (privateStatus) {
@@ -1046,7 +1052,7 @@
           if (!liveStreamLoaded) {
             console.log('🔴 Model is live, loading stream...');
             try {
-              const streamRes = await fetch(`/api/model/${username}/stream`);
+              const streamRes = await fetch(`/api/model/${username}/stream${sourceQuery()}`);
               if (streamRes.ok) {
                 const streamData = await streamRes.json();
                 console.log('📺 Stream URL:', streamData.streamUrl);
@@ -1174,7 +1180,7 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               target: username,
-              source_type: 'chaturbate',
+              source_type: currentSourceType || 'auto',
               person: username,
               name: username
             })
