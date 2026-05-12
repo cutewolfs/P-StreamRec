@@ -490,6 +490,12 @@ async def settings_page():
     return FileResponse(str(STATIC_DIR / "settings.html"))
 
 
+@app.get("/wiki")
+async def wiki_page():
+    """Wiki page - internal documentation"""
+    return FileResponse(str(STATIC_DIR / "wiki.html"))
+
+
 @app.get("/watch/{username}")
 async def watch_page(username: str):
     """Watch page - view live stream or recording for a model"""

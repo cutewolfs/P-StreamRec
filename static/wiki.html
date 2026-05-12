@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wiki - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/loader.js"></script>
+</head>
+<body>
+  <div id="header-placeholder"></div>
+
+  <main class="container wiki-container">
+    <section class="wiki-hero" id="top">
+      <p class="wiki-kicker">Internal documentation</p>
+      <h1>Wiki</h1>
+      <p class="wiki-intro">
+        P-StreamRec is a self-hosted web app for discovering live streams,
+        following creators, recording sessions automatically, and managing the
+        resulting video library from one interface.
+      </p>
+    </section>
+
+    <div class="wiki-layout">
+      <aside class="wiki-sidebar" aria-label="Wiki table of contents">
+        <h2>Contents</h2>
+        <nav>
+          <a href="#overview">Overview</a>
+          <a href="#supported-sources">Supported Sources</a>
+          <a href="#core-pages">Core Pages</a>
+          <a href="#recording-lifecycle">Recording Lifecycle</a>
+          <a href="#accounts-and-access">Accounts and Access</a>
+          <a href="#configuration">Configuration</a>
+          <a href="#storage">Storage</a>
+          <a href="#troubleshooting">Troubleshooting</a>
+        </nav>
+      </aside>
+
+      <article class="wiki-content">
+        <section class="wiki-section" id="overview">
+          <h2>Overview</h2>
+          <p>
+            P-StreamRec monitors supported streaming sources, detects when a
+            configured model or source is live, records the HLS stream with
+            FFmpeg, and makes the finished recording available in the Recordings
+            page. It is designed to run continuously in Docker or on UmbrelOS.
+          </p>
+          <div class="wiki-flow">
+            <span>Discover or add a source</span>
+            <span>Monitor live status</span>
+            <span>Record the stream</span>
+            <span>Convert to MP4</span>
+            <span>Watch or manage recordings</span>
+          </div>
+        </section>
+
+        <section class="wiki-section" id="supported-sources">
+          <h2>Supported Sources</h2>
+          <p>
+            The app supports provider integrations and direct HLS sources. Site
+            integrations can expose browsing, live status, account follows, and
+            better stream quality when credentials are configured.
+          </p>
+          <table class="wiki-table">
+            <thead>
+              <tr>
+                <th>Source</th>
+                <th>Watch</th>
+                <th>Record</th>
+                <th>Follow Sync</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Chaturbate</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes, with account login</td>
+              </tr>
+              <tr>
+                <td>CAM4</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>Yes, with account login</td>
+              </tr>
+              <tr>
+                <td>Direct m3u8 URL</td>
+                <td>Yes</td>
+                <td>Yes</td>
+                <td>No</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="wiki-section" id="core-pages">
+          <h2>Core Pages</h2>
+          <dl class="wiki-definitions">
+            <div>
+              <dt>Discover</dt>
+              <dd>Browse live models from supported providers, search by name, and filter by gender or tags.</dd>
+            </div>
+            <div>
+              <dt>Following</dt>
+              <dd>View followed models from connected accounts, grouped by online and offline status.</dd>
+            </div>
+            <div>
+              <dt>Recordings</dt>
+              <dd>Browse recorded sessions by model, inspect file details, play videos, and manage saved files.</dd>
+            </div>
+            <div>
+              <dt>Watch</dt>
+              <dd>Open a live stream or recording in the browser with the built-in player.</dd>
+            </div>
+            <div>
+              <dt>Settings</dt>
+              <dd>Manage provider accounts, recording options, system status, plugins, logs, and update checks.</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="wiki-section" id="recording-lifecycle">
+          <h2>Recording Lifecycle</h2>
+          <ol class="wiki-steps">
+            <li>
+              <strong>Source registration:</strong> a model username or direct
+              m3u8 URL is added through the app or configured through
+              environment variables.
+            </li>
+            <li>
+              <strong>Monitoring:</strong> the background monitor checks source
+              status on a recurring interval and skips sources that are offline.
+            </li>
+            <li>
+              <strong>Live detection:</strong> when a source becomes available,
+              the resolver prepares the playable HLS URL and stream metadata.
+            </li>
+            <li>
+              <strong>Recording:</strong> FFmpeg downloads the HLS segments into
+              an original TS file under the recordings directory.
+            </li>
+            <li>
+              <strong>Conversion:</strong> after the stream ends, the conversion
+              task creates an MP4 copy for easier playback and smaller storage.
+            </li>
+            <li>
+              <strong>Library update:</strong> the Recordings page discovers the
+              saved files and exposes playback, thumbnails, and management
+              actions.
+            </li>
+          </ol>
+        </section>
+
+        <section class="wiki-section" id="accounts-and-access">
+          <h2>Accounts and Access</h2>
+          <p>
+            Provider credentials are optional, but they unlock account-specific
+            features such as follow sync and may improve the quality or
+            reliability of stream URLs. App-level password protection is also
+            optional and is controlled by the <code>PASSWORD</code> environment
+            variable.
+          </p>
+          <div class="wiki-note">
+            Store credentials in Docker, Umbrel, or environment configuration.
+            Avoid placing real credentials directly in tracked project files.
+          </div>
+        </section>
+
+        <section class="wiki-section" id="configuration">
+          <h2>Configuration</h2>
+          <p>
+            Most runtime behavior is configured with environment variables. The
+            most common settings are listed below.
+          </p>
+          <table class="wiki-table">
+            <thead>
+              <tr>
+                <th>Variable</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>OUTPUT_DIR</code></td>
+                <td>Base directory where recordings, thumbnails, and session data are stored.</td>
+              </tr>
+              <tr>
+                <td><code>PORT</code></td>
+                <td>Web interface port. The default app port is 8080.</td>
+              </tr>
+              <tr>
+                <td><code>FFMPEG_PATH</code></td>
+                <td>Path to the FFmpeg binary used for recording and conversion.</td>
+              </tr>
+              <tr>
+                <td><code>AUTO_RECORD_USERS</code></td>
+                <td>Comma-separated list of usernames or sources to monitor automatically.</td>
+              </tr>
+              <tr>
+                <td><code>FLARESOLVERR_URL</code></td>
+                <td>FlareSolverr endpoint used when a provider needs browser-style challenge handling.</td>
+              </tr>
+              <tr>
+                <td><code>PSTREAMREC_PROXY_URL</code></td>
+                <td>Optional outbound proxy for provider requests and compatible stream fetching.</td>
+              </tr>
+            </tbody>
+          </table>
+        </section>
+
+        <section class="wiki-section" id="storage">
+          <h2>Storage</h2>
+          <p>
+            Recordings are grouped by source name so that each model has a
+            dedicated folder. Original TS files preserve the captured stream, and
+            MP4 files are generated after conversion for convenient playback.
+          </p>
+          <pre class="wiki-code"><code>/data/
+  records/
+    username/
+      YYYYMMDD_HHMMSS_ID.ts
+      YYYYMMDD_HHMMSS_ID.mp4
+  sessions/
+  thumbnails/</code></pre>
+          <p>
+            TS files are usually larger because they keep the original transport
+            stream. MP4 files are typically smaller and easier to stream in a
+            browser.
+          </p>
+        </section>
+
+        <section class="wiki-section" id="troubleshooting">
+          <h2>Troubleshooting</h2>
+          <dl class="wiki-definitions">
+            <div>
+              <dt>A model does not appear online</dt>
+              <dd>Confirm the username, provider credentials, network access, and whether the source is currently live.</dd>
+            </div>
+            <div>
+              <dt>Recording starts but stops quickly</dt>
+              <dd>Check FFmpeg availability, provider rate limits, proxy settings, and the app logs in Settings.</dd>
+            </div>
+            <div>
+              <dt>Chaturbate requests fail behind protection</dt>
+              <dd>Verify that FlareSolverr is running and that <code>FLARESOLVERR_URL</code> points to the correct service.</dd>
+            </div>
+            <div>
+              <dt>Recordings do not show up</dt>
+              <dd>Confirm that <code>OUTPUT_DIR</code> points to the mounted data volume and that the app can read it.</dd>
+            </div>
+          </dl>
+          <p class="wiki-backtop"><a href="#top">Back to top</a></p>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <div id="footer-placeholder"></div>
+</body>
+</html>

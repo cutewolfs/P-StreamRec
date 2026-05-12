@@ -262,6 +262,267 @@ body::before {
 }
 
 /* ============================================
+   WIKI
+   ============================================ */
+
+.wiki-container {
+  max-width: 1180px;
+}
+
+.wiki-hero {
+  padding: 2rem 0 2.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.wiki-kicker {
+  color: var(--accent-light);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin-bottom: 0.75rem;
+  text-transform: uppercase;
+}
+
+.wiki-hero h1 {
+  font-size: 3rem;
+  line-height: 1.1;
+  margin-bottom: 1rem;
+}
+
+.wiki-intro {
+  color: var(--text-secondary);
+  font-size: 1.1rem;
+  max-width: 780px;
+}
+
+.wiki-layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 3rem;
+  align-items: start;
+  padding-top: 2.5rem;
+}
+
+.wiki-sidebar {
+  background: rgba(26, 31, 58, 0.55);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem;
+  position: sticky;
+  top: 110px;
+}
+
+.wiki-sidebar h2 {
+  color: var(--text-primary);
+  font-size: 0.9rem;
+  margin-bottom: 0.9rem;
+  text-transform: uppercase;
+}
+
+.wiki-sidebar nav {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.wiki-sidebar a,
+.wiki-backtop a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: color var(--transition-fast);
+}
+
+.wiki-sidebar a {
+  border-radius: 6px;
+  padding: 0.45rem 0.55rem;
+}
+
+.wiki-sidebar a:hover,
+.wiki-backtop a:hover {
+  color: var(--text-primary);
+}
+
+.wiki-sidebar a:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.wiki-content {
+  min-width: 0;
+}
+
+.wiki-section {
+  scroll-margin-top: 120px;
+  padding-bottom: 2.5rem;
+  margin-bottom: 2.5rem;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.wiki-section:last-child {
+  margin-bottom: 0;
+}
+
+.wiki-section h2 {
+  font-size: 1.6rem;
+  margin-bottom: 1rem;
+}
+
+.wiki-section p,
+.wiki-section li,
+.wiki-section dd {
+  color: var(--text-secondary);
+}
+
+.wiki-section p {
+  margin-bottom: 1rem;
+}
+
+.wiki-flow {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.wiki-flow span {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  font-weight: 600;
+  min-height: 78px;
+  padding: 0.85rem;
+}
+
+.wiki-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: rgba(0, 0, 0, 0.12);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 1.25rem;
+  overflow: hidden;
+}
+
+.wiki-table th,
+.wiki-table td {
+  border-bottom: 1px solid var(--border-light);
+  padding: 0.85rem 1rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.wiki-table th {
+  color: var(--text-primary);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.wiki-table td {
+  color: var(--text-secondary);
+}
+
+.wiki-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.wiki-definitions {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.wiki-definitions div {
+  border-left: 3px solid rgba(99, 102, 241, 0.55);
+  padding-left: 1rem;
+}
+
+.wiki-definitions dt {
+  color: var(--text-primary);
+  font-weight: 700;
+  margin-bottom: 0.25rem;
+}
+
+.wiki-steps {
+  display: grid;
+  gap: 0.9rem;
+  padding-left: 1.25rem;
+}
+
+.wiki-steps strong {
+  color: var(--text-primary);
+}
+
+.wiki-note,
+.wiki-code {
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+}
+
+.wiki-note {
+  padding: 1rem;
+}
+
+.wiki-code {
+  overflow-x: auto;
+  padding: 1rem;
+  white-space: pre;
+}
+
+.wiki-code code,
+.wiki-section code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+
+.wiki-section code {
+  color: var(--text-primary);
+}
+
+.wiki-backtop {
+  margin-top: 1.5rem;
+}
+
+@media (max-width: 900px) {
+  .wiki-layout {
+    grid-template-columns: 1fr;
+    gap: 2rem;
+  }
+
+  .wiki-sidebar {
+    position: static;
+  }
+
+  .wiki-sidebar nav {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .wiki-flow {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .wiki-hero h1 {
+    font-size: 2.25rem;
+  }
+
+  .wiki-intro {
+    font-size: 1rem;
+  }
+
+  .wiki-sidebar nav,
+  .wiki-flow {
+    grid-template-columns: 1fr;
+  }
+
+  .wiki-table {
+    display: block;
+    overflow-x: auto;
+  }
+}
+
+/* ============================================
    MODELS GRID
    ============================================ */
 
