@@ -449,6 +449,36 @@
                   <span class="toggle-slider"></span>
                 </label>
               </div>
+              <div class="settings-row">
+                <div>
+                  <span class="settings-row-label">Segment by Duration</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Split recordings into time-based parts. Off keeps one file per session.</p>
+                </div>
+                <select id="segmentDurationSelect" onchange="updateRecordingSetting('segment_duration_minutes', parseInt(this.value))" style="padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;">
+                  <option value="0">Off</option>
+                  <option value="30">30 minutes</option>
+                  <option value="60">60 minutes</option>
+                  <option value="90">90 minutes</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <div>
+                  <span class="settings-row-label">Segment by Size</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Maximum TS part size in MB. Use 0 to disable; if duration is also set, the first limit reached starts the next part.</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end;">
+                  <input
+                    type="number"
+                    id="segmentSizeInput"
+                    min="0"
+                    step="100"
+                    value="0"
+                    onchange="updateRecordingSetting('segment_size_mb', normalizeSegmentSizeMb(this.value))"
+                    style="width: 7rem; padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;"
+                  />
+                  <span style="font-size: 0.9rem; color: var(--text-secondary);">MB</span>
+                </div>
+              </div>
               <div class="settings-row" style="border-top: 1px solid var(--border); padding-top: 1rem; margin-top: 0.5rem;">
                 <div>
                   <span class="settings-row-label">Auto-Delete After Watching</span>

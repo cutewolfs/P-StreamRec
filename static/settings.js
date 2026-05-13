@@ -365,6 +365,12 @@ function normalizeRetentionDays(value, fallback) {
   return Math.max(0, Math.min(365, parsed));
 }
 
+function normalizeSegmentSizeMb(value) {
+  var parsed = parseInt(value, 10);
+  if (isNaN(parsed)) parsed = 0;
+  return Math.max(0, parsed);
+}
+
 async function loadRecordingSettings() {
   try {
     var res = await fetch('/api/settings/recording');
@@ -378,6 +384,8 @@ async function loadRecordingSettings() {
       var thresholdRow = document.getElementById('autoDeleteThresholdRow');
       var thresholdValue = document.getElementById('thresholdValue');
       var defaultRetentionInput = document.getElementById('defaultRetentionInput');
+      var segmentDurationSelect = document.getElementById('segmentDurationSelect');
+      var segmentSizeInput = document.getElementById('segmentSizeInput');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
       if (keepTsToggle) keepTsToggle.checked = !!data.keep_ts;
@@ -402,6 +410,12 @@ async function loadRecordingSettings() {
       if (defaultRetentionInput) {
         defaultRetentionInput.value = normalizeRetentionDays(data.default_retention_days, 30);
       }
+      if (segmentDurationSelect) {
+        segmentDurationSelect.value = String(data.segment_duration_minutes || 0);
+      }
+      if (segmentSizeInput) {
+        segmentSizeInput.value = normalizeSegmentSizeMb(data.segment_size_mb);
+      }
     }
   } catch (e) {
     console.error('Error loading recording settings:', e);
@@ -422,6 +436,10 @@ async function updateRecordingSetting(key, value) {
       if (key === 'default_retention_days') {
         var defaultRetentionInput = document.getElementById('defaultRetentionInput');
         if (defaultRetentionInput) defaultRetentionInput.value = normalizeRetentionDays(value, 30);
+      }
+      if (key === 'segment_size_mb') {
+        var segmentSizeInput = document.getElementById('segmentSizeInput');
+        if (segmentSizeInput) segmentSizeInput.value = normalizeSegmentSizeMb(value);
       }
       // Toggle threshold row visibility when auto_delete_watched changes
       if (key === 'auto_delete_watched') {
@@ -851,7 +869,9 @@ var testDefinitions = [
       var data = await fetchJsonNoCache('/api/settings/recording');
       var maxRes = data.max_resolution ? data.max_resolution + 'p max' : 'best max';
       var defaultRes = data.default_resolution ? data.default_resolution + 'p default' : 'best default';
-      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + defaultRes + ' - ' + maxRes);
+      var duration = data.segment_duration_minutes ? data.segment_duration_minutes + 'm parts' : 'duration off';
+      var size = data.segment_size_mb ? data.segment_size_mb + 'MB parts' : 'size off';
+      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + defaultRes + ' - ' + maxRes + ' - ' + duration + ' - ' + size);
     }
   },
   {

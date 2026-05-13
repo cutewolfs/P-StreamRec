@@ -16,6 +16,7 @@ from .core.config import MIN_RECORDING_SECONDS
 # Chaturbate LL-HLS master playlists multiplex all quality levels into one stream.
 # Each entry maps a max_height ceiling to the ffmpeg video stream index.
 _LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
+_TS_PACKET_SIZE = 188
 
 
 def _llhls_video_stream_index(max_height: Optional[int]) -> int:
@@ -29,7 +30,17 @@ def _llhls_video_stream_index(max_height: Optional[int]) -> int:
 
 
 class FFmpegSession:
-    def __init__(self, session_id: str, input_url: str, sessions_dir: str, records_dir_for_person: str, person: str, display_name: Optional[str] = None):
+    def __init__(
+        self,
+        session_id: str,
+        input_url: str,
+        sessions_dir: str,
+        records_dir_for_person: str,
+        person: str,
+        display_name: Optional[str] = None,
+        segment_duration_seconds: int = 0,
+        segment_size_bytes: int = 0,
+    ):
         self.id = session_id
         self.input_url = input_url
         self.sessions_dir = sessions_dir
@@ -44,8 +55,14 @@ class FFmpegSession:
         self.process: Optional[subprocess.Popen] = None
         # Playback HLS is served from /streams/sessions/<id>/stream.m3u8
         self.playback_url = f"/streams/sessions/{self.id}/stream.m3u8"
-        # Recording file using unique name: YYYYMMDD_HHMMSS_ID.ts
-        self.record_filename = f"{self.start_timestamp}_{session_id[:6]}.ts"
+        self.record_base = f"{self.start_timestamp}_{session_id[:6]}"
+        self.segment_duration_seconds = max(0, int(segment_duration_seconds or 0))
+        self.segment_size_bytes = max(0, int(segment_size_bytes or 0))
+        self.segment_enabled = self.segment_duration_seconds > 0 or self.segment_size_bytes > 0
+        self.segment_index = 1
+        # Recording file using unique name: YYYYMMDD_HHMMSS_ID.ts. Segmented
+        # sessions append _partNNN only when segmentation is enabled.
+        self.record_filename = self._record_filename_for_segment(self.segment_index)
         self.record_path = os.path.join(self.records_dir_for_person, self.record_filename)
         self.log_path = os.path.join(self.sessions_dir, "ffmpeg.log")
         self._stop_evt = threading.Event()
@@ -60,7 +77,9 @@ class FFmpegSession:
                     person=person, 
                     display_name=display_name,
                     sessions_dir=sessions_dir,
-                    records_dir=records_dir_for_person)
+                    records_dir=records_dir_for_person,
+                    segment_duration_seconds=self.segment_duration_seconds,
+                    segment_size_bytes=self.segment_size_bytes)
 
     def is_running(self) -> bool:
         if self.process is None:
@@ -75,11 +94,36 @@ class FFmpegSession:
         return max(0.0, time.time() - self.last_progress_at)
     
     def record_path_today(self) -> str:
-        # Utilise la date de début du stream (pas de rotation)
         return self.record_path
 
+    def _record_filename_for_segment(self, segment_index: int) -> str:
+        if self.segment_enabled:
+            return f"{self.record_base}_part{segment_index:03d}.ts"
+        return f"{self.record_base}.ts"
+
+    def _advance_segment_path(self):
+        self.segment_index += 1
+        self.record_filename = self._record_filename_for_segment(self.segment_index)
+        self.record_path = os.path.join(self.records_dir_for_person, self.record_filename)
+
+    def _recording_paths_for_cleanup(self) -> List[str]:
+        if not self.segment_enabled:
+            return [self.record_path]
+
+        paths: List[str] = []
+        prefix = f"{self.record_base}_part"
+        try:
+            for filename in os.listdir(self.records_dir_for_person):
+                if filename.startswith(prefix) and filename.endswith(".ts"):
+                    paths.append(os.path.join(self.records_dir_for_person, filename))
+        except OSError:
+            pass
+        if self.record_path not in paths:
+            paths.append(self.record_path)
+        return paths
+
     def _writer_loop(self):
-        """Read TS from ffmpeg stdout and append to single file (no rotation)."""
+        """Read TS from ffmpeg stdout and optionally rotate recording segments."""
         if not self.process or not self.process.stdout:
             logger.warning("Writer loop: pas de processus ou stdout", session_id=self.id)
             return
@@ -90,18 +134,138 @@ class FFmpegSession:
                    session_id=self.id, 
                    person=self.person,
                    record_path=self.record_path,
-                   start_date=self.start_date)
+                   start_date=self.start_date,
+                   segment_duration_seconds=self.segment_duration_seconds,
+                   segment_size_bytes=self.segment_size_bytes)
         
         # 1 MiB chunks + 1 MiB write buffer: drastically fewer read/write syscalls
         # vs. the previous 64 KiB/unbuffered loop. CPU overhead of the writer
         # thread goes from "wakes ~100 times/sec on a busy stream" to a handful.
         CHUNK_SIZE = 1024 * 1024
-        f = open(self.record_path, "ab", buffering=CHUNK_SIZE)
+        f = None
         total_bytes = 0
+        segment_bytes = 0
+        segment_started_at = time.time()
         chunk_count = 0
         last_log_threshold = 0
+        pending = b""
+
+        def open_current_file():
+            nonlocal f, segment_started_at
+            if f is None:
+                os.makedirs(self.records_dir_for_person, exist_ok=True)
+                f = open(self.record_path, "ab", buffering=CHUNK_SIZE)
+                segment_started_at = time.time()
+                logger.info(
+                    "Segment recording démarré",
+                    session_id=self.id,
+                    person=self.person,
+                    segment_index=self.segment_index,
+                    record_path=self.record_path,
+                )
+
+        def close_current_file(reason: str):
+            nonlocal f
+            if f is None:
+                return
+            try:
+                f.flush()
+                f.close()
+                logger.info(
+                    "Segment recording fermé",
+                    session_id=self.id,
+                    person=self.person,
+                    segment_index=self.segment_index,
+                    segment_bytes=segment_bytes,
+                    reason=reason,
+                    record_path=self.record_path,
+                )
+            finally:
+                f = None
+
+        def should_rotate_for_duration() -> bool:
+            if not self.segment_enabled or self.segment_duration_seconds <= 0:
+                return False
+            return segment_bytes > 0 and (time.time() - segment_started_at) >= self.segment_duration_seconds
+
+        def rotate_segment(reason: str):
+            nonlocal segment_bytes
+            if not self.segment_enabled:
+                return
+            close_current_file(reason)
+            self._advance_segment_path()
+            segment_bytes = 0
+
+        def write_segmented(data: bytes):
+            nonlocal total_bytes, segment_bytes, chunk_count, last_log_threshold
+            offset = 0
+            data_len = len(data)
+
+            while offset < data_len:
+                if should_rotate_for_duration():
+                    rotate_segment("duration")
+
+                open_current_file()
+
+                write_len = data_len - offset
+                if self.segment_size_bytes > 0:
+                    capacity = self.segment_size_bytes - segment_bytes
+                    if capacity < _TS_PACKET_SIZE and segment_bytes > 0:
+                        rotate_segment("size")
+                        open_current_file()
+                        capacity = self.segment_size_bytes
+
+                    capacity = max(_TS_PACKET_SIZE, capacity)
+                    capacity -= capacity % _TS_PACKET_SIZE
+                    if capacity <= 0:
+                        capacity = _TS_PACKET_SIZE
+                    write_len = min(write_len, capacity)
+
+                f.write(data[offset:offset + write_len])
+                offset += write_len
+                total_bytes += write_len
+                segment_bytes += write_len
+                chunk_count += 1
+                self.bytes_written = total_bytes
+                self.last_progress_at = time.time()
+
+                threshold_100mb = total_bytes // (100 * 1024 * 1024)
+                if threshold_100mb > last_log_threshold:
+                    last_log_threshold = threshold_100mb
+                    logger.debug(
+                        "Progression écriture",
+                        session_id=self.id,
+                        bytes_written=total_bytes,
+                        mb_written=f"{total_bytes / 1024 / 1024:.1f}",
+                        current_segment=self.segment_index,
+                    )
+
+                if self.segment_size_bytes > 0 and segment_bytes >= self.segment_size_bytes:
+                    rotate_segment("size")
+                elif should_rotate_for_duration():
+                    rotate_segment("duration")
+
+        def write_plain(data: bytes):
+            nonlocal total_bytes, chunk_count, last_log_threshold
+            open_current_file()
+            f.write(data)
+            total_bytes += len(data)
+            chunk_count += 1
+            self.bytes_written = total_bytes
+            self.last_progress_at = time.time()
+
+            threshold_100mb = total_bytes // (100 * 1024 * 1024)
+            if threshold_100mb > last_log_threshold:
+                last_log_threshold = threshold_100mb
+                logger.debug(
+                    "Progression écriture",
+                    session_id=self.id,
+                    bytes_written=total_bytes,
+                    mb_written=f"{total_bytes / 1024 / 1024:.1f}",
+                )
 
         try:
+            open_current_file()
             while True:
                 chunk = self.process.stdout.read(CHUNK_SIZE)
                 if not chunk:
@@ -111,21 +275,18 @@ class FFmpegSession:
                                chunk_count=chunk_count)
                     break
 
-                f.write(chunk)
-                total_bytes += len(chunk)
-                chunk_count += 1
-                self.bytes_written = total_bytes
-                self.last_progress_at = time.time()
+                if self.segment_enabled:
+                    data = pending + chunk
+                    packet_bytes = (len(data) // _TS_PACKET_SIZE) * _TS_PACKET_SIZE
+                    if packet_bytes:
+                        write_segmented(data[:packet_bytes])
+                    pending = data[packet_bytes:]
+                else:
+                    write_plain(chunk)
 
-                # Log tous les 100MB (compteur monotone, évite les faux positifs du modulo)
-                threshold_100mb = total_bytes // (100 * 1024 * 1024)
-                if threshold_100mb > last_log_threshold:
-                    last_log_threshold = threshold_100mb
-                    logger.debug("Progression écriture",
-                               session_id=self.id,
-                               bytes_written=total_bytes,
-                               mb_written=f"{total_bytes / 1024 / 1024:.1f}")
-                    
+            if pending:
+                write_segmented(pending)
+
         except Exception as e:
             logger.error("Erreur dans writer loop", 
                         session_id=self.id, 
@@ -134,8 +295,7 @@ class FFmpegSession:
         finally:
             elapsed = time.time() - self.start_time
             try:
-                f.flush()
-                f.close()
+                close_current_file("finished")
                 logger.info("Writer loop terminé", 
                            session_id=self.id,
                            total_bytes=total_bytes,
@@ -161,8 +321,12 @@ class FFmpegSession:
             return
 
         try:
-            if os.path.exists(self.record_path):
-                os.remove(self.record_path)
+            deleted_paths = []
+            for path in self._recording_paths_for_cleanup():
+                if os.path.exists(path):
+                    os.remove(path)
+                    deleted_paths.append(path)
+            if deleted_paths:
                 logger.warning(
                     "Fragment recording supprimé",
                     session_id=self.id,
@@ -171,6 +335,7 @@ class FFmpegSession:
                     elapsed_seconds=f"{elapsed_seconds:.1f}",
                     bytes_written=total_bytes,
                     min_seconds=MIN_RECORDING_SECONDS,
+                    deleted_paths=deleted_paths,
                 )
         except Exception as e:
             logger.error(
@@ -208,7 +373,15 @@ class FFmpegManager:
                    sessions_root=self.sessions_root,
                    records_root=self.records_root)
 
-    def start_session(self, input_url: str, person: str, display_name: Optional[str] = None, max_height: Optional[int] = None) -> FFmpegSession:
+    def start_session(
+        self,
+        input_url: str,
+        person: str,
+        display_name: Optional[str] = None,
+        max_height: Optional[int] = None,
+        segment_duration_seconds: int = 0,
+        segment_size_bytes: int = 0,
+    ) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
         with self._lock:
@@ -231,7 +404,16 @@ class FFmpegManager:
             os.makedirs(records_dir_for_person, exist_ok=True)
             logger.debug("Création répertoire enregistrement", path=records_dir_for_person)
             
-            sess = FFmpegSession(session_id, input_url, sessions_dir, records_dir_for_person, person, display_name=display_name)
+            sess = FFmpegSession(
+                session_id,
+                input_url,
+                sessions_dir,
+                records_dir_for_person,
+                person,
+                display_name=display_name,
+                segment_duration_seconds=segment_duration_seconds,
+                segment_size_bytes=segment_size_bytes,
+            )
 
             # Build tee spec: one branch to stdout (pipe:1) as MPEG-TS, one for HLS playback
             hls_seg = os.path.join(sessions_dir, 'seg_%06d.ts')

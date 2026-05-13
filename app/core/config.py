@@ -50,6 +50,8 @@ CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3600"))  # secondes
 # Recording settings (defaults, overridden by DB settings at runtime)
 AUTO_CONVERT = os.getenv("AUTO_CONVERT", "true").lower() in {"1", "true", "yes"}
 KEEP_TS = os.getenv("KEEP_TS", "false").lower() in {"1", "true", "yes"}
+RECORD_SEGMENT_DURATION_MINUTES = int(os.getenv("RECORD_SEGMENT_DURATION_MINUTES", "0"))
+RECORD_SEGMENT_SIZE_MB = int(os.getenv("RECORD_SEGMENT_SIZE_MB", "0"))
 MIN_RECORDING_SECONDS = int(os.getenv("MIN_RECORDING_SECONDS", "10"))
 MIN_RECORDING_BYTES = int(os.getenv("MIN_RECORDING_BYTES", str(5 * 1024 * 1024)))
 

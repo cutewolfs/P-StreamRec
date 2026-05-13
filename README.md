@@ -9,6 +9,7 @@
 ## Features
 
 - **24/7 automatic recording** — monitors models and records when they go live
+- **Recording segmentation** — optionally split captures by 30/60/90 minutes or by maximum file size
 - **Auto MP4 conversion** — converts TS to compressed MP4 in background (50-70% smaller)
 - **Discover** — browse live models from every supported site with gender, tag, and search filters
 - **Following** — one list aggregating your follows across Chaturbate and CAM4
@@ -103,6 +104,8 @@ docker run -d --name p-streamrec \
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |
 | `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
+| `RECORD_SEGMENT_DURATION_MINUTES` | `0` | Optional recording split interval: `0`, `30`, `60`, or `90` minutes |
+| `RECORD_SEGMENT_SIZE_MB` | `0` | Optional maximum TS segment size in MB; `0` disables size-based splitting |
 | `CHATURBATE_USERNAME` | — | Chaturbate login (optional, enables Following + better quality) |
 | `CHATURBATE_PASSWORD` | — | Chaturbate password (optional) |
 | `FLARESOLVERR_URL` | — | FlareSolverr URL (e.g. `http://flaresolverr:8191`) |
@@ -127,6 +130,7 @@ segments through the proxy.
 ### Recording format
 
 - Original: `/data/records/<username>/YYYYMMDD_HHMMSS_ID.ts` (MPEG-TS, lossless)
+- Segmented original: `/data/records/<username>/YYYYMMDD_HHMMSS_ID_part001.ts`, `_part002.ts`, ... when duration or size segmentation is enabled
 - Converted: `/data/records/<username>/YYYYMMDD_HHMMSS_ID.mp4` (H.264, auto-generated)
 
 ### Storage estimates

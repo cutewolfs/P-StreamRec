@@ -880,9 +880,17 @@ async def api_start(body: StartBody):
     person = slugify(person)
     logger.info("Identifiant slugifié", person=person, display_name=body.name)
 
+    segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
     logger.subsection("Démarrage Session FFmpeg")
     try:
-        sess = manager.start_session(m3u8_url, person=person, display_name=body.name, max_height=max_height)
+        sess = manager.start_session(
+            m3u8_url,
+            person=person,
+            display_name=body.name,
+            max_height=max_height,
+            segment_duration_seconds=segment_duration_seconds,
+            segment_size_bytes=segment_size_bytes,
+        )
         duration_ms = (time.time() - start_time) * 1000
         logger.success("Session créée avec succès", 
                       session_id=sess.id,
@@ -2339,6 +2347,8 @@ async def get_recording_settings():
         default_resolution = 0
 
     default_retention_days = await _get_default_retention_days()
+    segment_duration_minutes = await _get_segment_duration_minutes()
+    segment_size_mb = await _get_segment_size_mb()
 
     return {
         "auto_convert": auto_convert,
@@ -2349,11 +2359,14 @@ async def get_recording_settings():
         "max_resolution": max_resolution,
         "default_resolution": default_resolution,
         "default_retention_days": default_retention_days,
+        "segment_duration_minutes": segment_duration_minutes,
+        "segment_size_mb": segment_size_mb,
     }
 
 
 # Allowed HLS heights. 0 means "best available".
 _ALLOWED_MAX_RESOLUTIONS = {0, 360, 480, 720, 1080, 1440, 2160}
+_ALLOWED_SEGMENT_DURATIONS = {0, 30, 60, 90}
 _DEFAULT_RETENTION_DAYS = 30
 _MAX_RETENTION_DAYS = 365
 
@@ -2378,6 +2391,61 @@ async def _get_default_retention_days() -> int:
         return _normalize_retention_days(raw if raw is not None else _DEFAULT_RETENTION_DAYS)
     except HTTPException:
         return _DEFAULT_RETENTION_DAYS
+
+
+def _normalize_segment_duration_minutes(value, default: int = 0) -> int:
+    try:
+        duration_minutes = int(value)
+    except (ValueError, TypeError):
+        duration_minutes = default
+
+    if duration_minutes not in _ALLOWED_SEGMENT_DURATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"segment_duration_minutes must be one of {sorted(_ALLOWED_SEGMENT_DURATIONS)}",
+        )
+    return duration_minutes
+
+
+def _normalize_segment_size_mb(value, default: int = 0) -> int:
+    try:
+        size_mb = int(value)
+    except (ValueError, TypeError):
+        size_mb = default
+
+    if size_mb < 0:
+        raise HTTPException(status_code=400, detail="segment_size_mb must be 0 or greater")
+    return size_mb
+
+
+async def _get_segment_duration_minutes() -> int:
+    from .core.config import RECORD_SEGMENT_DURATION_MINUTES
+
+    raw = await db.get_setting("segment_duration_minutes")
+    try:
+        return _normalize_segment_duration_minutes(
+            raw if raw is not None else RECORD_SEGMENT_DURATION_MINUTES
+        )
+    except HTTPException:
+        return 0
+
+
+async def _get_segment_size_mb() -> int:
+    from .core.config import RECORD_SEGMENT_SIZE_MB
+
+    raw = await db.get_setting("segment_size_mb")
+    try:
+        return _normalize_segment_size_mb(
+            raw if raw is not None else RECORD_SEGMENT_SIZE_MB
+        )
+    except HTTPException:
+        return 0
+
+
+async def _get_recording_segment_limits() -> tuple[int, int]:
+    duration_minutes = await _get_segment_duration_minutes()
+    size_mb = await _get_segment_size_mb()
+    return duration_minutes * 60, size_mb * 1024 * 1024
 
 
 async def _get_max_recording_height() -> Optional[int]:
@@ -2481,6 +2549,14 @@ async def update_recording_settings(body: dict):
     if "default_retention_days" in body:
         default_retention_days = _normalize_retention_days(body["default_retention_days"])
         await db.set_setting("default_retention_days", str(default_retention_days))
+    if "segment_duration_minutes" in body:
+        segment_duration_minutes = _normalize_segment_duration_minutes(
+            body["segment_duration_minutes"]
+        )
+        await db.set_setting("segment_duration_minutes", str(segment_duration_minutes))
+    if "segment_size_mb" in body:
+        segment_size_mb = _normalize_segment_size_mb(body["segment_size_mb"])
+        await db.set_setting("segment_size_mb", str(segment_size_mb))
     if body.get("apply_default_retention_to_models"):
         if default_retention_days is None:
             default_retention_days = await _get_default_retention_days()
@@ -2874,11 +2950,14 @@ async def auto_record_task():
                             logger.background_task("auto-record", "Modèle en ligne détecté", username=username)
 
                             try:
+                                segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
                                 sess = manager.start_session(
                                     input_url=hls_source,
                                     display_name=username,
                                     person=username,
                                     max_height=max_height,
+                                    segment_duration_seconds=segment_duration_seconds,
+                                    segment_size_bytes=segment_size_bytes,
                                 )
 
                                 if sess:
