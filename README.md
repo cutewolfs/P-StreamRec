@@ -100,6 +100,7 @@ docker run -d --name p-streamrec \
 | `OUTPUT_DIR` | `/data` | Recordings folder |
 | `PORT` | `8080` | Web interface port |
 | `FFMPEG_PATH` | `ffmpeg` | Path to FFmpeg |
+| `RECORDING_RANGE_CHUNK_SIZE` | `8388608` | Max bytes returned for open-ended replay Range requests |
 | `CB_RESOLVER_ENABLED` | `true` | Enable Chaturbate support |
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |

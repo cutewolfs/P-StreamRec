@@ -20,6 +20,7 @@ let timelineNowInterval = null;       // setInterval id for the blinking-now lin
 let globalMaxResolution = 0;          // 0 = no global cap; otherwise pixel height
 let globalDefaultResolution = 0;      // 0 = "best"; otherwise pixel height (used when enrolling new models)
 let globalDefaultRetention = 30;      // 0 = keep forever
+let recordingIsSeeking = false;
 
 // ============================================
 // Load recordings grouped by model
@@ -665,6 +666,178 @@ function setupRecordingVolumePersistence(video, username) {
   });
 }
 
+function formatRecordingClock(seconds) {
+  var total = Math.max(0, Math.floor(Number(seconds) || 0));
+  var hours = Math.floor(total / 3600);
+  var minutes = Math.floor((total % 3600) / 60);
+  var secs = total % 60;
+  var paddedSecs = secs < 10 ? '0' + secs : String(secs);
+
+  if (hours > 0) {
+    var paddedMinutes = minutes < 10 ? '0' + minutes : String(minutes);
+    return hours + ':' + paddedMinutes + ':' + paddedSecs;
+  }
+
+  return minutes + ':' + paddedSecs;
+}
+
+function getRecordingDuration(video) {
+  if (!video || !Number.isFinite(video.duration) || video.duration <= 0) return 0;
+  return video.duration;
+}
+
+function setRecordingTimeDisplay(position, duration) {
+  var time = document.getElementById('recordingTime');
+  if (!time) return;
+  time.textContent = formatRecordingClock(position) + ' / ' + formatRecordingClock(duration);
+}
+
+function updateRecordingPlayerControls() {
+  var video = document.getElementById('recordingPlayer');
+  var playIcon = document.getElementById('recordingPlayIcon');
+  var muteIcon = document.getElementById('recordingMuteIcon');
+  var volumeSlider = document.getElementById('recordingVolumeSlider');
+  var seekSlider = document.getElementById('recordingSeekSlider');
+  if (!video) return;
+
+  var duration = getRecordingDuration(video);
+  var position = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+
+  if (playIcon) {
+    playIcon.innerHTML = (video.paused || video.ended) ? '&#9654;' : '&#10074;&#10074;';
+  }
+
+  if (muteIcon) {
+    muteIcon.innerHTML = (video.muted || video.volume === 0) ? '&#128263;' : '&#128266;';
+  }
+
+  if (volumeSlider && document.activeElement !== volumeSlider) {
+    volumeSlider.value = String(video.volume);
+  }
+
+  if (seekSlider) {
+    seekSlider.disabled = duration <= 0;
+    if (!recordingIsSeeking && document.activeElement !== seekSlider) {
+      seekSlider.value = duration > 0 ? String((position / duration) * 100) : '0';
+    }
+  }
+
+  setRecordingTimeDisplay(position, duration);
+}
+
+function seekRecordingFromSlider() {
+  var video = document.getElementById('recordingPlayer');
+  var seekSlider = document.getElementById('recordingSeekSlider');
+  if (!video || !seekSlider) return;
+
+  var duration = getRecordingDuration(video);
+  if (duration <= 0) return;
+
+  var ratio = Math.min(100, Math.max(0, parseFloat(seekSlider.value) || 0)) / 100;
+  var position = duration * ratio;
+  video.currentTime = position;
+  setRecordingTimeDisplay(position, duration);
+}
+
+function toggleRecordingPlayback() {
+  var video = document.getElementById('recordingPlayer');
+  if (!video) return;
+
+  if (video.paused || video.ended) {
+    video.play().catch(function() {});
+  } else {
+    video.pause();
+  }
+}
+
+function setupRecordingPlayerControls() {
+  var video = document.getElementById('recordingPlayer');
+  var container = document.querySelector('.recording-player-container');
+  var playBtn = document.getElementById('recordingPlayBtn');
+  var muteBtn = document.getElementById('recordingMuteBtn');
+  var fullscreenBtn = document.getElementById('recordingFullscreenBtn');
+  var volumeSlider = document.getElementById('recordingVolumeSlider');
+  var seekSlider = document.getElementById('recordingSeekSlider');
+  if (!video) return;
+
+  video.controls = false;
+  video.preload = 'metadata';
+  video.playsInline = true;
+  video.setAttribute('playsinline', '');
+  video.setAttribute('webkit-playsinline', '');
+
+  if (video.dataset.recordingControlsReady === 'true') return;
+  video.dataset.recordingControlsReady = 'true';
+
+  if (playBtn) {
+    playBtn.addEventListener('click', toggleRecordingPlayback);
+  }
+
+  if (muteBtn) {
+    muteBtn.addEventListener('click', function() {
+      if (video.muted || video.volume === 0) {
+        video.muted = false;
+        if (video.volume === 0) video.volume = getSavedRecordingVolume(currentPlayingUsername);
+      } else {
+        video.muted = true;
+      }
+      updateRecordingPlayerControls();
+    });
+  }
+
+  if (volumeSlider) {
+    volumeSlider.addEventListener('input', function() {
+      var volume = parseFloat(volumeSlider.value);
+      if (Number.isNaN(volume)) return;
+      video.volume = volume;
+      video.muted = volume === 0;
+      saveRecordingVolume(currentPlayingUsername, volume);
+      updateRecordingPlayerControls();
+    });
+  }
+
+  if (seekSlider) {
+    seekSlider.addEventListener('input', function() {
+      recordingIsSeeking = true;
+      seekRecordingFromSlider();
+    });
+    seekSlider.addEventListener('change', function() {
+      seekRecordingFromSlider();
+      recordingIsSeeking = false;
+      updateRecordingPlayerControls();
+    });
+    seekSlider.addEventListener('blur', function() {
+      recordingIsSeeking = false;
+      updateRecordingPlayerControls();
+    });
+  }
+
+  if (fullscreenBtn && container) {
+    fullscreenBtn.addEventListener('click', function() {
+      if (document.fullscreenElement) {
+        document.exitFullscreen().catch(function() {});
+      } else if (container.requestFullscreen) {
+        container.requestFullscreen().catch(function() {});
+      }
+    });
+  }
+
+  video.addEventListener('click', function(event) {
+    if (event.target === video) {
+      toggleRecordingPlayback();
+    }
+  });
+  video.addEventListener('play', updateRecordingPlayerControls);
+  video.addEventListener('pause', updateRecordingPlayerControls);
+  video.addEventListener('ended', updateRecordingPlayerControls);
+  video.addEventListener('loadedmetadata', updateRecordingPlayerControls);
+  video.addEventListener('durationchange', updateRecordingPlayerControls);
+  video.addEventListener('timeupdate', updateRecordingPlayerControls);
+  video.addEventListener('volumechange', updateRecordingPlayerControls);
+
+  updateRecordingPlayerControls();
+}
+
 // ============================================
 // Play recording with resume support
 // ============================================
@@ -682,6 +855,7 @@ async function playRecording(username, filename, recordingId) {
   modal.style.display = 'flex';
   modal.setAttribute('aria-hidden', 'false');
   document.body.classList.add('player-modal-open');
+  updateRecordingPlayerControls();
 
   var url = '/streams/records/' + encodeURIComponent(username) + '/' + encodeURIComponent(filename);
 
@@ -691,10 +865,14 @@ async function playRecording(username, filename, recordingId) {
     currentPlayer = null;
   }
   video.removeAttribute('src');
+  delete video.dataset.retried;
+  while (video.firstChild) { video.removeChild(video.firstChild); }
   await loadRecordingVolume(username);
   setupRecordingVolumePersistence(video, username);
+  updateRecordingPlayerControls();
 
   // TS files are raw MPEG-TS, not HLS streams - use direct playback
+  video.preload = 'metadata';
   video.src = url;
   video.onloadedmetadata = function() {
     loadAndSeek(video, recordingId, username);
@@ -801,6 +979,8 @@ async function closePlayer() {
   delete video.dataset.retried;
   while (video.firstChild) { video.removeChild(video.firstChild); }
   video.load();
+  recordingIsSeeking = false;
+  updateRecordingPlayerControls();
 
   currentPlayingRecordingId = '';
   currentPlayingUsername = '';
@@ -1074,6 +1254,8 @@ window.addEventListener('DOMContentLoaded', function() {
       closePlayer();
     }
   });
+
+  setupRecordingPlayerControls();
 
   var loadingState = document.getElementById('loadingState');
 

@@ -10,13 +10,16 @@
   <link rel="stylesheet" href="/static/styles.css">
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script src="/static/loader.js"></script>
-  <script defer src="/static/watch.js?v=6"></script>
+  <script defer src="/static/watch.js?v=7"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
 
   <!-- Video Player (Theater Mode) -->
   <div class="watch-player-container">
+    <button class="watch-back-btn" id="watchBackBtn" type="button" onclick="goBackFromWatch()" title="Back" aria-label="Back">
+      <span aria-hidden="true">&#8592;</span>
+    </button>
     <video id="videoPlayer" class="watch-video" autoplay muted playsinline></video>
     <div class="watch-live-controls" id="liveControls">
       <button class="watch-control-btn" id="livePlayBtn" type="button" title="Play/Pause" aria-label="Play/Pause">

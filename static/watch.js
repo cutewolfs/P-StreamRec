@@ -28,6 +28,15 @@ function sourceQuery() {
   return currentSourceType ? ('?source=' + encodeURIComponent(currentSourceType)) : '';
 }
 
+function goBackFromWatch() {
+  if (window.history.length > 1) {
+    window.history.back();
+    return;
+  }
+
+  window.location.href = '/';
+}
+
 // ============================================
 // Extract username from URL
 // ============================================

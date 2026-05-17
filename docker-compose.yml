@@ -26,6 +26,7 @@ services:
       - FFMPEG_PATH=ffmpeg
       - HLS_TIME=${HLS_TIME:-4}
       - HLS_LIST_SIZE=${HLS_LIST_SIZE:-6}
+      - RECORDING_RANGE_CHUNK_SIZE=${RECORDING_RANGE_CHUNK_SIZE:-8388608}
       - CB_RESOLVER_ENABLED=${CB_RESOLVER_ENABLED:-true}
       - AUTO_RECORD_USERS=${AUTO_RECORD_USERS:-}
       # - CB_COOKIE=session=...; autre=...   # Optionnel

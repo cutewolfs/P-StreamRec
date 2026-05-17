@@ -49,6 +49,7 @@ PASSWORD = os.getenv("PASSWORD", "")  # Mot de passe optionnel
 CHATURBATE_USERNAME = os.getenv("CHATURBATE_USERNAME", "")
 CHATURBATE_PASSWORD = os.getenv("CHATURBATE_PASSWORD", "")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191")
+RECORDING_RANGE_CHUNK_SIZE = int(os.getenv("RECORDING_RANGE_CHUNK_SIZE", str(8 * 1024 * 1024)))
 
 # Docker constants
 DOCKER_SOCKET = '/var/run/docker.sock'
@@ -247,7 +248,13 @@ def _parse_byte_range(range_header: str, file_size: int) -> Optional[tuple[int, 
             end = file_size - 1
         else:
             start = int(start_text)
-            end = int(end_text) if end_text else file_size - 1
+            if end_text:
+                end = int(end_text)
+            else:
+                # Browsers commonly request "bytes=N-" for video. Returning a
+                # bounded chunk keeps very long replays responsive and avoids a
+                # single multi-GB response through Docker/proxy layers.
+                end = start + max(RECORDING_RANGE_CHUNK_SIZE, 1) - 1
             end = min(end, file_size - 1)
     except ValueError:
         return None

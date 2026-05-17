@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/styles.css">
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script src="/static/loader.js"></script>
-  <script defer src="/static/recordings.js?v=6"></script>
+  <script defer src="/static/recordings.js?v=7"></script>
   <style>
     /* --- Per-model edit panel --- */
     .model-edit-panel {
@@ -233,14 +233,33 @@
     </div>
 
     <!-- Player Modal -->
-    <div class="player-modal" id="playerModal" style="display: none;">
+    <div class="player-modal" id="playerModal" style="display: none;" aria-hidden="true">
       <div class="player-modal-content">
-        <div class="player-modal-header">
-          <h3 id="playerTitle">Playing</h3>
-          <button class="player-close-btn" onclick="closePlayer()">&times;</button>
+        <div class="recording-player-container">
+          <button class="watch-back-btn recording-back-btn" type="button" onclick="closePlayer()" title="Back" aria-label="Back">
+            <span aria-hidden="true">&#8592;</span>
+          </button>
+          <h3 class="recording-player-title" id="playerTitle">Playing</h3>
+          <video id="recordingPlayer" class="recording-video" playsinline></video>
+          <div class="watch-live-controls recording-player-controls" id="recordingPlayerControls">
+            <button class="watch-control-btn" id="recordingPlayBtn" type="button" title="Play/Pause" aria-label="Play/Pause">
+              <span id="recordingPlayIcon">&#9654;</span>
+            </button>
+            <button class="watch-control-btn" id="recordingMuteBtn" type="button" title="Mute" aria-label="Mute">
+              <span id="recordingMuteIcon">&#128266;</span>
+            </button>
+            <input class="watch-volume-slider" id="recordingVolumeSlider" type="range" min="0" max="1" step="0.01" aria-label="Volume">
+            <input class="recording-seek-slider" id="recordingSeekSlider" type="range" min="0" max="100" step="0.1" value="0" aria-label="Seek">
+            <div class="recording-time" id="recordingTime">0:00 / 0:00</div>
+            <div class="watch-live-state recording-replay-state" aria-label="Replay status">
+              <span class="watch-live-dot recording-replay-dot"></span>
+              <span>Replay</span>
+            </div>
+            <button class="watch-control-btn" id="recordingFullscreenBtn" type="button" title="Fullscreen" aria-label="Fullscreen">
+              <span>&#9974;</span>
+            </button>
+          </div>
         </div>
-        <button class="player-floating-close" onclick="closePlayer()" aria-label="Close player">&times;</button>
-        <video id="recordingPlayer" class="recording-video" controls></video>
       </div>
     </div>
 
