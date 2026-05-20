@@ -5,6 +5,7 @@ import subprocess
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 from .logger import logger
 from .core.http_client import (
     ffmpeg_http_proxy_url,
@@ -17,6 +18,12 @@ from .core.config import MIN_RECORDING_SECONDS
 # Each entry maps a max_height ceiling to the ffmpeg video stream index.
 _LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
 _TS_PACKET_SIZE = 188
+_CHATURBATE_HLS_HOST_SUFFIXES = ("chaturbate.com", "highwebmedia.com", "mmcdn.com")
+_CHATURBATE_HLS_HEADERS = (
+    "Referer: https://chaturbate.com/\r\n"
+    "Origin: https://chaturbate.com\r\n"
+    "Connection: keep-alive\r\n"
+)
 
 
 def _llhls_video_stream_index(max_height: Optional[int]) -> int:
@@ -27,6 +34,82 @@ def _llhls_video_stream_index(max_height: Optional[int]) -> int:
         if max_height <= height:
             return idx
     return _LLHLS_QUALITY_LADDER[-1][1]
+
+
+def _is_chaturbate_hls_url(input_url: str) -> bool:
+    try:
+        hostname = (urlparse(input_url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in _CHATURBATE_HLS_HOST_SUFFIXES
+    )
+
+
+def _chaturbate_hls_input_args(input_url: str) -> List[str]:
+    if not _is_chaturbate_hls_url(input_url):
+        return []
+    return [
+        "-http_persistent", "1",
+        "-http_multiple", "0",
+        "-multiple_requests", "1",
+        "-headers", _CHATURBATE_HLS_HEADERS,
+    ]
+
+
+def _build_ffmpeg_command(
+    ffmpeg_path: str,
+    input_url: str,
+    tee_spec: str,
+    max_height: Optional[int] = None,
+) -> List[str]:
+    cmd = [
+        ffmpeg_path,
+        "-nostdin", "-hide_banner", "-loglevel", "warning",
+        "-y",
+        # Options de reconnexion pour stabilité
+        "-reconnect", "1",
+        "-reconnect_at_eof", "1",
+        "-reconnect_on_network_error", "1",
+        # 403/404 generally mean an expired HLS token/segment. Retrying
+        # the same URL keeps a dead session around; let the monitor
+        # re-resolve instead. 5xx remains worth retrying briefly.
+        "-reconnect_on_http_error", "5xx",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "10",
+        "-reconnect_delay_total_max", "120",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+
+    proxy_url = ffmpeg_http_proxy_url()
+    if proxy_url:
+        cmd.extend(["-http_proxy", proxy_url])
+    elif is_socks_proxy(get_outbound_proxy_url()):
+        logger.warning(
+            "Proxy SOCKS configuré: les requêtes Python l'utilisent, "
+            "mais FFmpeg ne supporte ici que les proxys HTTP(S)"
+        )
+
+    cmd.extend(_chaturbate_hls_input_args(input_url))
+
+    # For Chaturbate LL-HLS master playlists, the master URL contains both
+    # video variants and a separate audio rendition group. Passing only a
+    # video-only chunk URL strips audio.
+    is_llhls = 'llhls.m3u8' in input_url
+    if is_llhls:
+        v_idx = _llhls_video_stream_index(max_height)
+        map_args = ["-map", f"0:v:{v_idx}", "-map", "0:a:0"]
+    else:
+        map_args = ["-map", "0"]
+
+    cmd.extend([
+        "-i", input_url,
+        *map_args,
+        "-c", "copy",
+        "-f", "tee", tee_spec,
+    ])
+    return cmd
 
 
 class FFmpegSession:
@@ -427,57 +510,12 @@ class FFmpegManager:
                 f"{hls_m3u8}"
             )
 
-            cmd = [
+            cmd = _build_ffmpeg_command(
                 self.ffmpeg_path,
-                "-nostdin", "-hide_banner", "-loglevel", "warning",
-                "-y",
-                # Options de reconnexion pour stabilité
-                "-reconnect", "1",
-                "-reconnect_at_eof", "1",
-                "-reconnect_on_network_error", "1",
-                # 403/404 generally mean an expired HLS token/segment. Retrying
-                # the same URL keeps a dead session around; let the monitor
-                # re-resolve instead. 5xx remains worth retrying briefly.
-                "-reconnect_on_http_error", "5xx",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "10",
-                "-reconnect_delay_total_max", "120",
-                "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            ]
-
-            proxy_url = ffmpeg_http_proxy_url()
-            if proxy_url:
-                cmd.extend(["-http_proxy", proxy_url])
-            elif is_socks_proxy(get_outbound_proxy_url()):
-                logger.warning(
-                    "Proxy SOCKS configuré: les requêtes Python l'utilisent, "
-                    "mais FFmpeg ne supporte ici que les proxys HTTP(S)"
-                )
-
-            if any(host in sess.input_url for host in ("chaturbate.com", "highwebmedia.com", "mmcdn.com")):
-                cmd.extend([
-                    "-headers",
-                    "Referer: https://chaturbate.com/\r\nOrigin: https://chaturbate.com\r\n",
-                ])
-
-            # For Chaturbate LL-HLS master playlists, the master URL contains
-            # both video variants and a separate audio rendition group. Passing
-            # only a video-only chunk URL (from _resolve_variant) strips audio.
-            # The tee muxer also requires explicit mapping, so map one video
-            # rendition plus the audio track in a conventional video/audio order.
-            is_llhls = 'llhls.m3u8' in sess.input_url
-            if is_llhls:
-                v_idx = _llhls_video_stream_index(max_height)
-                map_args = ["-map", f"0:v:{v_idx}", "-map", "0:a:0"]
-            else:
-                map_args = ["-map", "0"]
-
-            cmd.extend([
-                "-i", sess.input_url,
-                *map_args,
-                "-c", "copy",
-                "-f", "tee", tee_spec,
-            ])
+                sess.input_url,
+                tee_spec,
+                max_height=max_height,
+            )
 
             safe_cmd = []
             redact_next = False
