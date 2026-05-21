@@ -376,6 +376,79 @@ cam4_auth_service: Optional[CAM4AuthService] = None
 SOURCE_TYPES = {"chaturbate", "cam4"}
 
 
+def _parse_auto_record_users_env(raw_value: Optional[str]) -> Tuple[list[str], int]:
+    """Parse AUTO_RECORD_USERS, preserving order and dropping duplicates."""
+    users: list[str] = []
+    seen: set[str] = set()
+    skipped = 0
+
+    if not raw_value:
+        return users, skipped
+
+    for item in (raw_value or "").split(","):
+        username = item.strip()
+        if not username:
+            skipped += 1
+            continue
+        dedupe_key = username.lower()
+        if dedupe_key in seen:
+            skipped += 1
+            continue
+        seen.add(dedupe_key)
+        users.append(username)
+
+    return users, skipped
+
+
+async def _import_auto_record_users_from_env() -> dict[str, int]:
+    """Import AUTO_RECORD_USERS into SQLite so the auto-record loop can see it."""
+    users, skipped = _parse_auto_record_users_env(os.getenv("AUTO_RECORD_USERS", ""))
+    imported = 0
+    updated = 0
+    created = 0
+
+    for username in users:
+        existing = await db.get_model(username)
+        if existing:
+            retention_days = existing.get("retention_days")
+            await db.add_or_update_model(
+                username=username,
+                display_name=existing.get("display_name"),
+                auto_record=True,
+                record_quality=existing.get("record_quality") or "best",
+                retention_days=retention_days if retention_days is not None else 30,
+                source_type=existing.get("source_type") or "chaturbate",
+            )
+            updated += 1
+        else:
+            await db.add_or_update_model(
+                username=username,
+                display_name=username,
+                auto_record=True,
+                record_quality=await _get_default_record_quality(),
+                retention_days=await _get_default_retention_days(),
+                source_type="chaturbate",
+            )
+            created += 1
+        imported += 1
+
+    if imported or skipped:
+        logger.info(
+            "AUTO_RECORD_USERS imported",
+            imported=imported,
+            created=created,
+            updated=updated,
+            skipped=skipped,
+        )
+
+    return {
+        "imported": imported,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+    }
+
+
 def _normalize_source_type(source_type: Optional[str]) -> Optional[str]:
     value = (source_type or "").strip().lower()
     if not value or value == "auto":
@@ -3149,6 +3222,7 @@ async def startup_event():
     repaired_sources = await db.reconcile_model_sources_from_followed()
     if repaired_sources:
         logger.info("Sources modèles réparées depuis les favoris", count=repaired_sources)
+    await _import_auto_record_users_from_env()
 
     # Initialize FlareSolverr client.
     # The docker-compose healthcheck normally guarantees FlareSolverr is
