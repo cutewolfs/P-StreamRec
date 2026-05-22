@@ -102,6 +102,8 @@ docker run -d --name p-streamrec \
 | `FFMPEG_PATH` | `ffmpeg` | Path to FFmpeg |
 | `RECORDING_RANGE_CHUNK_SIZE` | `8388608` | Max bytes returned for open-ended replay Range requests |
 | `CB_RESOLVER_ENABLED` | `true` | Enable Chaturbate support |
+| `PSTREAMREC_DNS_CACHE` | `false` | Enable a container-local DNS cache for FFmpeg/HLS lookups |
+| `PSTREAMREC_DNS_CACHE_UPSTREAMS` | — | Optional comma-separated upstream DNS servers for the local DNS cache |
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |
 | `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
@@ -119,6 +121,13 @@ For recording downloads, FFmpeg can use HTTP(S) proxies via `PSTREAMREC_PROXY_UR
 or the standard proxy env vars. SOCKS proxies are supported by the Python
 resolvers/API calls; use an HTTP proxy if FFmpeg also needs to fetch HLS
 segments through the proxy.
+
+For Chaturbate/CDN recordings that trigger repeated FFmpeg DNS lookups during
+live LL-HLS playlist reloads, set `PSTREAMREC_DNS_CACHE=true` to start a small
+`dnsmasq` cache inside the P-StreamRec container. The cache keeps repeated
+lookups local until the upstream DNS TTL expires. If your container already
+uses a localhost resolver, also set `PSTREAMREC_DNS_CACHE_UPSTREAMS=1.1.1.1,1.0.0.1`
+or your preferred upstream servers to avoid a resolver loop.
 
 ## Usage
 
