@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - beta
 
 jobs:
   build-and-push:
@@ -21,6 +22,13 @@ jobs:
       - name: Compute version (YEAR.WEEK.N)
         id: version
         run: |
+          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
+            VERSION="beta"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "Computed beta image tag: $VERSION"
+            exit 0
+          fi
+
           YEAR=$(date -u +%Y)
           WEEK=$(date -u +%V)
           # Remove leading zero for clean version number
@@ -60,7 +68,7 @@ jobs:
           images: ghcr.io/raccommode/p-streamrec
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -76,6 +84,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Create GitHub Release
+        if: github.ref_name == 'main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
@@ -83,6 +92,7 @@ jobs:
           generate_release_notes: true
 
       - name: Sync Umbrel app version
+        if: github.ref_name == 'main'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -93,6 +103,7 @@ jobs:
           grep "^version:" "$APP_YML"
 
       - name: Commit Umbrel version bump
+        if: github.ref_name == 'main'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
