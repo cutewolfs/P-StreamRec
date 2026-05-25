@@ -524,8 +524,6 @@ async function retryStream() {
 // ============================================
 function followBasePath() {
   // Route vers le bon service selon la plateforme.
-  if (currentSourceType === 'cam4') return '/api/cam4';
-  if (currentSourceType === 'chaturbate') return '/api/chaturbate';
   return '/api/providers/' + encodeURIComponent(currentSourceType || 'chaturbate');
 }
 

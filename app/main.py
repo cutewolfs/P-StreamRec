@@ -1525,7 +1525,10 @@ async def provider_sync_following(source_type: str):
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
     try:
-        items = await provider.sync_following()
+        timeout = float(os.getenv("PSTREAMREC_FOLLOW_SYNC_TIMEOUT", "45") or "45")
+        items = await asyncio.wait_for(provider.sync_following(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"{provider.display_name}: sync timeout")
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -3600,32 +3603,19 @@ async def update_recording_settings(body: dict):
 @app.post("/api/chaturbate/follow/{username}")
 async def follow_model_on_chaturbate(username: str):
     """Follow a model on Chaturbate"""
-    if not chaturbate_api:
-        raise HTTPException(status_code=503, detail="Chaturbate API not initialized")
-    success = await chaturbate_api.follow_model(username)
-    if success:
-        return {"success": True, "message": f"Now following {username}"}
-    raise HTTPException(status_code=400, detail=f"Failed to follow {username}")
+    return await provider_follow("chaturbate", username)
 
 
 @app.post("/api/chaturbate/unfollow/{username}")
 async def unfollow_model_on_chaturbate(username: str):
     """Unfollow a model on Chaturbate"""
-    if not chaturbate_api:
-        raise HTTPException(status_code=503, detail="Chaturbate API not initialized")
-    success = await chaturbate_api.unfollow_model(username)
-    if success:
-        return {"success": True, "message": f"Unfollowed {username}"}
-    raise HTTPException(status_code=400, detail=f"Failed to unfollow {username}")
+    return await provider_unfollow("chaturbate", username)
 
 
 @app.get("/api/chaturbate/is-following/{username}")
 async def is_following_model(username: str):
     """Check if following a model on Chaturbate"""
-    if not chaturbate_api:
-        return {"isFollowing": False}
-    is_following = await chaturbate_api.is_following(username)
-    return {"isFollowing": is_following}
+    return await provider_is_following("chaturbate", username)
 
 
 # ============================================
@@ -4261,7 +4251,7 @@ async def startup_event():
     # Wire up API routers
     auth_router.init(cb_auth, flaresolverr)
     discover_router.init(cb_api, db, provider_registry)
-    following_router.init(cb_api, cb_auth, db)
+    following_router.init(cb_api, cb_auth, db, provider_registry)
 
     # Set authenticated resolver for chaturbate
     from .resolvers.chaturbate import set_chaturbate_api
