@@ -2,9 +2,13 @@
 API Router: Following management
 """
 
+import asyncio
+import os
+
 from fastapi import APIRouter, HTTPException
 
 from ..logger import logger
+from ..providers.base import ProviderError
 
 router = APIRouter(prefix="/api", tags=["following"])
 
@@ -12,15 +16,17 @@ router = APIRouter(prefix="/api", tags=["following"])
 _chaturbate_api = None
 _auth_service = None
 _db = None
+_provider_registry = None
 _DEFAULT_RETENTION_DAYS = 30
 _MAX_RETENTION_DAYS = 365
 
 
-def init(chaturbate_api, auth_service, db):
-    global _chaturbate_api, _auth_service, _db
+def init(chaturbate_api, auth_service, db, provider_registry=None):
+    global _chaturbate_api, _auth_service, _db, _provider_registry
     _chaturbate_api = chaturbate_api
     _auth_service = auth_service
     _db = db
+    _provider_registry = provider_registry
 
 
 async def _get_default_retention_days() -> int:
@@ -117,8 +123,70 @@ async def get_following():
 @router.post("/following/sync")
 async def sync_following():
     """
-    Force re-sync followed models from Chaturbate.
+    Force re-sync followed models from every connected provider that supports
+    remote follow sync. Kept on the legacy route for the Following page and
+    older clients.
     """
+    if not _db:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+
+    if _provider_registry:
+        timeout = float(os.getenv("PSTREAMREC_FOLLOW_SYNC_TIMEOUT", "45") or "45")
+        results = []
+        total_synced = 0
+
+        for provider in _provider_registry.all():
+            caps = getattr(provider, "capabilities", None)
+            if not caps or not getattr(caps, "can_sync_following", False):
+                continue
+
+            source_type = getattr(provider, "source_type", "") or ""
+            display_name = getattr(provider, "display_name", source_type) or source_type
+            try:
+                items = await asyncio.wait_for(provider.sync_following(), timeout=timeout)
+                synced = await _store_provider_following(source_type, items or [])
+                total_synced += synced
+                results.append({
+                    "sourceType": source_type,
+                    "displayName": display_name,
+                    "synced": synced,
+                    "status": "ok",
+                })
+            except asyncio.TimeoutError:
+                logger.warning("Provider following sync timeout", source_type=source_type, timeout=timeout)
+                results.append({
+                    "sourceType": source_type,
+                    "displayName": display_name,
+                    "synced": 0,
+                    "status": "timeout",
+                    "detail": f"Sync timed out after {int(timeout)}s",
+                })
+            except ProviderError as exc:
+                results.append({
+                    "sourceType": source_type,
+                    "displayName": display_name,
+                    "synced": 0,
+                    "status": "error",
+                    "detail": str(exc),
+                })
+            except Exception as exc:
+                logger.error("Provider following sync failed", source_type=source_type, error=str(exc), exc_info=True)
+                results.append({
+                    "sourceType": source_type,
+                    "displayName": display_name,
+                    "synced": 0,
+                    "status": "error",
+                    "detail": str(exc),
+                })
+
+        await _db.reconcile_model_sources_from_followed()
+        ok_count = sum(1 for item in results if item.get("status") == "ok")
+        return {
+            "synced": total_synced,
+            "results": results,
+            "message": f"Synced {total_synced} followed models from {ok_count} provider(s)",
+        }
+
     if not _auth_service or not _chaturbate_api:
         raise HTTPException(status_code=503, detail="Services not initialized")
 
@@ -152,6 +220,7 @@ async def sync_following():
             is_online=is_online,
             viewers=model.get("viewers", 0),
             thumbnail_url=thumb,
+            source_type="chaturbate",
             room_status=model.get("room_status"),
         )
         synced_usernames.add(model["username"])
@@ -160,6 +229,32 @@ async def sync_following():
     await _db.remove_unfollowed(synced_usernames)
 
     return {"synced": len(models), "message": f"Synced {len(models)} followed models"}
+
+
+async def _store_provider_following(source_type: str, items: list[dict]) -> int:
+    synced_usernames = set()
+    for item in items:
+        username = item.get("username")
+        if not username:
+            continue
+        thumbnail = item.get("thumbnail_url") or item.get("thumbnail")
+        is_online = bool(item.get("is_online", item.get("isOnline", False)))
+        if source_type == "chaturbate" and not is_online and thumbnail and "roomimg.stream.highwebmedia.com" in thumbnail:
+            thumbnail = None
+        await _db.upsert_followed_model(
+            username=username,
+            display_name=item.get("display_name") or username,
+            is_online=is_online,
+            viewers=int(item.get("viewers") or 0),
+            thumbnail_url=thumbnail,
+            source_type=source_type,
+            room_status=item.get("room_status") or item.get("roomStatus"),
+        )
+        synced_usernames.add(username)
+
+    if source_type == "chaturbate":
+        await _db.remove_unfollowed(synced_usernames, source_type=source_type)
+    return len(synced_usernames)
 
 
 @router.post("/following/{username}/track")

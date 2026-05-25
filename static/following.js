@@ -34,20 +34,43 @@ function renderPlatformBadge(sourceType) {
 // State
 let trackedModels = new Set();
 let isLoggedIn = false;
+let followingProviders = [];
+
+async function fetchJsonWithTimeout(url, options, timeoutMs) {
+  timeoutMs = timeoutMs || 45000;
+  var controller = window.AbortController ? new AbortController() : null;
+  var timer = controller ? setTimeout(function() { controller.abort(); }, timeoutMs) : null;
+  try {
+    var requestOptions = options || {};
+    if (controller) requestOptions.signal = controller.signal;
+    var res = await fetch(url, requestOptions);
+    var data = await res.json().catch(function() { return {}; });
+    return { ok: res.ok, status: res.status, data: data };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // ============================================
-// Check Chaturbate login status
+// Check provider login status
 // ============================================
-async function checkChaturbateStatus() {
+async function loadFollowingProviders() {
   try {
-    var res = await fetch('/api/chaturbate/status');
+    var res = await fetch('/api/providers', { cache: 'no-store' });
     if (res.ok) {
       var data = await res.json();
-      return data.isLoggedIn === true;
+      followingProviders = (data.providers || []).filter(function(provider) {
+        var caps = provider.capabilities || {};
+        return caps.can_sync_following === true;
+      });
+      return followingProviders.some(function(provider) {
+        return provider.status && provider.status.isLoggedIn === true;
+      });
     }
   } catch (e) {
-    // Chaturbate status API not available
+    console.error('Error loading provider status:', e);
   }
+  followingProviders = [];
   return false;
 }
 
@@ -247,29 +270,65 @@ async function trackFollowedModel(username, btn) {
 // Sync following list
 // ============================================
 async function syncFollowing() {
+  var options = arguments[0] || {};
+  var silent = options.silent === true;
   var syncBtn = document.getElementById('syncBtn');
   var syncIcon = document.getElementById('syncIcon');
 
-  syncBtn.classList.add('syncing');
-  syncIcon.style.animation = 'spin 1s linear infinite';
+  if (syncBtn) syncBtn.classList.add('syncing');
+  if (syncIcon) syncIcon.style.animation = 'spin 1s linear infinite';
 
   try {
-    var res = await fetch('/api/following/sync', { method: 'POST' });
-    if (res.ok) {
-      showNotification('Following list synced!', 'success');
-      // Reload the page data
-      var models = await loadFollowing();
-      renderFollowing(models);
-      updateLastSynced();
-    } else {
-      showNotification('Failed to sync following list', 'error');
+    if (!followingProviders.length) {
+      await loadFollowingProviders();
     }
+
+    var targets = followingProviders.filter(function(provider) {
+      var caps = provider.capabilities || {};
+      return caps.can_sync_following === true && provider.status && provider.status.isLoggedIn === true;
+    });
+
+    if (!targets.length) {
+      if (!silent) showNotification('No connected provider to sync', 'error');
+      return [];
+    }
+
+    var synced = 0;
+    var failed = [];
+    for (var i = 0; i < targets.length; i += 1) {
+      var provider = targets[i];
+      try {
+        var result = await fetchJsonWithTimeout(
+          '/api/providers/' + encodeURIComponent(provider.sourceType) + '/following/sync',
+          { method: 'POST' },
+          45000
+        );
+        if (result.ok) {
+          synced += Number(result.data.synced || 0);
+        } else {
+          failed.push(provider.displayName || provider.sourceType);
+        }
+      } catch (e) {
+        failed.push(provider.displayName || provider.sourceType);
+      }
+    }
+
+    var models = await loadFollowing();
+    renderFollowing(models);
+    if (failed.length) {
+      if (!silent) showNotification('Sync incomplete: ' + failed.join(', '), 'error');
+    } else {
+      if (!silent) showNotification('Following list synced!', 'success');
+      updateLastSynced();
+    }
+    return models;
   } catch (e) {
     console.error('Error syncing following:', e);
-    showNotification('Connection error', 'error');
+    if (!silent) showNotification('Connection error', 'error');
+    return [];
   } finally {
-    syncBtn.classList.remove('syncing');
-    syncIcon.style.animation = '';
+    if (syncBtn) syncBtn.classList.remove('syncing');
+    if (syncIcon) syncIcon.style.animation = '';
   }
 }
 
@@ -376,7 +435,7 @@ window.addEventListener('DOMContentLoaded', function() {
   var syncControls = document.getElementById('syncControls');
 
   // Load data
-  Promise.all([loadTrackedModels(), checkChaturbateStatus()]).then(function(results) {
+  Promise.all([loadTrackedModels(), loadFollowingProviders()]).then(function(results) {
     isLoggedIn = results[1];
 
     loadingState.style.display = 'none';
@@ -400,6 +459,9 @@ window.addEventListener('DOMContentLoaded', function() {
 
       loadFollowing().then(function(models) {
         renderFollowing(models);
+        if (!models.length) {
+          syncFollowing({ silent: true });
+        }
       });
     }
   }).catch(function(e) {

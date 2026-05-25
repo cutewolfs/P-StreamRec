@@ -507,6 +507,7 @@ SOURCE_TYPES = {"chaturbate", "cam4"}
 provider_registry = create_provider_registry(db, output_dir=OUTPUT_DIR)
 SOURCE_TYPES = provider_registry.source_types()
 _HLS_PROXY_CACHE: dict[str, dict] = {}
+_HLS_PROXY_REVERSE: dict[tuple, str] = {}
 _HLS_PROXY_TTL_SECONDS = int(os.getenv("PSTREAMREC_HLS_PROXY_TTL_SECONDS", "900"))
 
 
@@ -687,7 +688,21 @@ def _prune_hls_proxy_cache() -> None:
         if entry.get("expires_at", 0) <= now
     ]
     for token in expired:
-        _HLS_PROXY_CACHE.pop(token, None)
+        entry = _HLS_PROXY_CACHE.pop(token, None)
+        cache_key = entry.get("cache_key") if entry else None
+        if cache_key and _HLS_PROXY_REVERSE.get(cache_key) == token:
+            _HLS_PROXY_REVERSE.pop(cache_key, None)
+
+
+def _hls_proxy_cache_key(
+    url: str,
+    headers: Optional[dict[str, str]],
+    suffix: str,
+) -> tuple:
+    header_items = tuple(
+        sorted((str(key), str(value)) for key, value in (headers or {}).items())
+    )
+    return (url, header_items, suffix)
 
 
 def _hls_proxy_path_suffix(url: str) -> str:
@@ -709,15 +724,25 @@ def _register_hls_proxy_url(
     suffix: Optional[str] = None,
 ) -> str:
     _prune_hls_proxy_cache()
-    token = secrets.token_urlsafe(24)
+    resolved_suffix = suffix if suffix is not None else _hls_proxy_path_suffix(url)
+    cache_key = _hls_proxy_cache_key(url, headers, resolved_suffix)
     now = time.time()
+    existing_token = _HLS_PROXY_REVERSE.get(cache_key)
+    existing = _HLS_PROXY_CACHE.get(existing_token or "")
+    if existing and existing.get("expires_at", 0) > now:
+        existing["expires_at"] = now + max(60, _HLS_PROXY_TTL_SECONDS)
+        return f"/api/proxy/hls/{existing_token}{resolved_suffix}"
+
+    token = secrets.token_urlsafe(24)
     _HLS_PROXY_CACHE[token] = {
         "url": url,
         "headers": dict(headers or {}),
+        "cache_key": cache_key,
         "created_at": now,
         "expires_at": now + max(60, _HLS_PROXY_TTL_SECONDS),
     }
-    return f"/api/proxy/hls/{token}{suffix if suffix is not None else _hls_proxy_path_suffix(url)}"
+    _HLS_PROXY_REVERSE[cache_key] = token
+    return f"/api/proxy/hls/{token}{resolved_suffix}"
 
 
 def _register_cached_hls_body(url: str, body: bytes, content_type: str = "") -> str:
@@ -833,6 +858,7 @@ def _rewrite_hls_playlist(
         return _register_hls_proxy_url(urljoin(base_url, raw_uri), headers=headers)
 
     media_sequence_written = False
+    pending_program_date_time: Optional[str] = None
     rewritten = []
     for line in (text or "").splitlines():
         stripped = line.strip()
@@ -840,8 +866,28 @@ def _rewrite_hls_playlist(
             rewritten.append(line)
             continue
         if stripped.startswith("#"):
+            upper = stripped.upper()
+            # Hls.js can chase LL-HLS parts/preload hints faster than a
+            # server-side proxy can refresh provider tokens. Keep the stable
+            # full segments and rewrite the playlist as ordinary live HLS.
+            if (
+                upper.startswith("#EXT-X-SERVER-CONTROL:")
+                or upper.startswith("#EXT-X-PART-INF:")
+                or upper.startswith("#EXT-X-PART:")
+                or upper.startswith("#EXT-X-PRELOAD-HINT:")
+                or upper.startswith("#EXT-X-RENDITION-REPORT:")
+            ):
+                continue
+            if upper.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+                pending_program_date_time = line
+                continue
+            if upper.startswith("#EXTINF:"):
+                if pending_program_date_time:
+                    rewritten.append(pending_program_date_time)
+                    pending_program_date_time = None
+                rewritten.append(line)
+                continue
             if live_sequence is not None:
-                upper = stripped.upper()
                 if upper.startswith("#EXT-X-PLAYLIST-TYPE:") or upper == "#EXT-X-ENDLIST":
                     continue
                 if upper.startswith("#EXT-X-MEDIA-SEQUENCE:"):
@@ -1525,7 +1571,10 @@ async def provider_sync_following(source_type: str):
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
     try:
-        items = await provider.sync_following()
+        timeout = float(os.getenv("PSTREAMREC_FOLLOW_SYNC_TIMEOUT", "45") or "45")
+        items = await asyncio.wait_for(provider.sync_following(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"{provider.display_name}: sync timeout")
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -3600,32 +3649,19 @@ async def update_recording_settings(body: dict):
 @app.post("/api/chaturbate/follow/{username}")
 async def follow_model_on_chaturbate(username: str):
     """Follow a model on Chaturbate"""
-    if not chaturbate_api:
-        raise HTTPException(status_code=503, detail="Chaturbate API not initialized")
-    success = await chaturbate_api.follow_model(username)
-    if success:
-        return {"success": True, "message": f"Now following {username}"}
-    raise HTTPException(status_code=400, detail=f"Failed to follow {username}")
+    return await provider_follow("chaturbate", username)
 
 
 @app.post("/api/chaturbate/unfollow/{username}")
 async def unfollow_model_on_chaturbate(username: str):
     """Unfollow a model on Chaturbate"""
-    if not chaturbate_api:
-        raise HTTPException(status_code=503, detail="Chaturbate API not initialized")
-    success = await chaturbate_api.unfollow_model(username)
-    if success:
-        return {"success": True, "message": f"Unfollowed {username}"}
-    raise HTTPException(status_code=400, detail=f"Failed to unfollow {username}")
+    return await provider_unfollow("chaturbate", username)
 
 
 @app.get("/api/chaturbate/is-following/{username}")
 async def is_following_model(username: str):
     """Check if following a model on Chaturbate"""
-    if not chaturbate_api:
-        return {"isFollowing": False}
-    is_following = await chaturbate_api.is_following(username)
-    return {"isFollowing": is_following}
+    return await provider_is_following("chaturbate", username)
 
 
 # ============================================
@@ -4261,7 +4297,7 @@ async def startup_event():
     # Wire up API routers
     auth_router.init(cb_auth, flaresolverr)
     discover_router.init(cb_api, db, provider_registry)
-    following_router.init(cb_api, cb_auth, db)
+    following_router.init(cb_api, cb_auth, db, provider_registry)
 
     # Set authenticated resolver for chaturbate
     from .resolvers.chaturbate import set_chaturbate_api

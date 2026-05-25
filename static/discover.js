@@ -254,9 +254,7 @@ async function toggleFollowOnCard(username, sourceType, btn) {
   if (!username || btn.classList.contains('busy')) return;
   var key = sourceKey(username, sourceType);
   var wasFollowing = followedSet.has(key);
-  var base = sourceType === 'cam4'
-    ? '/api/cam4'
-    : (sourceType === 'chaturbate' ? '/api/chaturbate' : '/api/providers/' + encodeURIComponent(sourceType || 'chaturbate'));
+  var base = '/api/providers/' + encodeURIComponent(sourceType || 'chaturbate');
   var endpoint = base + (wasFollowing ? '/unfollow/' : '/follow/') + encodeURIComponent(username);
 
   btn.classList.add('busy');

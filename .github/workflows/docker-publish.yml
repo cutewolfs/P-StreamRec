@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - beta
 
 jobs:
   build-and-push:
@@ -34,6 +35,9 @@ jobs:
 
           N=$(( LATEST + 1 ))
           VERSION="${PREFIX}.${N}"
+          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
+            VERSION="${VERSION}-beta"
+          fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Computed version: $VERSION"
@@ -60,7 +64,8 @@ jobs:
           images: ghcr.io/raccommode/p-streamrec
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=raw,value=beta,enable=${{ github.ref_name == 'beta' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -76,6 +81,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Create GitHub Release
+        if: github.ref_name == 'main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.version }}
@@ -83,6 +89,7 @@ jobs:
           generate_release_notes: true
 
       - name: Sync Umbrel app version
+        if: github.ref_name == 'main'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -93,6 +100,7 @@ jobs:
           grep "^version:" "$APP_YML"
 
       - name: Commit Umbrel version bump
+        if: github.ref_name == 'main'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
