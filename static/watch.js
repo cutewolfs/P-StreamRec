@@ -334,10 +334,10 @@ function startStreamWithUrl(streamUrl) {
     }, { once: true });
     video.load();
     startMutedAutoplay(video);
-  } else if (Hls.isSupported()) {
+  } else if (window.Hls && window.Hls.isSupported()) {
     hlsPlayer = new Hls({
       enableWorker: true,
-      lowLatencyMode: true,
+      lowLatencyMode: false,
       backBufferLength: 90,
     });
     hlsPlayer.loadSource(streamUrl);
@@ -351,7 +351,14 @@ function startStreamWithUrl(streamUrl) {
     });
     hlsPlayer.on(Hls.Events.ERROR, function(event, data) {
       if (data.fatal) {
-        console.error('HLS fatal error:', data.type);
+        console.error('HLS fatal error: ' + [
+          data.type,
+          data.details || '',
+          data.reason || '',
+          data.error ? data.error.message : '',
+          data.response ? data.response.code : '',
+          data.url || ''
+        ].filter(Boolean).join(' | '));
         scheduleStatusRefreshAfterStreamProblem();
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
@@ -379,6 +386,19 @@ function startStreamWithUrl(streamUrl) {
     }, { once: true });
     video.load();
     startMutedAutoplay(video);
+  } else {
+    console.error('HLS playback is not supported in this browser');
+    stopStream(false);
+    var offlineOverlay = document.getElementById('offlineOverlay');
+    var offlineIcon = document.getElementById('offlineIcon');
+    var offlineTitle = document.getElementById('offlineTitle');
+    var offlineText = document.getElementById('offlineText');
+    var retryBtn = document.getElementById('retryBtn');
+    if (offlineIcon) offlineIcon.innerHTML = '&#9888;';
+    if (offlineTitle) offlineTitle.textContent = 'Live player unavailable';
+    if (offlineText) offlineText.textContent = 'This browser cannot load the HLS player. Check the network connection and retry.';
+    if (retryBtn) retryBtn.style.display = 'inline-flex';
+    if (offlineOverlay) offlineOverlay.style.display = 'flex';
   }
 }
 
