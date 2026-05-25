@@ -31,6 +31,8 @@ services:
       - HLS_LIST_SIZE=6
       - CB_RESOLVER_ENABLED=true
       - PSTREAMREC_DNS_CACHE=${PSTREAMREC_DNS_CACHE:-false}
+      - PSTREAMREC_BROWSER_HEADLESS=${PSTREAMREC_BROWSER_HEADLESS:-true}
+      - PSTREAMREC_BROWSER_CAPTURE_TIMEOUT=${PSTREAMREC_BROWSER_CAPTURE_TIMEOUT:-25}
       - AUTO_RECORD_USERS=
       # Optional: set PASSWORD here if you want an extra layer on top of Umbrel auth
       - PASSWORD=

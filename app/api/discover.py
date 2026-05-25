@@ -1,71 +1,124 @@
-"""
-API Router: Discover live models.
-
-Agrège Chaturbate + CAM4 (deux sources intégrées). Le premier tag est envoyé
-aux API natives (filtrage côté source), les tags supplémentaires et la
-blacklist sont appliqués localement. L'interleave round-robin empêche un
-catalogue plus gros (Chaturbate ~7000) d'écraser le plus petit (CAM4 ~60).
-"""
+"""API Router: Discover live models across registered providers."""
 
 import asyncio
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query
 
 from ..logger import logger
-from ..services import cam4_source
 
 router = APIRouter(prefix="/api", tags=["discover"])
 
 _chaturbate_api = None
 _db = None
+_provider_registry = None
+_pagination_total_cache: dict[tuple, tuple[float, int, int]] = {}
+_PAGINATION_TOTAL_TTL_SECONDS = 300
 
 
-def init(chaturbate_api, db):
-    global _chaturbate_api, _db
+def init(chaturbate_api, db, provider_registry=None):
+    global _chaturbate_api, _db, _provider_registry
     _chaturbate_api = chaturbate_api
     _db = db
+    _provider_registry = provider_registry
+    _pagination_total_cache.clear()
 
 
-async def _fetch_chaturbate(
-    page: int,
-    limit: int,
+def _discover_providers(source: Optional[str]) -> list:
+    if _provider_registry is None:
+        return []
+    requested = [
+        item.strip().lower()
+        for item in (source or "").split(",")
+        if item.strip()
+    ]
+    if requested:
+        providers = []
+        for source_type in requested:
+            if _provider_registry.has(source_type):
+                providers.append(_provider_registry.get(source_type))
+        return providers
+    return [
+        provider
+        for provider in _provider_registry.all()
+        if getattr(provider.capabilities, "can_discover", False)
+    ]
+
+
+def _pagination_cache_key(
+    source: Optional[str],
     gender: Optional[str],
-    search: Optional[str],
-    first_tag: str,
-) -> Optional[Dict[str, Any]]:
-    if _chaturbate_api is None:
-        return None
-    try:
-        return await _chaturbate_api.get_live_models(
-            page=page,
-            limit=limit,
-            gender=gender or "",
-            search=search or "",
-            tag=first_tag,
-        )
-    except Exception as e:
-        logger.warning("Discover Chaturbate échec", error=str(e))
-        return None
+    search: str,
+    tags: List[str],
+    sort_mode: str,
+    limit: int,
+) -> tuple:
+    requested_sources = tuple(
+        item.strip().lower()
+        for item in (source or "").split(",")
+        if item.strip()
+    )
+    return (
+        requested_sources or ("__all__",),
+        (gender or "").strip().lower(),
+        search,
+        tuple(tags),
+        sort_mode,
+        int(limit),
+    )
 
 
-async def _fetch_cam4(
+def _stable_pagination_totals(
+    cache_key: tuple,
+    page: int,
+    total: int,
+    total_pages: int,
+) -> tuple[int, int]:
+    now = time.monotonic()
+    cached = _pagination_total_cache.get(cache_key)
+    if cached and now - cached[0] >= _PAGINATION_TOTAL_TTL_SECONDS:
+        cached = None
+        _pagination_total_cache.pop(cache_key, None)
+
+    if page <= 1 or cached is None:
+        stable = (max(0, int(total)), max(1, int(total_pages or 1)))
+        _pagination_total_cache[cache_key] = (now, stable[0], stable[1])
+        return stable
+
+    return cached[1], cached[2]
+
+
+async def _fetch_provider(
+    provider,
     page: int,
     limit: int,
     gender: Optional[str],
     search: Optional[str],
     tags: Optional[List[str]],
+    allow_browser: bool,
+    exact_search_fallback: bool,
 ) -> Optional[Dict[str, Any]]:
     try:
-        return await cam4_source.list_live_models(
-            page=page,
-            limit=limit,
-            gender=gender,
-            search=search,
-            tags=tags,
+        timeout = 25 if allow_browser else 14
+        return await asyncio.wait_for(
+            provider.list_live_models(
+                page=page,
+                limit=limit,
+                gender=gender or "",
+                search=search or "",
+                tags=tags or [],
+                allow_browser=allow_browser,
+                exact_search_fallback=exact_search_fallback,
+            ),
+            timeout=timeout,
         )
     except Exception as e:
-        logger.warning("Discover CAM4 échec", error=str(e))
+        logger.warning(
+            "Discover provider échec",
+            source_type=getattr(provider, "source_type", "unknown"),
+            error=str(e),
+        )
         return None
 
 
@@ -73,27 +126,45 @@ async def _fetch_cam4(
 async def discover_models(
     page: int = Query(1, ge=1),
     limit: int = Query(24, ge=1, le=100),
+    source: Optional[str] = Query(None),
     gender: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     tags: Optional[str] = Query(None),
     sort: Optional[str] = Query("viewers"),
 ):
-    """Liste agrégée Chaturbate + CAM4 (rooms publiques uniquement)."""
+    """Liste agrégée de toutes les sources Discover (rooms publiques uniquement)."""
     included_tags: List[str] = []
     if tags:
         included_tags = [t.strip().lower() for t in tags.split(",") if t.strip()]
-    first_tag = included_tags[0] if included_tags else ""
 
     search_lower = (search or "").strip().lower()
     sort_mode = (sort or "viewers").strip().lower()
 
-    n_sources = 2  # chaturbate + cam4
-    per_source_limit = max(1, (limit + n_sources - 1) // n_sources)
+    providers = _discover_providers(source)
+    if not providers:
+        return {"models": [], "total": 0, "page": page, "limit": limit, "total_pages": 1}
+    explicit_source = bool((source or "").strip())
+    # En vue "All sources", on récupère un volume fixe par provider puis on
+    # trie/pagine localement. Sinon le nombre total de pages change à chaque
+    # Next parce que certains providers recalculent total_pages avec le limit
+    # temporaire qu'on leur passe.
+    per_source_limit = limit if explicit_source else 100
+    provider_page = page if explicit_source else 1
+    allow_browser = explicit_source
 
-    cb_result, cam4_result = await asyncio.gather(
-        _fetch_chaturbate(page, per_source_limit, gender, search, first_tag),
-        _fetch_cam4(page, per_source_limit, gender, search, included_tags or None),
-    )
+    results = await asyncio.gather(*[
+        _fetch_provider(
+            provider,
+            provider_page,
+            per_source_limit,
+            gender,
+            search,
+            included_tags or None,
+            allow_browser=allow_browser,
+            exact_search_fallback=explicit_source,
+        )
+        for provider in providers
+    ])
 
     blacklisted_tags: List[str] = []
     if _db:
@@ -103,7 +174,40 @@ async def discover_models(
             blacklisted_tags = []
     blacklisted_set = {t.lower() for t in blacklisted_tags}
 
-    def _filter_list(result: Optional[Dict[str, Any]], source: str) -> List[Dict[str, Any]]:
+    capabilities = {
+        provider.source_type: provider.capabilities
+        for provider in providers
+    }
+
+    def _fallback_tags(item: Dict[str, Any]) -> List[str]:
+        values = [
+            item.get("gender"),
+            item.get("room_status") or "public",
+        ]
+        age = item.get("age")
+        try:
+            age_value = int(age or 0)
+        except (TypeError, ValueError):
+            age_value = 0
+        if 18 <= age_value <= 29:
+            values.append("18-29")
+        elif 30 <= age_value <= 39:
+            values.append("30-39")
+        elif 40 <= age_value <= 49:
+            values.append("40-49")
+        elif age_value >= 50:
+            values.append("50+")
+        seen = set()
+        tags_out: List[str] = []
+        for value in values:
+            tag = str(value or "").strip().lower()
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            tags_out.append(tag)
+        return tags_out
+
+    def _filter_list(result: Optional[Dict[str, Any]], source_type: str) -> List[Dict[str, Any]]:
         if result is None:
             return []
         out: List[Dict[str, Any]] = []
@@ -113,7 +217,10 @@ async def discover_models(
             rs = (item.get("room_status") or "public").lower()
             if rs != "public" or not item.get("is_online", True):
                 continue
-            item_tags_lower = [t.lower() for t in (item.get("tags") or [])]
+            item_tags = [str(tag).strip().lower() for tag in (item.get("tags") or []) if str(tag).strip()]
+            if not item_tags:
+                item_tags = _fallback_tags(item)
+            item_tags_lower = [t.lower() for t in item_tags]
             if blacklisted_set and any(bt in item_tags_lower for bt in blacklisted_set):
                 continue
             # Filtrage strict: tous les tags demandés doivent être présents.
@@ -130,54 +237,109 @@ async def discover_models(
                 if search_lower not in uname and search_lower not in dname:
                     continue
             item = dict(item)
-            item["source_type"] = source
+            item["viewers"] = int(item.get("viewers") or 0)
+            item["tags"] = item_tags
+            item["source_type"] = item.get("source_type") or source_type
+            item_caps = capabilities.get(item["source_type"])
+            stream_available = bool(getattr(item_caps, "can_stream", True))
+            if not explicit_source and not stream_available:
+                continue
+            item["stream_available"] = stream_available
+            item["record_available"] = bool(getattr(item_caps, "can_record", stream_available))
+            item["can_follow"] = bool(getattr(item_caps, "can_follow", False))
             out.append(item)
         return out
 
-    cb_items = _filter_list(cb_result, "chaturbate")
-    cam4_items = _filter_list(cam4_result, "cam4")
+    grouped_items: List[List[Dict[str, Any]]] = []
+    for provider, result in zip(providers, results):
+        grouped_items.append(_filter_list(result, provider.source_type))
+
+    provider_statuses: List[Dict[str, Any]] = []
+    for provider, result, items in zip(providers, results, grouped_items):
+        if result is None:
+            provider_statuses.append({
+                "source_type": provider.source_type,
+                "display_name": provider.display_name,
+                "status": "error",
+                "detail": "Provider did not return a Discover response.",
+                "count": 0,
+                "total": 0,
+            })
+            continue
+        provider_can_stream = bool(getattr(provider.capabilities, "can_stream", True))
+        provider_status = str(result.get("provider_status") or ("ok" if items else "empty"))
+        provider_detail = str(result.get("provider_detail") or "")
+        if not provider_can_stream and result.get("models"):
+            provider_status = "discover_only"
+            provider_detail = (
+                provider_detail
+                or "Discover is available, but this provider did not expose a public FFmpeg-readable stream."
+            )
+        provider_statuses.append({
+            "source_type": provider.source_type,
+            "display_name": provider.display_name,
+            "status": provider_status,
+            "detail": provider_detail,
+            "count": len(items),
+            "total": int(result.get("total") or 0),
+        })
 
     plugin_totals = []
     plugin_total_pages = []
-    for r in (cb_result, cam4_result):
+    for r in results:
         if r is None:
             continue
         plugin_totals.append(int(r.get("total") or 0))
         plugin_total_pages.append(int(r.get("total_pages") or 1))
 
-    # Interleave round-robin pour mélanger les deux sources.
-    combined: List[Dict[str, Any]] = []
-    iters = [iter(cam4_items), iter(cb_items)]
-    while len(combined) < limit and any(iters):
-        next_iters = []
-        for it in iters:
-            try:
-                combined.append(next(it))
-                if len(combined) >= limit:
-                    break
-                next_iters.append(it)
-            except StopIteration:
-                continue
-        iters = next_iters
-
-    # Tri final. "newest" privilégie les comptes jeunes (proxy raisonnable
-    # pour "nouveau" sans timestamp côté source). "viewers" respecte l'ordre
-    # interleave qui vient des sources déjà triées par audience.
+    # Classement global: une room à 900 viewers doit passer devant une room à
+    # 50 viewers, quelle que soit la source. En vue agrégée, on prend la page 1
+    # de chaque provider avec assez de candidats pour trier puis paginer ici.
+    ranked_items = [item for group in grouped_items for item in group]
+    if not explicit_source and sort_mode == "viewers":
+        positive_items = [item for item in ranked_items if int(item.get("viewers") or 0) > 0]
+        if positive_items:
+            ranked_items = positive_items
     if sort_mode == "newest":
-        combined.sort(key=lambda m: (m.get("age") or 99))
+        ranked_items.sort(key=lambda m: (m.get("age") or 99))
+    else:
+        ranked_items.sort(key=lambda m: int(m.get("viewers") or 0), reverse=True)
+
+    if explicit_source:
+        combined = ranked_items[:limit]
+    else:
+        start = (page - 1) * limit
+        combined = ranked_items[start:start + limit]
 
     total_combined = sum(plugin_totals)
-    total_pages = max(plugin_total_pages) if plugin_total_pages else 1
+    if explicit_source:
+        total_pages = max(plugin_total_pages) if plugin_total_pages else 1
+    else:
+        total_combined = len(ranked_items)
+        total_pages = max(1, (total_combined + limit - 1) // limit)
+    total_combined, total_pages = _stable_pagination_totals(
+        _pagination_cache_key(source, gender, search_lower, included_tags, sort_mode, limit),
+        page,
+        total_combined,
+        total_pages,
+    )
 
     if _db:
         try:
             tracked_models = await _db.get_all_models()
-            tracked_set = {m["username"] for m in tracked_models}
+            tracked_set = {
+                (m["username"], m.get("source_type") or "chaturbate")
+                for m in tracked_models
+            }
             followed_models = await _db.get_all_followed()
-            followed_set = {m["username"] for m in followed_models}
+            followed_set = {
+                (m["username"], m.get("source_type") or "chaturbate")
+                for m in followed_models
+            }
             for model in combined:
-                model["isTracked"] = model["username"] in tracked_set
-                model["isFollowed"] = model["username"] in followed_set
+                key = (model["username"], model.get("source_type") or "chaturbate")
+                model["isTracked"] = key in tracked_set
+                model["isFollowed"] = key in followed_set
         except Exception:
             pass
 
@@ -187,4 +349,5 @@ async def discover_models(
         "page": page,
         "limit": limit,
         "total_pages": total_pages,
+        "provider_statuses": provider_statuses,
     }

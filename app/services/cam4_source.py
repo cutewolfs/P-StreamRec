@@ -24,6 +24,11 @@ _M3U8_RE = re.compile(r"https?://[^\s\"'<>]+\.m3u8[^\s\"'<>]*", re.IGNORECASE)
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9_]{2,32}$")
 _BROADCAST_MARKER_RE = re.compile(r'"BroadcastItem:\d+":')
 _TAG_MARKER_RE = re.compile(r'"BroadcastTag:([^"]+)":\{([^}]+)\}')
+_ATTR_RE = re.compile(
+    r"""([:\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?""",
+    re.IGNORECASE,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
 
 _DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -83,6 +88,145 @@ def _decode_unicode_slashes(text: str) -> str:
     return text.replace("\\u002F", "/").replace("\\u003D", "=")
 
 
+def _strip_html(value: str) -> str:
+    return re.sub(r"\s+", " ", _TAG_RE.sub(" ", value or "")).strip()
+
+
+def _parse_attrs(raw: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    for match in _ATTR_RE.finditer(raw or ""):
+        key = (match.group(1) or "").lower()
+        value = next((g for g in match.groups()[1:] if g is not None), "")
+        if key:
+            attrs[key] = value or ""
+    return attrs
+
+
+def _normalize_tags(values: List[Any]) -> List[str]:
+    seen = set()
+    tags: List[str] = []
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("label") or value.get("slug") or value.get("value")
+        tag = str(value or "").strip().strip("#").lower()
+        tag = re.sub(r"\s+", " ", tag)
+        if not tag or tag in seen or len(tag) > 48:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+        if len(tags) >= 12:
+            break
+    return tags
+
+
+def _tags_from_stream_info(info: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    for key in ("tags", "tagLabels", "tag_labels", "categories", "interests"):
+        raw = info.get(key) or []
+        if isinstance(raw, str):
+            values.extend(part.strip() for part in raw.split(",") if part.strip())
+        elif isinstance(raw, list):
+            values.extend(raw)
+    return _normalize_tags(values)
+
+
+def _first_image_url(fragment: str) -> Optional[str]:
+    img_match = re.search(r"<img\b([^>]*)>", fragment or "", re.IGNORECASE | re.DOTALL)
+    if not img_match:
+        return None
+    attrs = _parse_attrs(img_match.group(1))
+    for key in ("data-src", "data-original", "data-thumb", "src"):
+        value = (attrs.get(key) or "").strip()
+        if value and not value.startswith("data:image"):
+            return _decode_unicode_slashes(value)
+    return None
+
+
+def _parse_card_viewers(fragment: str) -> int:
+    for pattern in (
+        r"""data-count\s*=\s*["']?(\d[\d,.\s]*(?:[kKmM])?)["']?[^>]{0,180}(?:Viewers?|Watching|Users?|Connection)""",
+        r"""(?:Viewers?|Watching|Users?|Connection)[^<>"']{0,120}>\s*(\d[\d,.\s]*(?:[kKmM])?)\s*<""",
+        r"""(\d[\d,.\s]*(?:[kKmM])?)\s*(?:viewers?|watching|users?)""",
+    ):
+        match = re.search(pattern, fragment or "", re.IGNORECASE | re.DOTALL)
+        if match:
+            raw = match.group(1).strip().lower().replace(",", ".").replace(" ", "")
+            suffix = raw[-1:] if raw[-1:] in {"k", "m"} else ""
+            number = raw[:-1] if suffix else raw
+            try:
+                parsed = float(number) if suffix else int(re.sub(r"[^\d]", "", number) or 0)
+            except ValueError:
+                return 0
+            if suffix == "k":
+                return int(parsed * 1000)
+            if suffix == "m":
+                return int(parsed * 1000000)
+            return int(parsed)
+    return 0
+
+
+def _parse_rendered_cards(html: str) -> List[Dict[str, Any]]:
+    cards: List[Dict[str, Any]] = []
+    pattern = re.compile(
+        r"""<div\b(?P<attrs>[^>]*(?:data-position|data-profile)[^>]*)>(?P<body>.*?)(?=<div\b[^>]*(?:data-position|data-profile)|</body>|\Z)""",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(html or ""):
+        attrs = _parse_attrs(match.group("attrs"))
+        body = match.group("body") or ""
+        username = (attrs.get("data-profile") or attrs.get("data-username") or "").strip()
+        if not username:
+            link_match = re.search(r"""href\s*=\s*["']/([A-Za-z0-9_]{2,32})(?:["'/?#])""", body, re.IGNORECASE)
+            username = link_match.group(1) if link_match else ""
+        if not username:
+            continue
+
+        tag_values: List[str] = []
+        for tag_match in re.finditer(r"""href\s*=\s*["'][^"']*/tags/([^"'?#]+)""", body, re.IGNORECASE):
+            path = tag_match.group(1).strip("/")
+            segment = next((part for part in reversed(path.split("/")) if part), "")
+            if segment:
+                tag_values.append(segment.replace("-", " "))
+
+        cards.append(
+            {
+                "username": username,
+                "display_name": username,
+                "thumbnail": _first_image_url(body),
+                "viewers": _parse_card_viewers(match.group(0)),
+                "subject": None,
+                "age": None,
+                "gender": attrs.get("data-gender") or attrs.get("data-broadcast-type") or "",
+                "is_online": True,
+                "tags": _normalize_tags(
+                    tag_values
+                    + [attrs.get("data-gender"), attrs.get("data-broadcast-type"), "public"]
+                ),
+                "source_type": "cam4",
+                "room_status": "public",
+            }
+        )
+    return cards
+
+
+def _merge_broadcast_metadata(items: List[Dict[str, Any]], extra_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_username = {str(item.get("username") or "").lower(): item for item in items if item.get("username")}
+    for extra in extra_items:
+        key = str(extra.get("username") or "").lower()
+        if not key:
+            continue
+        existing = by_username.get(key)
+        if not existing:
+            by_username[key] = extra
+            items.append(extra)
+            continue
+        if not existing.get("thumbnail") and extra.get("thumbnail"):
+            existing["thumbnail"] = extra["thumbnail"]
+        existing["viewers"] = max(int(existing.get("viewers") or 0), int(extra.get("viewers") or 0))
+        existing["tags"] = _normalize_tags(list(existing.get("tags") or []) + list(extra.get("tags") or []))
+    return items
+
+
 def _parse_broadcasts(html: str) -> List[Dict[str, Any]]:
     tag_names: Dict[str, str] = {}
     for m in _TAG_MARKER_RE.finditer(html):
@@ -126,7 +270,7 @@ def _parse_broadcasts(html: str) -> List[Dict[str, Any]]:
             room_status = show_type.lower().replace("_show", "")
 
         tag_slugs = re.findall(r'"__ref":"BroadcastTag:([^"]+)"', obj_text)
-        tag_labels = [tag_names.get(s, s) for s in tag_slugs]
+        tag_labels = _normalize_tags([tag_names.get(s, s) for s in tag_slugs] + [broadcast_type, "public"])
 
         items.append(
             {
@@ -143,7 +287,7 @@ def _parse_broadcasts(html: str) -> List[Dict[str, Any]]:
                 "room_status": room_status,
             }
         )
-    return items
+    return _merge_broadcast_metadata(items, _parse_rendered_cards(html))
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +408,8 @@ async def check_status(username: str) -> Dict[str, Any]:
         "viewers": viewers,
         "hls_source": hls,
         "room_status": info.get("showType") or info.get("status") or None,
+        "tags": _tags_from_stream_info(info),
+        "thumbnail": info.get("previewImageURL") or info.get("profileImageURL"),
     }
 
 

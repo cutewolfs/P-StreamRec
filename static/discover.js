@@ -5,7 +5,7 @@
 // Render a small platform badge overlaid on the thumbnail.
 function renderPlatformBadge(sourceType) {
   var t = (sourceType || '').toLowerCase();
-  var label = t.charAt(0).toUpperCase() + t.slice(1);
+  var label = providerLabel(t);
   var cls = 'platform-badge platform-' + (t || 'unknown');
   return '<span class="' + cls + '" title="' + label + '">' + label + '</span>';
 }
@@ -13,55 +13,126 @@ function renderPlatformBadge(sourceType) {
 // State
 let currentPage = 1;
 let totalPages = 1;
+let currentSource = '';
 let currentGender = '';
 let currentSearch = '';
 let activeTags = [];
 let searchTimeout = null;
+let discoverProviders = [];
+let providerCapsBySource = {};
+let discoverRequestSeq = 0;
+let isDiscoverLoading = false;
+let paginationQueryKey = '';
+let lockedTotalPages = null;
+const DISCOVER_PAGE_LIMIT = 24;
 // Set des usernames déjà suivis (toutes plateformes). Rempli au chargement
 // par loadFollowedSet(), consulté par renderGrid pour colorer le cœur, et
 // mis à jour par toggleFollowOnCard après chaque action.
 let followedSet = new Set();
+
+function sourceKey(username, sourceType) {
+  return (sourceType || 'chaturbate') + ':' + (username || '');
+}
+
+function providerLabel(sourceType) {
+  var meta = discoverProviders.find(function(p) { return p.sourceType === sourceType; });
+  if (meta && meta.displayName) return meta.displayName;
+  var t = (sourceType || '').toLowerCase();
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
 
 async function loadFollowedSet() {
   try {
     var res = await fetch('/api/following');
     if (!res.ok) return;
     var data = await res.json();
-    followedSet = new Set((data.models || []).map(function(m) { return m.username; }));
+    followedSet = new Set((data.models || []).map(function(m) {
+      return sourceKey(m.username, m.source_type || m.platform || 'chaturbate');
+    }));
   } catch (e) {
     // Silencieux: cœurs s'affichent vides par défaut
+  }
+}
+
+async function loadDiscoverProviders() {
+  var select = document.getElementById('sourceFilter');
+  try {
+    var res = await fetch('/api/providers');
+    if (!res.ok) return;
+    var data = await res.json();
+    discoverProviders = (data.providers || []).filter(function(provider) {
+      return provider.capabilities && provider.capabilities.can_discover;
+    });
+    providerCapsBySource = {};
+    discoverProviders.forEach(function(provider) {
+      providerCapsBySource[provider.sourceType] = provider.capabilities || {};
+    });
+    if (!select) return;
+    var current = select.value || currentSource;
+    select.innerHTML = '<option value="">All sources</option>' + discoverProviders.map(function(provider) {
+      return '<option value="' + escapeHtml(provider.sourceType) + '">' + escapeHtml(provider.displayName || provider.sourceType) + '</option>';
+    }).join('');
+    select.value = current;
+  } catch (e) {
+    // Discover reste utilisable avec les defaults serveur.
   }
 }
 
 // ============================================
 // Fetch discover data
 // ============================================
-async function fetchDiscover() {
-  var grid = document.getElementById('discoverGrid');
-  grid.innerHTML = '<div class="empty-message"><div class="icon">&#9203;</div><p>Loading models...</p></div>';
-
-  var params = new URLSearchParams({
-    page: currentPage,
-    limit: 24
+function discoverQueryKey() {
+  return JSON.stringify({
+    source: currentSource || '',
+    gender: currentGender || '',
+    search: currentSearch || '',
+    tags: activeTags.slice().sort(),
+    limit: DISCOVER_PAGE_LIMIT
   });
+}
+
+function buildDiscoverParams(page) {
+  var params = new URLSearchParams({
+    page: page || currentPage,
+    limit: DISCOVER_PAGE_LIMIT
+  });
+  if (currentSource) params.set('source', currentSource);
   if (currentGender) params.set('gender', currentGender);
   if (currentSearch) params.set('search', currentSearch);
   if (activeTags.length > 0) params.set('tags', activeTags.join(','));
+  return params;
+}
+
+async function fetchDiscover() {
+  var requestSeq = ++discoverRequestSeq;
+  var queryKey = discoverQueryKey();
+  setPaginationLoading(true);
+  var grid = document.getElementById('discoverGrid');
+  grid.innerHTML = '<div class="empty-message"><div class="icon">&#9203;</div><p>Loading models...</p></div>';
+
+  var params = buildDiscoverParams(currentPage);
 
   try {
     var res = await fetch('/api/discover?' + params.toString());
+    if (requestSeq !== discoverRequestSeq) return;
     if (res.ok) {
       var data = await res.json();
-      renderGrid(data.models || []);
-      renderPagination(data.page || 1, data.total_pages || 1);
+      if (requestSeq !== discoverRequestSeq) return;
+      renderGrid(data.models || [], data.provider_statuses || []);
+      renderPagination(data.page || currentPage, data.total_pages || 1, queryKey);
     } else {
       grid.innerHTML = '<div class="empty-message"><div class="icon">&#9888;</div><p>Failed to load models.</p></div>';
       document.getElementById('pagination').style.display = 'none';
     }
   } catch (e) {
+    if (requestSeq !== discoverRequestSeq) return;
     console.error('Error loading discover:', e);
     grid.innerHTML = '<div class="empty-message"><div class="icon">&#9888;</div><p>Connection error.</p></div>';
     document.getElementById('pagination').style.display = 'none';
+  } finally {
+    if (requestSeq === discoverRequestSeq) {
+      setPaginationLoading(false);
+    }
   }
 }
 
@@ -81,11 +152,41 @@ function getGridColumnCount(grid) {
 // ============================================
 // Render model grid
 // ============================================
-function renderGrid(models) {
+function renderEmpty(providerStatuses) {
+  var grid = document.getElementById('discoverGrid');
+  var status = null;
+  if (currentSource) {
+    status = (providerStatuses || []).find(function(item) {
+      return item.source_type === currentSource;
+    });
+  }
+  if (!status && providerStatuses && providerStatuses.length === 1) {
+    status = providerStatuses[0];
+  }
+
+  var title = 'No models found';
+  var detail = '';
+  var action = '';
+  if (status && status.status === 'auth_required') {
+    title = (status.display_name || providerLabel(status.source_type)) + ' needs a connection';
+    detail = status.detail || 'Connect this provider before loading live models.';
+    action = '<button class="btn-primary empty-action" onclick="window.location.href=\'/settings\'">Open Settings</button>';
+  } else if (status && status.detail) {
+    title = (status.display_name || providerLabel(status.source_type)) + ' is not available';
+    detail = status.detail;
+  }
+
+  grid.innerHTML = '<div class="empty-message"><div class="icon">&#128269;</div><p>' + escapeHtml(title) + '</p>' +
+    (detail ? '<span class="empty-detail">' + escapeHtml(detail) + '</span>' : '') +
+    action +
+    '</div>';
+}
+
+function renderGrid(models, providerStatuses) {
   var grid = document.getElementById('discoverGrid');
 
   if (!models.length) {
-    grid.innerHTML = '<div class="empty-message"><div class="icon">&#128269;</div><p>No models found</p></div>';
+    renderEmpty(providerStatuses || []);
     return;
   }
 
@@ -97,7 +198,7 @@ function renderGrid(models) {
 
   grid.innerHTML = models.map(function(model) {
     var thumbUrl = model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + model.username + '.jpg');
-    var viewerText = model.viewers ? ('<span class="discover-viewers">&#128065; ' + Number(model.viewers).toLocaleString() + '</span>') : '';
+    var viewerText = '<span class="discover-viewers">&#128065; ' + Number(model.viewers || 0).toLocaleString() + '</span>';
     var ageText = model.age ? ('<span class="discover-age">' + model.age + '</span>') : '';
     var tagsHtml = '';
     if (model.tags && model.tags.length > 0) {
@@ -108,18 +209,26 @@ function renderGrid(models) {
     }
 
     var cardSource = (model.source_type || model.platform || 'chaturbate');
-    var isFollowed = followedSet.has(model.username);
-    var heartBtn = '<button class="discover-follow-heart ' + (isFollowed ? 'is-followed' : '') + '" ' +
+    var streamAvailable = model.stream_available !== false;
+    var canFollow = model.can_follow !== false && (!providerCapsBySource[cardSource] || providerCapsBySource[cardSource].can_follow !== false);
+    var isFollowed = followedSet.has(sourceKey(model.username, cardSource));
+    var heartBtn = canFollow ? '<button class="discover-follow-heart ' + (isFollowed ? 'is-followed' : '') + '" ' +
       'title="' + (isFollowed ? 'Unfollow' : 'Follow') + ' ' + escapeHtml(model.username) + '" ' +
-      'onclick="event.stopPropagation(); toggleFollowOnCard(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\', this)">&#9829;</button>';
+      'onclick="event.stopPropagation(); toggleFollowOnCard(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\', this)">&#9829;</button>' : '';
+    var streamBadge = streamAvailable ? '' : '<span class="discover-stream-status">Unavailable</span>';
+    var cardClass = 'discover-card' + (streamAvailable ? '' : ' is-discover-only');
+    var cardAction = streamAvailable
+      ? ' onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')"'
+      : ' title="Live playback is not available for this provider yet"';
 
-    return '<div class="discover-card" data-username="' + escapeHtml(model.username) + '" onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')">' +
+    return '<div class="' + cardClass + '" data-username="' + escapeHtml(model.username) + '"' + cardAction + '>' +
       '<div class="discover-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
           'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(model.username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
         viewerText +
         ageText +
         renderPlatformBadge(model.source_type || model.platform || 'chaturbate') +
+        streamBadge +
         heartBtn +
       '</div>' +
       '<div class="discover-card-info">' +
@@ -143,8 +252,11 @@ function openWatch(username, sourceType) {
 // ============================================
 async function toggleFollowOnCard(username, sourceType, btn) {
   if (!username || btn.classList.contains('busy')) return;
-  var wasFollowing = followedSet.has(username);
-  var base = (sourceType === 'cam4') ? '/api/cam4' : '/api/chaturbate';
+  var key = sourceKey(username, sourceType);
+  var wasFollowing = followedSet.has(key);
+  var base = sourceType === 'cam4'
+    ? '/api/cam4'
+    : (sourceType === 'chaturbate' ? '/api/chaturbate' : '/api/providers/' + encodeURIComponent(sourceType || 'chaturbate'));
   var endpoint = base + (wasFollowing ? '/unfollow/' : '/follow/') + encodeURIComponent(username);
 
   btn.classList.add('busy');
@@ -152,11 +264,11 @@ async function toggleFollowOnCard(username, sourceType, btn) {
     var res = await fetch(endpoint, { method: 'POST' });
     if (res.ok) {
       if (wasFollowing) {
-        followedSet.delete(username);
+        followedSet.delete(key);
         btn.classList.remove('is-followed');
         btn.title = 'Follow ' + username;
       } else {
-        followedSet.add(username);
+        followedSet.add(key);
         btn.classList.add('is-followed');
         btn.title = 'Unfollow ' + username;
       }
@@ -245,7 +357,29 @@ function escapeHtml(text) {
 // ============================================
 // Pagination
 // ============================================
-function renderPagination(page, pages) {
+function setPaginationLoading(isLoading) {
+  isDiscoverLoading = isLoading;
+  var prevBtn = document.getElementById('prevBtn');
+  var nextBtn = document.getElementById('nextBtn');
+  if (!prevBtn || !nextBtn) return;
+  prevBtn.disabled = isLoading || currentPage <= 1;
+  nextBtn.disabled = isLoading || currentPage >= totalPages;
+}
+
+function renderPagination(page, pages, queryKey) {
+  page = Math.max(1, Number(page) || 1);
+  pages = Math.max(1, Number(pages) || 1);
+  if (queryKey && paginationQueryKey !== queryKey) {
+    paginationQueryKey = queryKey;
+    lockedTotalPages = null;
+  }
+  if (page <= 1 || lockedTotalPages === null) {
+    lockedTotalPages = pages;
+  } else {
+    pages = lockedTotalPages;
+  }
+  pages = Math.max(page, pages);
+
   currentPage = page;
   totalPages = pages;
 
@@ -266,6 +400,7 @@ function renderPagination(page, pages) {
 }
 
 function changePage(delta) {
+  if (isDiscoverLoading) return;
   var newPage = currentPage + delta;
   if (newPage >= 1 && newPage <= totalPages) {
     currentPage = newPage;
@@ -283,6 +418,12 @@ function setGender(gender, btn) {
   var pills = document.querySelectorAll('.filter-pill');
   pills.forEach(function(pill) { pill.classList.remove('active'); });
   if (btn) btn.classList.add('active');
+  fetchDiscover();
+}
+
+function setSource(sourceType) {
+  currentSource = sourceType || '';
+  currentPage = 1;
   fetchDiscover();
 }
 
@@ -322,10 +463,7 @@ async function refreshLiveThumbnails() {
   var grid = document.getElementById('discoverGrid');
   if (!grid || !grid.querySelector('.discover-card')) return;
 
-  var params = new URLSearchParams({ page: currentPage, limit: 24 });
-  if (currentGender) params.set('gender', currentGender);
-  if (currentSearch) params.set('search', currentSearch);
-  if (activeTags.length > 0) params.set('tags', activeTags.join(','));
+  var params = buildDiscoverParams(currentPage);
 
   try {
     var res = await fetch('/api/discover?' + params.toString());
@@ -375,9 +513,16 @@ window.addEventListener('DOMContentLoaded', function() {
     tagInput.addEventListener('keydown', handleTagInput);
   }
 
+  var sourceFilter = document.getElementById('sourceFilter');
+  if (sourceFilter) {
+    sourceFilter.addEventListener('change', function() {
+      setSource(sourceFilter.value);
+    });
+  }
+
   // Charger la liste des follows avant le premier render pour que les cœurs
   // soient coloriés correctement dès l'affichage.
-  loadFollowedSet().finally(fetchDiscover);
+  Promise.all([loadFollowedSet(), loadDiscoverProviders()]).finally(fetchDiscover);
 
   // Refresh live thumbnails toutes les 30s
   setInterval(refreshLiveThumbnails, 30000);

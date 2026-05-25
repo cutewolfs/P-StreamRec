@@ -17,10 +17,12 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install dependencies
+# Install dependencies and the Chromium runtime used by protected providers.
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && \
-    apt-get purge -y --auto-remove gcc python3-dev
+    python -m playwright install --with-deps chromium && \
+    apt-get purge -y --auto-remove gcc python3-dev && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy source
 COPY app ./app

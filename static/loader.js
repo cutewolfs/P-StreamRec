@@ -1,5 +1,44 @@
 // Component loader for shared header and footer
 (function() {
+  function setVersionText(version) {
+    const label = `v${version || 'unknown'}`;
+    const versionTextEl = document.getElementById('appVersionText');
+    const versionEl = document.getElementById('appVersion');
+
+    if (versionTextEl) {
+      versionTextEl.textContent = label;
+    } else if (versionEl) {
+      versionEl.textContent = label;
+    }
+
+    if (versionEl && !versionEl.classList.contains('has-update')) {
+      versionEl.setAttribute('aria-label', `Current version ${label}`);
+    }
+  }
+
+  function showUpdateBadge(updateInfo) {
+    const versionEl = document.getElementById('appVersion');
+    const badge = document.getElementById('appUpdateBadge');
+    const versionTextEl = document.getElementById('appVersionText');
+
+    if (!versionEl || !badge) return;
+
+    const currentVersion = versionTextEl ? versionTextEl.textContent : versionEl.textContent;
+    const latestVersion = updateInfo && (updateInfo.latest_version || updateInfo.latestVersion);
+    const behindBy = updateInfo && Number(updateInfo.behindBy || 0);
+    const message = latestVersion
+      ? `Update available: v${latestVersion}`
+      : behindBy > 0
+        ? `${behindBy} update${behindBy === 1 ? '' : 's'} available`
+        : 'Update available';
+
+    badge.hidden = false;
+    badge.title = message;
+    versionEl.classList.add('has-update');
+    versionEl.title = message;
+    versionEl.setAttribute('aria-label', `${currentVersion}. ${message}`);
+  }
+
   // Load header
   fetch('/static/header.html')
     .then(res => res.text())
@@ -23,10 +62,24 @@
           try {
             const res = await fetch('/api/version');
             const data = await res.json();
-            const versionEl = document.getElementById('appVersion');
-            if (versionEl) versionEl.textContent = `v${data.version}`;
+            setVersionText(data.version);
           } catch (e) {
             console.error('Error loading version:', e);
+          }
+        })();
+
+        // Check release-based app updates
+        (async function checkAppUpdateStatus() {
+          try {
+            const res = await fetch('/api/system/check-update', { cache: 'no-store' });
+            if (!res.ok) return;
+
+            const data = await res.json();
+            if (data.update_available) {
+              showUpdateBadge(data);
+            }
+          } catch (e) {
+            console.error('Error checking app updates:', e);
           }
         })();
 
@@ -45,6 +98,7 @@
                   document.getElementById('gitStatusText').textContent = 'Update!';
                   btn.style.borderColor = 'var(--accent)';
                   btn.style.color = 'var(--accent)';
+                  showUpdateBadge(data);
                 }
               }
             }

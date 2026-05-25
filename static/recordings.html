@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/styles.css">
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script src="/static/loader.js"></script>
-  <script defer src="/static/recordings.js?v=7"></script>
+  <script defer src="/static/recordings.js?v=8"></script>
   <style>
     /* --- Per-model edit panel --- */
     .model-edit-panel {
@@ -165,6 +165,11 @@
         <div class="stat-value" id="totalModels">-</div>
         <div class="stat-label">Models</div>
       </div>
+    </div>
+
+    <div class="media-import-toolbar" id="mediaImportToolbar" style="display: none;">
+      <button class="media-import-rescan-btn" id="mediaImportRescanBtn" type="button" onclick="rescanMediaImports()">Rescan library</button>
+      <span class="media-import-status" id="mediaImportStatus"></span>
     </div>
 
     <!-- Model Cards Grid (default view) -->

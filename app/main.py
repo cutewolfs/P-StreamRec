@@ -1,11 +1,12 @@
 import re
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urljoin, urlparse
 import os
 import asyncio
 import aiohttp
 import json
+import queue
 import subprocess
 import sys
 import time
@@ -17,9 +18,11 @@ import socket as raw_socket
 
 from fastapi import FastAPI, HTTPException, Request, Cookie, Response
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from .browser_recorder import BrowserCaptureManager
 from .ffmpeg_runner import FFmpegManager
 from .logger import logger
 from .core.database import Database
@@ -27,11 +30,28 @@ from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .tasks.monitor import monitor_models_task
 from .tasks.convert import auto_convert_recordings_task
+from .tasks.media_imports import (
+    MediaImportManager,
+    media_imports_task,
+    remove_import_record,
+    SUPPORTED_VIDEO_EXTENSIONS,
+)
 from .services.flaresolverr import FlareSolverrClient
 from .services.chaturbate_auth import ChaturbateAuthService
 from .services.chaturbate_api import ChaturbateAPI
 from .services.cam4_auth import CAM4AuthService
 from .services import cam4_source
+from .providers import (
+    ProviderAuthError,
+    ProviderError,
+    ProviderInteractionRequired,
+    ProviderOfflineError,
+    ProviderPrivateError,
+    ProviderRegistry,
+    ProviderStatus,
+    ResolvedStream,
+    create_provider_registry,
+)
 from .api import auth as auth_router
 from .api import cam4 as cam4_router
 from .api import discover as discover_router
@@ -50,6 +70,7 @@ CHATURBATE_USERNAME = os.getenv("CHATURBATE_USERNAME", "")
 CHATURBATE_PASSWORD = os.getenv("CHATURBATE_PASSWORD", "")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191")
 RECORDING_RANGE_CHUNK_SIZE = int(os.getenv("RECORDING_RANGE_CHUNK_SIZE", str(8 * 1024 * 1024)))
+MEDIA_IMPORTS_ENABLED = os.getenv("PSTREAMREC_MEDIA_IMPORTS", "false").lower() in {"1", "true", "yes"}
 
 # Docker constants
 DOCKER_SOCKET = '/var/run/docker.sock'
@@ -106,8 +127,38 @@ def _get_container_id():
                                 except ValueError:
                                     continue
         except FileNotFoundError:
-            continue
+                continue
     return None
+
+
+def _normalize_version(version: Optional[str]) -> str:
+    return (version or "").strip().lstrip("v").strip()
+
+
+def _version_parts(version: str) -> Optional[Tuple[int, ...]]:
+    match = re.search(r"\d+(?:\.\d+)*", _normalize_version(version))
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(0).split("."))
+
+
+def _is_update_available(current_version: str, latest_version: str) -> bool:
+    current = _normalize_version(current_version)
+    latest = _normalize_version(latest_version)
+    if not current or current.lower() in {"dev", "local"} or not latest:
+        return False
+    if current == latest:
+        return False
+
+    current_parts = _version_parts(current)
+    latest_parts = _version_parts(latest)
+    if current_parts and latest_parts:
+        width = max(len(current_parts), len(latest_parts))
+        current_parts = current_parts + (0,) * (width - len(current_parts))
+        latest_parts = latest_parts + (0,) * (width - len(latest_parts))
+        return latest_parts > current_parts
+
+    return current != latest
 
 
 # Ensure dirs
@@ -117,6 +168,7 @@ logger.info("Répertoire de sortie", path=str(OUTPUT_DIR))
 logger.info("FFmpeg path", path=FFMPEG_PATH)
 logger.info("HLS Configuration", hls_time=HLS_TIME, hls_list_size=HLS_LIST_SIZE)
 logger.info("Chaturbate Resolver", enabled=CB_RESOLVER_ENABLED)
+logger.info("Local media imports", enabled=MEDIA_IMPORTS_ENABLED)
 if PASSWORD:
     logger.info("Authentification activée", protected=True)
 else:
@@ -209,7 +261,8 @@ app.include_router(following_router.router)
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path.startswith("/static/"):
+    no_cache_paths = {"/", "/discover", "/following", "/recordings", "/settings", "/wiki"}
+    if request.url.path.startswith("/static/") or request.url.path in no_cache_paths:
         response.headers["Cache-Control"] = "no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
@@ -218,7 +271,16 @@ async def _no_cache_static(request: Request, call_next):
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 def _recording_media_type(filename: str) -> str:
-    return "video/mp4" if filename.endswith(".mp4") else "video/mp2t"
+    ext = Path(filename).suffix.lower()
+    if ext in {".mp4", ".m4v", ".mov"}:
+        return "video/mp4"
+    if ext == ".webm":
+        return "video/webm"
+    if ext == ".mkv":
+        return "video/x-matroska"
+    if ext == ".avi":
+        return "video/x-msvideo"
+    return "video/mp2t"
 
 
 def _recording_headers(filename: str, file_size: int) -> dict:
@@ -264,49 +326,19 @@ def _parse_byte_range(range_header: str, file_size: int) -> Optional[tuple[int, 
     return start, end
 
 
-# Route protégée pour les enregistrements
-@app.api_route("/streams/records/{username}/{filename}", methods=["GET", "HEAD"])
-async def serve_recording_protected(request: Request, username: str, filename: str):
-    """Sert un enregistrement (TS ou MP4) avec support HTTP Range pour les gros fichiers"""
+async def _serve_video_file_with_ranges(request: Request, file_path: Path, filename: str):
+    """Serve a local video path with browser-friendly Range/HEAD support."""
     from fastapi.responses import StreamingResponse
 
-    logger.api_request(request.method, f"/streams/records/{username}/{filename}")
-
-    # Sécurité: vérifier le nom de fichier
-    if ".." in username or "/" in username or ".." in filename or "/" in filename or not (filename.endswith(".ts") or filename.endswith(".mp4")):
-        logger.warning("Tentative d'accès fichier invalide", username=username, filename=filename)
-        raise HTTPException(status_code=400, detail="Nom de fichier invalide")
-
-    # Pour les fichiers TS, vérifier que ce n'est pas l'enregistrement en cours
-    if filename.endswith(".ts"):
-        today = datetime.now().strftime("%Y-%m-%d")
-        recording_date = filename.replace(".ts", "")
-
-        # Vérifier si une session est active pour cet utilisateur
-        active_sessions = manager.list_status()
-        is_recording = any(s.get('person') == username and s.get('running') for s in active_sessions)
-
-        if is_recording and recording_date == today:
-            logger.warning("Accès bloqué à enregistrement en cours", username=username, filename=filename, date=today)
-            raise HTTPException(
-                status_code=403,
-                detail="Cet enregistrement est en cours. Regardez le live à la place."
-            )
-
-    # Servir le fichier
-    file_path = OUTPUT_DIR / "records" / username / filename
-
-    if not file_path.exists():
-        logger.error("Fichier introuvable", username=username, filename=filename, path=str(file_path))
-        raise HTTPException(status_code=404, detail="Enregistrement introuvable")
+    if not file_path.exists() or not file_path.is_file():
+        logger.error("Fichier vidéo introuvable", path=str(file_path))
+        raise HTTPException(status_code=404, detail="Média introuvable")
 
     file_size = file_path.stat().st_size
     logger.file_operation("Lecture", str(file_path), size=file_size)
 
     media_type = _recording_media_type(filename)
     base_headers = _recording_headers(filename, file_size)
-
-    # HTTP Range request support pour la lecture vidéo de gros fichiers
     range_header = request.headers.get("range")
 
     if range_header:
@@ -328,7 +360,7 @@ async def serve_recording_protected(request: Request, username: str, filename: s
                 f.seek(start)
                 remaining = chunk_size
                 while remaining > 0:
-                    read_size = min(remaining, 64 * 1024)  # 64KB chunks
+                    read_size = min(remaining, 64 * 1024)
                     data = f.read(read_size)
                     if not data:
                         break
@@ -356,15 +388,113 @@ async def serve_recording_protected(request: Request, username: str, filename: s
 
     return FileResponse(str(file_path), media_type=media_type, headers=base_headers)
 
+
+# Route protégée pour les enregistrements
+@app.api_route("/streams/records/{username}/{filename}", methods=["GET", "HEAD"])
+async def serve_recording_protected(request: Request, username: str, filename: str):
+    """Sert un enregistrement (TS ou MP4) avec support HTTP Range pour les gros fichiers"""
+    logger.api_request(request.method, f"/streams/records/{username}/{filename}")
+
+    # Sécurité: vérifier le nom de fichier
+    if (
+        ".." in username
+        or "/" in username
+        or ".." in filename
+        or "/" in filename
+        or not filename.lower().endswith((".ts", ".mp4", ".webm"))
+    ):
+        logger.warning("Tentative d'accès fichier invalide", username=username, filename=filename)
+        raise HTTPException(status_code=400, detail="Nom de fichier invalide")
+
+    active_sessions = _all_recording_statuses()
+    for session in active_sessions:
+        if not (session.get("person") == username and session.get("running")):
+            continue
+        record_path = session.get("record_path") or ""
+        if record_path and Path(record_path).name == filename:
+            logger.warning("Accès bloqué à enregistrement en cours", username=username, filename=filename)
+            raise HTTPException(
+                status_code=403,
+                detail="Cet enregistrement est en cours. Regardez le live à la place.",
+            )
+
+    # Servir le fichier
+    file_path = OUTPUT_DIR / "records" / username / filename
+    return await _serve_video_file_with_ranges(request, file_path, filename)
+
+
+@app.api_route("/streams/media/{recording_id}", methods=["GET", "HEAD"])
+async def serve_imported_media(request: Request, recording_id: str, download: bool = False):
+    """Sert un média importé via son ID stable, sans exposer de chemin disque."""
+    if ".." in recording_id or "/" in recording_id:
+        raise HTTPException(status_code=400, detail="ID média invalide")
+
+    rec = await db.get_recording_by_id(recording_id)
+    if not rec or rec.get("media_kind") != "import":
+        raise HTTPException(status_code=404, detail="Média introuvable")
+
+    path_value = rec.get("file_path") if download else (rec.get("playable_path") or rec.get("file_path"))
+    if not path_value:
+        raise HTTPException(status_code=404, detail="Fichier média introuvable")
+
+    file_path = Path(path_value)
+    output_root = OUTPUT_DIR.resolve()
+    try:
+        resolved = file_path.resolve()
+        if not resolved.is_relative_to(output_root):
+            raise HTTPException(status_code=403, detail="Chemin média non autorisé")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Chemin média invalide")
+
+    return await _serve_video_file_with_ranges(request, file_path, file_path.name)
+
 # Mount pour les sessions HLS live uniquement
 app.mount("/streams/sessions", StaticFiles(directory=str(OUTPUT_DIR / "sessions")), name="streams_sessions")
 app.mount("/streams/thumbnails", StaticFiles(directory=str(OUTPUT_DIR / "thumbnails")), name="streams_thumbnails")
 
 manager = FFmpegManager(str(OUTPUT_DIR), ffmpeg_path=FFMPEG_PATH, hls_time=HLS_TIME, hls_list_size=HLS_LIST_SIZE)
+browser_capture_manager = BrowserCaptureManager(str(OUTPUT_DIR))
+
+
+@app.get("/streams/browser/{session_id}/{filename}")
+async def serve_browser_live_stream(session_id: str, filename: str):
+    session = browser_capture_manager.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session browser introuvable")
+    if filename not in {"live.webm", "live.mp4"} or filename != f"live.{getattr(session, 'file_extension', 'webm')}":
+        raise HTTPException(status_code=404, detail="Flux browser introuvable")
+    q = session.subscribe()
+
+    async def chunks():
+        try:
+            while session.is_running() or not q.empty():
+                try:
+                    chunk = await asyncio.to_thread(q.get, True, 2)
+                except queue.Empty:
+                    if not session.is_running():
+                        break
+                    continue
+                yield chunk
+        finally:
+            session.unsubscribe(q)
+            if not session.record:
+                browser_capture_manager.stop_live_if_idle(session_id)
+
+    return StreamingResponse(
+        chunks(),
+        media_type="video/mp4" if filename.endswith(".mp4") else "video/webm",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 # Database SQLite
 DB_FILE = OUTPUT_DIR / "streamrec.db"
 db = Database(DB_FILE)
+media_import_manager: Optional[MediaImportManager] = None
 
 # Chaturbate API (initialized at startup)
 chaturbate_api: Optional[ChaturbateAPI] = None
@@ -374,6 +504,10 @@ chaturbate_api: Optional[ChaturbateAPI] = None
 cam4_auth_service: Optional[CAM4AuthService] = None
 
 SOURCE_TYPES = {"chaturbate", "cam4"}
+provider_registry = create_provider_registry(db, output_dir=OUTPUT_DIR)
+SOURCE_TYPES = provider_registry.source_types()
+_HLS_PROXY_CACHE: dict[str, dict] = {}
+_HLS_PROXY_TTL_SECONDS = int(os.getenv("PSTREAMREC_HLS_PROXY_TTL_SECONDS", "900"))
 
 
 def _parse_auto_record_users_env(raw_value: Optional[str]) -> Tuple[list[str], int]:
@@ -456,6 +590,26 @@ def _normalize_source_type(source_type: Optional[str]) -> Optional[str]:
     return value
 
 
+def _available_source_types() -> set[str]:
+    types = provider_registry.source_types()
+    return types or set(SOURCE_TYPES)
+
+
+def _source_type_from_url(target: str) -> Optional[str]:
+    try:
+        hostname = (urlparse(target).hostname or "").lower().rstrip(".")
+    except Exception:
+        return None
+    if not hostname:
+        return None
+    for provider in provider_registry.all():
+        for domain in provider.domains:
+            clean = domain.lower().rstrip(".")
+            if hostname == clean or hostname.endswith(f".{clean}"):
+                return provider.source_type
+    return None
+
+
 async def _infer_source_type(
     username: Optional[str],
     model: Optional[dict] = None,
@@ -482,18 +636,380 @@ async def _infer_source_type(
     return model_source or "chaturbate"
 
 
-async def _resolve_m3u8(source_type: str, target: str, max_height: Optional[int]) -> Optional[str]:
-    """Résolution directe du M3U8 pour chaturbate/cam4. Lève une exception si
-    la source est inconnue ou si la résolution échoue."""
-    if source_type == "chaturbate":
-        from .resolvers.chaturbate import resolve_m3u8_async
-        try:
-            return await resolve_m3u8_async(target, max_height=max_height)
-        except Exception:
-            return None
-    if source_type == "cam4":
-        return await cam4_source.resolve(target, max_height=max_height)
+def _provider_for(source_type: str):
+    if provider_registry.has(source_type):
+        return provider_registry.get(source_type)
     raise ValueError(f"source_type inconnu: {source_type}")
+
+
+_BROWSER_CAPTURE_SOURCES = {"livejasmin", "xcams"}
+
+
+def _supports_browser_capture(source_type: str) -> bool:
+    return (source_type or "").strip().lower() in _BROWSER_CAPTURE_SOURCES
+
+
+def _provider_error_detail(source_type: str, target: str, exc: Exception) -> str:
+    if isinstance(exc, ProviderInteractionRequired):
+        return f"{source_type}/{target}: interaction manuelle requise (CAPTCHA/2FA/challenge)"
+    if isinstance(exc, ProviderPrivateError):
+        return f"{source_type}/{target}: flux prive ou payant non supporte"
+    if isinstance(exc, ProviderAuthError):
+        return f"{source_type}/{target}: connexion requise"
+    if isinstance(exc, ProviderOfflineError):
+        return f"{source_type}/{target}: modele hors ligne ou flux public introuvable"
+    return f"{source_type}/{target}: {exc}"
+
+
+async def _resolve_stream(source_type: str, target: str, max_height: Optional[int]) -> ResolvedStream:
+    provider = _provider_for(source_type)
+    if not getattr(provider.capabilities, "can_stream", True):
+        raise ProviderError(
+            f"{provider.display_name} est disponible en Discover uniquement: "
+            "aucun flux public lisible par FFmpeg n'a ete valide."
+        )
+    stream = await provider.resolve_stream(target, max_height=max_height)
+    if not stream.source_type:
+        stream.source_type = source_type
+    return stream
+
+
+async def _resolve_m3u8(source_type: str, target: str, max_height: Optional[int]) -> Optional[str]:
+    """Backward-compatible URL-only resolver."""
+    stream = await _resolve_stream(source_type, target, max_height)
+    return stream.url
+
+
+def _prune_hls_proxy_cache() -> None:
+    now = time.time()
+    expired = [
+        token for token, entry in _HLS_PROXY_CACHE.items()
+        if entry.get("expires_at", 0) <= now
+    ]
+    for token in expired:
+        _HLS_PROXY_CACHE.pop(token, None)
+
+
+def _hls_proxy_path_suffix(url: str) -> str:
+    parsed = urlparse(url or "")
+    path = parsed.path
+    if re.search(r"(?:^|[&;])flags=segment(?:$|[&;])", parsed.query or "", re.IGNORECASE):
+        return ".mp4"
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix == ".pts":
+        return ".ts"
+    if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix or ""):
+        return suffix
+    return ""
+
+
+def _register_hls_proxy_url(
+    url: str,
+    headers: Optional[dict[str, str]] = None,
+    suffix: Optional[str] = None,
+) -> str:
+    _prune_hls_proxy_cache()
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    _HLS_PROXY_CACHE[token] = {
+        "url": url,
+        "headers": dict(headers or {}),
+        "created_at": now,
+        "expires_at": now + max(60, _HLS_PROXY_TTL_SECONDS),
+    }
+    return f"/api/proxy/hls/{token}{suffix if suffix is not None else _hls_proxy_path_suffix(url)}"
+
+
+def _register_cached_hls_body(url: str, body: bytes, content_type: str = "") -> str:
+    _prune_hls_proxy_cache()
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    _HLS_PROXY_CACHE[token] = {
+        "url": url,
+        "headers": {},
+        "body": body,
+        "content_type": content_type,
+        "created_at": now,
+        "expires_at": now + max(60, _HLS_PROXY_TTL_SECONDS),
+    }
+    return f"/api/proxy/hls/{token}.mp4"
+
+
+def _hls_segment_header_variants(headers: Optional[dict[str, str]]) -> list[dict[str, str]]:
+    primary = dict(headers or {})
+    variants = [primary]
+    without_cookie = {
+        key: value
+        for key, value in primary.items()
+        if key.lower() != "cookie"
+    }
+    if without_cookie != primary:
+        variants.append(without_cookie)
+    return variants
+
+
+def _single_segment_hls_info(text: str) -> Optional[tuple[str, str, str, str]]:
+    target_duration = "1"
+    version = "3"
+    duration = "1.0"
+    pending_duration: Optional[str] = None
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#EXT-X-TARGETDURATION:"):
+            target_duration = stripped.split(":", 1)[1].strip() or target_duration
+        elif stripped.startswith("#EXT-X-VERSION:"):
+            version = stripped.split(":", 1)[1].strip() or version
+        elif stripped.startswith("#EXTINF:"):
+            pending_duration = stripped.split(":", 1)[1].split(",", 1)[0].strip() or duration
+        elif not stripped.startswith("#"):
+            return stripped, pending_duration or duration, target_duration, version
+    return None
+
+
+async def _rewrite_prefetched_single_segment_playlist(
+    text: str,
+    base_url: str,
+    headers: Optional[dict[str, str]],
+    entry: dict,
+    session,
+) -> str:
+    segment_info = _single_segment_hls_info(text)
+    if not segment_info:
+        return _rewrite_hls_playlist(text, base_url, headers=headers, live_sequence=0)
+
+    raw_uri, duration, target_duration, version = segment_info
+    raw_url = urljoin(base_url, raw_uri)
+    proxy_url = None
+    for attempt_headers in _hls_segment_header_variants(headers):
+        try:
+            async with session.get(
+                raw_url,
+                headers=attempt_headers,
+                allow_redirects=True,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                body = await resp.read()
+                if resp.status < 400 and body:
+                    proxy_url = _register_cached_hls_body(
+                        str(resp.url),
+                        body,
+                        resp.headers.get("Content-Type", "video/mp4"),
+                    )
+                    break
+        except Exception:
+            continue
+
+    if not proxy_url:
+        proxy_url = _register_hls_proxy_url(raw_url, headers=headers, suffix=".mp4")
+
+    seq = int(entry.get("next_media_sequence") or 0)
+    history = list(entry.get("live_segments") or [])
+    history.append({"seq": seq, "duration": duration, "url": proxy_url})
+    history = history[-6:]
+    entry["live_segments"] = history
+    entry["next_media_sequence"] = seq + 1
+
+    lines = [
+        "#EXTM3U",
+        f"#EXT-X-TARGETDURATION:{target_duration}",
+        f"#EXT-X-VERSION:{version}",
+        f"#EXT-X-MEDIA-SEQUENCE:{history[0]['seq']}",
+    ]
+    for segment in history:
+        lines.append(f"#EXTINF:{segment['duration']},")
+        lines.append(segment["url"])
+    return "\n".join(lines) + "\n"
+
+
+def _rewrite_hls_playlist(
+    text: str,
+    base_url: str,
+    headers: Optional[dict[str, str]] = None,
+    live_sequence: Optional[int] = None,
+) -> str:
+    def proxy_url(raw_uri: str) -> str:
+        return _register_hls_proxy_url(urljoin(base_url, raw_uri), headers=headers)
+
+    media_sequence_written = False
+    rewritten = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            rewritten.append(line)
+            continue
+        if stripped.startswith("#"):
+            if live_sequence is not None:
+                upper = stripped.upper()
+                if upper.startswith("#EXT-X-PLAYLIST-TYPE:") or upper == "#EXT-X-ENDLIST":
+                    continue
+                if upper.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                    rewritten.append(f"#EXT-X-MEDIA-SEQUENCE:{live_sequence}")
+                    media_sequence_written = True
+                    continue
+            if "URI=\"" in stripped:
+                line = re.sub(
+                    r'URI="([^"]+)"',
+                    lambda match: f'URI="{proxy_url(match.group(1))}"',
+                    line,
+                )
+            rewritten.append(line)
+            continue
+        rewritten.append(proxy_url(stripped))
+    if live_sequence is not None and not media_sequence_written:
+        insert_at = 1 if rewritten and rewritten[0].strip() == "#EXTM3U" else 0
+        rewritten.insert(insert_at, f"#EXT-X-MEDIA-SEQUENCE:{live_sequence}")
+    return "\n".join(rewritten) + ("\n" if text.endswith("\n") else "")
+
+
+def _proxied_stream_url(stream: ResolvedStream) -> str:
+    lower = (stream.url or "").lower()
+    if stream.source_type == "livejasmin":
+        return _register_hls_proxy_url(stream.url, headers=stream.headers, suffix=".m3u8")
+    if ".m3u8" in lower or ".mpd" in lower:
+        return _register_hls_proxy_url(stream.url, headers=stream.headers)
+    return stream.url
+
+
+def _local_proxy_url_for_ffmpeg(url: str) -> str:
+    if (url or "").startswith("/api/proxy/hls/"):
+        port = os.getenv("PORT", "8080")
+        return f"http://127.0.0.1:{port}{url}"
+    return url
+
+
+def _ffmpeg_stream_input(stream: ResolvedStream) -> tuple[str, Optional[dict[str, str]]]:
+    proxied_url = _proxied_stream_url(stream)
+    if proxied_url != stream.url:
+        return _local_proxy_url_for_ffmpeg(proxied_url), None
+    return stream.url, stream.headers
+
+
+def _start_browser_capture(
+    source_type: str,
+    target: str,
+    person: str,
+    display_name: Optional[str] = None,
+    record: bool = True,
+):
+    provider = _provider_for(source_type)
+    normalized_source = (source_type or "").strip().lower()
+    if target.startswith("http://") or target.startswith("https://"):
+        page_url = target
+    elif normalized_source == "livejasmin":
+        page_url = f"https://www.livejasmin.com/en/chat/{quote(target.strip(), safe='')}"
+    else:
+        page_url = provider.canonical_url(target)
+    capture_mode = "websocket_mp4" if normalized_source == "livejasmin" else "media_recorder"
+    return browser_capture_manager.start_session(
+        source_type=source_type,
+        page_url=page_url,
+        person=person,
+        display_name=display_name or target,
+        record=record,
+        capture_mode=capture_mode,
+    )
+
+
+def _all_recording_statuses() -> list[dict]:
+    return manager.list_status() + browser_capture_manager.list_status(recording_only=True)
+
+
+async def _index_browser_capture_recording(session) -> None:
+    if not getattr(session, "record", False):
+        return
+    record_path = Path(session.record_path)
+    if not record_path.exists() or not record_path.is_file():
+        return
+    try:
+        from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+
+        await _remux_browser_recording(record_path)
+        file_size = record_path.stat().st_size
+        duration_seconds = await get_video_duration(record_path, FFMPEG_PATH)
+        if not duration_seconds:
+            duration_seconds = max(0, int(time.time() - getattr(session, "start_time", time.time())))
+        if duration_seconds < MIN_RECORDING_SECONDS and file_size < MIN_RECORDING_BYTES:
+            return
+        thumbnail_path = await generate_recording_thumbnail(
+            record_path,
+            OUTPUT_DIR,
+            session.person,
+            FFMPEG_PATH,
+        )
+        await db.add_or_update_recording(
+            username=session.person,
+            filename=record_path.name,
+            file_path=str(record_path),
+            file_size=file_size,
+            recording_id=f"{session.person}_{record_path.stem}",
+            duration_seconds=duration_seconds,
+            thumbnail_path=thumbnail_path,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Indexation browser recording échouée",
+            session_id=session.id,
+            person=session.person,
+            error=str(exc),
+        )
+
+
+async def _remux_browser_recording(record_path: Path) -> bool:
+    if record_path.suffix.lower() not in {".webm", ".mp4"}:
+        return False
+    tmp_path = record_path.with_name(f"{record_path.stem}.remuxing{record_path.suffix}")
+    try:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG_PATH,
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(record_path),
+            "-c",
+            "copy",
+            str(tmp_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode != 0:
+            logger.warning(
+                "Remux browser recording échoué",
+                path=str(record_path),
+                error=(stderr or stdout or b"").decode("utf-8", "replace")[:500],
+            )
+            return False
+        if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            return False
+        os.replace(tmp_path, record_path)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Remux browser recording impossible",
+            path=str(record_path),
+            error=str(exc),
+        )
+        return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+async def _provider_status(source_type: str, username: str) -> ProviderStatus:
+    provider = _provider_for(source_type)
+    status = await provider.check_status(username)
+    if not status.source_type:
+        status.source_type = source_type
+    return status
+
 
 # Fichier de sauvegarde des modèles (côté serveur)
 MODELS_FILE = OUTPUT_DIR / "models.json"
@@ -521,12 +1037,17 @@ def save_models_to_file(models):
 
 class StartBody(BaseModel):
     target: str  # Either an m3u8 URL or a username (if resolver enabled)
-    source_type: Optional[str] = None  # "m3u8", "chaturbate", "cam4", or None/"auto"
+    source_type: Optional[str] = None  # "m3u8", provider source_type, or None/"auto"
     name: Optional[str] = None  # display name
     person: Optional[str] = None  # recording bucket (per person)
     auto_start: Optional[bool] = False  # True si démarrage automatique
     record_quality: Optional[str] = None  # best, 1080p, 720p, 480p, 360p
     recordQuality: Optional[str] = None  # camelCase frontend alias
+
+
+class ProviderLoginBody(BaseModel):
+    username: str
+    password: str
 
 
 class ModelVolumeBody(BaseModel):
@@ -855,6 +1376,245 @@ async def model_page():
     return FileResponse(str(STATIC_DIR / "model.html"))
 
 
+@app.api_route("/api/proxy/hls/{token_path:path}", methods=["GET", "HEAD"])
+async def hls_proxy(token_path: str, request: Request):
+    token = (token_path or "").split("/", 1)[0].split(".", 1)[0]
+    entry = _HLS_PROXY_CACHE.get(token)
+    if not entry or entry.get("expires_at", 0) <= time.time():
+        _HLS_PROXY_CACHE.pop(token, None)
+        raise HTTPException(status_code=404, detail="Flux proxy expire")
+
+    url = entry["url"]
+    headers = dict(entry.get("headers") or {})
+    entry["expires_at"] = time.time() + max(60, _HLS_PROXY_TTL_SECONDS)
+    if "body" in entry:
+        content_type = entry.get("content_type") or "application/octet-stream"
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type=content_type)
+        return Response(
+            content=entry.get("body") or b"",
+            media_type=content_type,
+            headers={"Cache-Control": "no-store"},
+        )
+    try:
+        async with aiohttp_client_session(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                if resp.status >= 400:
+                    raise HTTPException(status_code=resp.status, detail=f"Provider HTTP {resp.status}")
+                content_type = resp.headers.get("Content-Type", "")
+                if request.method == "HEAD":
+                    return Response(status_code=200, media_type=content_type or None)
+                body = await resp.read()
+                lower_url = str(resp.url).lower()
+                is_playlist = (
+                    ".m3u8" in lower_url
+                    or "mpegurl" in content_type.lower()
+                    or body.startswith(b"#EXTM3U")
+                )
+                if is_playlist:
+                    text = body.decode("utf-8", errors="replace")
+                    if "flags=segment" in text and "#EXT-X-ENDLIST" in text:
+                        rewritten = await _rewrite_prefetched_single_segment_playlist(
+                            text,
+                            str(resp.url),
+                            headers=headers,
+                            entry=entry,
+                            session=session,
+                        )
+                    else:
+                        rewritten = _rewrite_hls_playlist(text, str(resp.url), headers=headers)
+                    return Response(
+                        content=rewritten,
+                        media_type="application/vnd.apple.mpegurl",
+                        headers={"Cache-Control": "no-store"},
+                    )
+                return Response(
+                    content=body,
+                    media_type=content_type or "application/octet-stream",
+                    headers={"Cache-Control": "no-store"},
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Erreur proxy HLS", url=url, error=str(exc), exc_info=True)
+        raise HTTPException(status_code=502, detail="Erreur proxy HLS")
+
+
+async def _provider_login_state(source_type: str) -> dict:
+    try:
+        provider = _provider_for(source_type)
+    except Exception:
+        return {"isLoggedIn": False, "username": None, "lastError": "Unknown provider"}
+
+    auth = getattr(provider, "auth", None)
+    if auth is not None:
+        try:
+            return auth.get_status()
+        except Exception:
+            pass
+
+    row = await db.get_provider_session(source_type)
+    if not row:
+        return {"isLoggedIn": False, "username": None, "lastError": None, "hasCookies": False}
+    return {
+        "isLoggedIn": bool(row.get("is_logged_in")),
+        "username": row.get("username"),
+        "lastError": row.get("last_error"),
+        "lastLoginAt": row.get("last_login_at"),
+        "hasCookies": bool(row.get("session_cookies")),
+    }
+
+
+@app.get("/api/providers")
+async def list_providers():
+    providers = []
+    for meta in provider_registry.metadata():
+        source_type = meta["sourceType"]
+        meta["status"] = await _provider_login_state(source_type)
+        providers.append(meta)
+    return {"providers": providers, "sourceTypes": sorted(_available_source_types())}
+
+
+@app.get("/api/providers/{source_type}/status")
+async def provider_status(source_type: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    return {
+        **provider.metadata(),
+        **await _provider_login_state(source_type),
+    }
+
+
+@app.post("/api/providers/{source_type}/login")
+async def provider_login(source_type: str, body: ProviderLoginBody):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    try:
+        result = await provider.login(body.username, body.password)
+    except ProviderInteractionRequired as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not result.get("success"):
+        raise HTTPException(status_code=401, detail=result.get("error", "Login failed"))
+    return result
+
+
+@app.post("/api/providers/{source_type}/logout")
+async def provider_logout(source_type: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    result = await _provider_for(source_type).logout()
+    return result
+
+
+@app.post("/api/providers/{source_type}/following/sync")
+async def provider_sync_following(source_type: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    try:
+        items = await provider.sync_following()
+    except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    synced = set()
+    for item in items or []:
+        username = item.get("username")
+        if not username:
+            continue
+        await db.upsert_followed_model(
+            username=username,
+            display_name=item.get("display_name") or username,
+            is_online=bool(item.get("is_online", item.get("isOnline", False))),
+            viewers=int(item.get("viewers") or 0),
+            thumbnail_url=item.get("thumbnail") or item.get("thumbnail_url"),
+            source_type=source_type,
+            room_status=item.get("room_status") or item.get("roomStatus"),
+        )
+        synced.add(username)
+
+    if source_type == "chaturbate":
+        await db.remove_unfollowed(synced, source_type=source_type)
+    await db.reconcile_model_sources_from_followed()
+    return {"synced": len(synced), "message": f"{provider.display_name}: {len(synced)} follows synchronises"}
+
+
+@app.get("/api/providers/{source_type}/is-following/{username}")
+async def provider_is_following(source_type: str, username: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    remote = False
+    try:
+        if provider.capabilities.can_follow:
+            remote = bool(await provider.is_following(username))
+    except Exception:
+        remote = False
+    local = await db.get_followed_model(username)
+    local_match = bool(local and (local.get("source_type") or "chaturbate") == source_type)
+    return {"isFollowing": remote or local_match}
+
+
+@app.post("/api/providers/{source_type}/follow/{username}")
+async def provider_follow(source_type: str, username: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    if provider.capabilities.can_follow:
+        result = await provider.follow(username)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Follow failed"))
+    else:
+        result = {"success": True, "localOnly": True}
+
+    status = ProviderStatus(False, source_type=source_type)
+    try:
+        status = await _provider_status(source_type, username)
+    except Exception:
+        pass
+    await db.upsert_followed_model(
+        username=username,
+        display_name=username,
+        is_online=bool(status.is_online),
+        viewers=int(status.viewers or 0),
+        thumbnail_url=status.thumbnail,
+        source_type=source_type,
+        room_status=status.room_status,
+    )
+    await db.reconcile_model_sources_from_followed()
+    return result
+
+
+@app.post("/api/providers/{source_type}/unfollow/{username}")
+async def provider_unfollow(source_type: str, username: str):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    if provider.capabilities.can_follow:
+        result = await provider.unfollow(username)
+        if not result.get("success"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Unfollow failed"))
+    else:
+        result = {"success": True, "localOnly": True}
+    await db.delete_followed_model(username, source_type=source_type)
+    return result
+
+
 @app.post("/api/start")
 async def api_start(body: StartBody):
     start_time = time.time()
@@ -896,6 +1656,7 @@ async def api_start(body: StartBody):
     logger.info("Paramètres validés", target=target, source_type=body.source_type)
 
     m3u8_url: Optional[str] = None
+    stream_headers: Optional[dict[str, str]] = None
     person: Optional[str] = (body.person or "").strip() or None
     record_quality = body.record_quality or body.recordQuality
     if not record_quality and model_settings:
@@ -905,30 +1666,76 @@ async def api_start(body: StartBody):
     # Determine source type
     requested_source = _normalize_source_type(body.source_type)
     stype = requested_source or await _infer_source_type(person or target, model_settings)
+    if target.startswith("http://") or target.startswith("https://"):
+        url_source = _source_type_from_url(target)
+        if not requested_source and url_source:
+            stype = url_source
     logger.debug("Détermination type source", source_type=stype or 'auto', target=target)
 
-    if stype == "m3u8" or target.startswith("http://") or target.startswith("https://"):
+    direct_media_url = (
+        target.startswith("http://")
+        or target.startswith("https://")
+    ) and (".m3u8" in target.lower() or ".mpd" in target.lower())
+
+    if stype == "m3u8" or direct_media_url:
         logger.info("URL M3U8 directe détectée", url=target[:80])
         m3u8_url = target
     else:
         effective_source = stype
-        if effective_source not in SOURCE_TYPES:
+        available_sources = _available_source_types()
+        if effective_source not in available_sources:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"source_type '{effective_source}' inconnu. "
-                    f"Sources disponibles: {', '.join(sorted(SOURCE_TYPES))}"
+                    f"Sources disponibles: {', '.join(sorted(available_sources))}"
                 ),
             )
-        if effective_source == "chaturbate" and not CB_RESOLVER_ENABLED:
-            logger.error("Chaturbate Resolver désactivé", CB_RESOLVER_ENABLED=False)
-            raise HTTPException(
-                status_code=400,
-                detail="Résolution Chaturbate désactivée. Fournissez une URL m3u8 directe ou activez CB_RESOLVER_ENABLED.",
-            )
+        if _supports_browser_capture(effective_source):
+            if not person:
+                person = target
+            person = slugify(person)
+            logger.subsection(f"Démarrage capture navigateur '{effective_source}'")
+            try:
+                sess = _start_browser_capture(
+                    effective_source,
+                    target,
+                    person=person,
+                    display_name=body.name or target,
+                    record=True,
+                )
+                ready = await asyncio.to_thread(sess.wait_until_ready, 35)
+                if not ready:
+                    browser_capture_manager.stop_session(sess.id)
+                    raise RuntimeError("Aucun flux video capturable dans le navigateur")
+                duration_ms = (time.time() - start_time) * 1000
+                logger.success(
+                    "Session browser capture créée",
+                    session_id=sess.id,
+                    person=person,
+                    duration_ms=f"{duration_ms:.2f}",
+                )
+            except RuntimeError as e:
+                logger.error("Session browser capture impossible", person=person, error=str(e))
+                raise HTTPException(status_code=409, detail=str(e))
+            except Exception as e:
+                logger.critical("Erreur création browser capture", exc_info=True, person=person, error=str(e))
+                raise HTTPException(status_code=500, detail=f"Erreur serveur: {str(e)}")
+
+            return {
+                "id": sess.id,
+                "person": person,
+                "name": sess.name,
+                "playback_url": sess.playback_url,
+                "record_path": sess.record_path_today(),
+                "created_at": sess.created_at,
+                "running": True,
+                "capture_type": "browser",
+            }
         logger.subsection(f"Résolution via source '{effective_source}'")
         try:
-            m3u8_url = await _resolve_m3u8(effective_source, target, max_height)
+            resolved = await _resolve_stream(effective_source, target, max_height)
+            m3u8_url, stream_headers = _ffmpeg_stream_input(resolved)
             if not m3u8_url:
                 raise HTTPException(
                     status_code=400,
@@ -941,7 +1748,7 @@ async def api_start(body: StartBody):
         except HTTPException:
             raise
         except Exception as e:
-            error_detail = f"Échec résolution {effective_source}: {str(e)}"
+            error_detail = f"Échec résolution {effective_source}: {_provider_error_detail(effective_source, target, e)}"
             logger.error(error_detail, exc_info=True, username=target)
             raise HTTPException(status_code=400, detail=error_detail)
 
@@ -970,6 +1777,7 @@ async def api_start(body: StartBody):
             max_height=max_height,
             segment_duration_seconds=segment_duration_seconds,
             segment_size_bytes=segment_size_bytes,
+            input_headers=stream_headers,
         )
         duration_ms = (time.time() - start_time) * 1000
         logger.success("Session créée avec succès", 
@@ -996,12 +1804,17 @@ async def api_start(body: StartBody):
 
 @app.get("/api/status")
 async def api_status():
-    return manager.list_status()
+    return _all_recording_statuses()
 
 
 @app.post("/api/stop/{session_id}")
 async def api_stop(session_id: str):
     ok = manager.stop_session(session_id)
+    if not ok:
+        browser_session = browser_capture_manager.get(session_id)
+        ok = browser_capture_manager.stop_session(session_id)
+        if ok and browser_session:
+            await _index_browser_capture_recording(browser_session)
     if not ok:
         raise HTTPException(status_code=404, detail="Session introuvable")
     return {"stopped": True, "id": session_id}
@@ -1265,13 +2078,8 @@ async def api_process_restart(session_id: str):
 
 @app.get("/api/model/{username}/status")
 async def get_model_status(username: str, source: Optional[str] = None):
-    """Récupère le statut d'un modèle depuis le cache SQLite, avec fallback sur
-    le plugin de la source (query param `source=cam4`) ou sur l'API Chaturbate."""
-    # Lire directement depuis le cache SQLite (mis à jour par la tâche de monitoring)
+    """Récupère le statut d'un modèle via le registre provider."""
     model = await db.get_model(username)
-    # Si pas dans tracked_models, fallback sur followed_models pour retrouver
-    # le source_type réel (sinon on renvoie chaturbate par défaut, ce qui
-    # casse le bouton Follow sur la page watch pour les modèles CAM4 suivis).
     if not model or not model.get('source_type'):
         followed = await db.get_followed_model(username)
         if followed and followed.get('source_type'):
@@ -1279,10 +2087,21 @@ async def get_model_status(username: str, source: Optional[str] = None):
                 model = followed
             else:
                 model = {**model, 'source_type': followed['source_type']}
-    # Priorité: param `source` explicite (depuis le discover) > DB > défaut.
+
     source_type = _normalize_source_type(source)
     if not source_type:
         source_type = await _infer_source_type(username, model)
+
+    if source_type not in _available_source_types():
+        return {
+            "username": username,
+            "isOnline": False,
+            "thumbnail": f"/api/thumbnail/{username}",
+            "viewers": 0,
+            "tags": [],
+            "roomStatus": "unsupported",
+            "sourceType": source_type,
+        }
 
     if model and model.get('is_online'):
         return {
@@ -1290,89 +2109,36 @@ async def get_model_status(username: str, source: Optional[str] = None):
             "isOnline": True,
             "thumbnail": f"/api/thumbnail/{username}",
             "viewers": model.get('viewers', 0),
+            "tags": list(model.get('tags') or []),
             "roomStatus": model.get('room_status'),
             "sourceType": source_type,
         }
 
-    # Si source_type == cam4, on délègue directement à la source CAM4 (évite
-    # le fallback Chaturbate qui marque les CAM4 comme offline).
-    if source_type == "cam4":
-        try:
-            from .services import cam4_source
-            status = await cam4_source.check_status(username)
-            return {
-                "username": username,
-                "isOnline": bool(status.get("is_online")),
-                "thumbnail": f"/api/thumbnail/{username}",
-                "viewers": int(status.get("viewers") or 0),
-                "roomStatus": status.get("room_status"),
-                "sourceType": "cam4",
-            }
-        except Exception as e:
-            logger.debug("CAM4 check_status échoué", username=username, error=str(e))
-            return {
-                "username": username,
-                "isOnline": False,
-                "thumbnail": f"/api/thumbnail/{username}",
-                "viewers": 0,
-                "roomStatus": None,
-                "sourceType": "cam4",
-            }
-
-    # Modèle non trouvé ou offline dans le cache: vérifier en direct via l'API Chaturbate
-    # Try up to 2 attempts with better headers
-    for attempt in range(2):
-        try:
-            api_url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": f"https://chaturbate.com/{username}/",
-                "Origin": "https://chaturbate.com",
-            }
-            async with aiohttp_client_session() as session:
-                async with session.get(
-                    api_url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    ssl=False,
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        hls_fields = ['hls_source_1080p', 'hls_source_hd', 'hls_source_high', 'hls_source_720p', 'hls_source']
-                        is_online = any(data.get(f) for f in hls_fields)
-                        viewers = data.get('num_viewers', 0)
-                        room_status = data.get('room_status') or None
-                        if is_online:
-                            return {
-                                "username": username,
-                                "isOnline": True,
-                                "thumbnail": f"/api/thumbnail/{username}",
-                                "viewers": viewers,
-                                "roomStatus": room_status,
-                                "sourceType": source_type,
-                            }
-                        # Pas de flux HLS mais on a peut-être un room_status « privé »
-                        return {
-                            "username": username,
-                            "isOnline": False,
-                            "thumbnail": f"/api/thumbnail/{username}",
-                            "viewers": viewers,
-                            "roomStatus": room_status,
-                            "sourceType": source_type,
-                        }
-        except Exception as e:
-            logger.debug("Fallback API Chaturbate échoué pour status", username=username, error=str(e), attempt=attempt + 1)
-            if attempt == 0:
-                await asyncio.sleep(1)  # Brief wait before retry
+    try:
+        status = await _provider_status(source_type, username)
+        return {
+            "username": username,
+            "isOnline": bool(status.is_online),
+            "thumbnail": status.thumbnail or f"/api/thumbnail/{username}",
+            "viewers": int(status.viewers or 0),
+            "tags": list(status.tags or []),
+            "roomStatus": status.room_status,
+            "sourceType": source_type,
+        }
+    except Exception as e:
+        logger.debug(
+            "Provider check_status échoué",
+            username=username,
+            source_type=source_type,
+            error=str(e),
+        )
 
     return {
         "username": username,
         "isOnline": model.get('is_online', False) if model else False,
         "thumbnail": f"/api/thumbnail/{username}",
         "viewers": model.get('viewers', 0) if model else 0,
+        "tags": list(model.get('tags') or []) if model else [],
         "roomStatus": model.get('room_status') if model else None,
         "sourceType": source_type,
     }
@@ -1396,25 +2162,57 @@ async def get_model_stream(username: str, source: Optional[str] = None):
         if not source_type:
             source_type = await _infer_source_type(username, model)
 
-        if source_type not in SOURCE_TYPES:
+        if source_type not in _available_source_types():
             raise HTTPException(
                 status_code=404,
                 detail=f"Source '{source_type}' non disponible",
             )
+        if _supports_browser_capture(source_type):
+            person = slugify(username)
+            try:
+                sess = _start_browser_capture(
+                    source_type,
+                    username,
+                    person=person,
+                    display_name=username,
+                    record=False,
+                )
+                ready = await asyncio.to_thread(sess.wait_until_ready, 35)
+                if not ready:
+                    browser_capture_manager.stop_session(sess.id)
+                    raise RuntimeError("Aucun flux video capturable dans le navigateur")
+            except Exception as e:
+                raise HTTPException(status_code=404, detail=_provider_error_detail(source_type, username, e))
+
+            return {
+                "username": username,
+                "streamUrl": sess.playback_url,
+                "streamType": getattr(sess, "file_extension", "webm"),
+                "isOnline": True,
+                "sourceType": source_type,
+                "roomStatus": "public",
+                "viewers": 0,
+                "tags": [],
+                "thumbnail": None,
+            }
         try:
             max_height = await _get_max_recording_height()
-            m3u8_url = await _resolve_m3u8(source_type, username, max_height)
+            resolved = await _resolve_stream(source_type, username, max_height)
         except Exception as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            raise HTTPException(status_code=404, detail=_provider_error_detail(source_type, username, e))
 
-        if not m3u8_url:
+        if not resolved.url:
             raise HTTPException(status_code=404, detail=f"Impossible de trouver le flux pour {username}")
 
         return {
             "username": username,
-            "streamUrl": m3u8_url,
+            "streamUrl": _proxied_stream_url(resolved),
             "isOnline": True,
             "sourceType": source_type,
+            "roomStatus": resolved.room_status,
+            "viewers": int(resolved.viewers or 0),
+            "tags": list(resolved.tags or []),
+            "thumbnail": resolved.thumbnail,
         }
     except HTTPException:
         raise
@@ -1524,6 +2322,72 @@ async def get_dashboard():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _format_duration_label(duration_seconds: int) -> str:
+    hours = duration_seconds // 3600
+    minutes = (duration_seconds % 3600) // 60
+    seconds = duration_seconds % 60
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    return f"{minutes}m{seconds:02d}s"
+
+
+def _format_size_display(file_size: int) -> str:
+    if file_size >= 1000 * 1024 * 1024:
+        return f"{file_size / 1024 / 1024 / 1024:.2f} GB"
+    return f"{file_size / 1024 / 1024:.0f} MB"
+
+
+def _format_import_recording(rec: dict, username: str) -> Optional[dict]:
+    from .core.utils import format_bytes
+
+    source_path = Path(rec.get("file_path") or "")
+    if not source_path.exists():
+        return None
+
+    recording_id = rec.get("recording_id") or source_path.stem
+    playable_raw = rec.get("playable_path")
+    playable_path = Path(playable_raw) if playable_raw else None
+    playable = bool(playable_path and playable_path.exists())
+    file_size = (
+        rec.get("playable_size")
+        if playable and rec.get("playable_size")
+        else rec.get("file_size") or source_path.stat().st_size
+    )
+    created_at = rec.get("created_at") or int(source_path.stat().st_mtime)
+    duration_seconds = int(rec.get("duration_seconds") or 0)
+    thumb_path = Path(rec.get("thumbnail_path") or "")
+    thumb_url = (
+        f"/api/recording-thumbnail/{username}/{thumb_path.name}"
+        if thumb_path.exists()
+        else None
+    )
+
+    return {
+        "recordingId": recording_id,
+        "filename": source_path.name,
+        "title": rec.get("title") or source_path.stem,
+        "date": source_path.stem,
+        "size": file_size,
+        "size_formatted": format_bytes(file_size),
+        "size_mb": round(file_size / 1024 / 1024, 2),
+        "size_display": _format_size_display(file_size),
+        "modified": datetime.fromtimestamp(source_path.stat().st_mtime).isoformat(),
+        "url": f"/streams/media/{recording_id}" if playable else None,
+        "downloadUrl": f"/streams/media/{recording_id}?download=1",
+        "thumbnail": thumb_url,
+        "duration": duration_seconds,
+        "duration_str": _format_duration_label(duration_seconds),
+        "isConverted": playable,
+        "isImported": True,
+        "mediaKind": "import",
+        "importStatus": rec.get("import_status") or ("ready" if playable else "failed"),
+        "importError": rec.get("import_error"),
+        "playable": playable,
+        "createdAt": created_at,
+        "mp4": None,
+    }
+
+
 @app.get("/api/recordings/{username}")
 async def list_recordings(username: str, show_ts: bool = False):
     """Liste les enregistrements (MP4 convertis ou TS bruts)"""
@@ -1537,6 +2401,12 @@ async def list_recordings(username: str, show_ts: bool = False):
     thumbnails_dir = OUTPUT_DIR / "thumbnails" / username
 
     for rec in recordings_db:
+        if rec.get("media_kind") == "import":
+            formatted_import = _format_import_recording(rec, username)
+            if formatted_import:
+                recordings.append(formatted_import)
+            continue
+
         # Determine the playable file: prefer MP4, fall back to TS
         is_converted = bool(rec.get('is_converted'))
         mp4_raw = rec.get('mp4_path')
@@ -1546,10 +2416,11 @@ async def list_recordings(username: str, show_ts: bool = False):
             serve_path = Path(mp4_raw)
             file_size = rec.get('mp4_size') or serve_path.stat().st_size
         elif ts_raw and Path(ts_raw).exists():
-            # Skip TS files unless show_ts is enabled
-            if not show_ts:
-                continue
             serve_path = Path(ts_raw)
+            # Skip raw TS files unless show_ts is enabled. Browser captures are
+            # written as WebM and are directly playable, so keep them visible.
+            if serve_path.suffix.lower() == ".ts" and not show_ts:
+                continue
             file_size = rec.get('file_size') or serve_path.stat().st_size
         else:
             continue
@@ -1568,19 +2439,8 @@ async def list_recordings(username: str, show_ts: bool = False):
         ):
             continue
 
-        hours = duration_seconds // 3600
-        minutes = (duration_seconds % 3600) // 60
-        seconds = duration_seconds % 60
-        if hours > 0:
-            duration_str = f"{hours}h{minutes:02d}m"
-        else:
-            duration_str = f"{minutes}m{seconds:02d}s"
-
-        # Calculer la taille en MB ou GB
-        if file_size >= 1000 * 1024 * 1024:  # >= 1000 MB
-            size_display = f"{file_size / 1024 / 1024 / 1024:.2f} GB"
-        else:
-            size_display = f"{file_size / 1024 / 1024:.0f} MB"
+        duration_str = _format_duration_label(duration_seconds)
+        size_display = _format_size_display(file_size)
 
         # Use created_at from DB, fallback to file mtime
         created_at = rec.get('created_at')
@@ -1601,6 +2461,12 @@ async def list_recordings(username: str, show_ts: bool = False):
             "duration": duration_seconds,
             "duration_str": duration_str,
             "isConverted": is_converted,
+            "isImported": False,
+            "mediaKind": "recording",
+            "importStatus": None,
+            "importError": None,
+            "playable": True,
+            "downloadUrl": f"/streams/records/{username}/{serve_path.name}",
             "conversionAttempts": rec.get('conversion_attempts') or 0,
             "conversionError": rec.get('conversion_error'),
             "createdAt": created_at,
@@ -1634,6 +2500,50 @@ async def retry_conversion(recording_id: str):
     }
 
 
+def _get_media_import_manager() -> MediaImportManager:
+    global media_import_manager
+    if media_import_manager is None:
+        media_import_manager = MediaImportManager(db, OUTPUT_DIR, FFMPEG_PATH)
+    return media_import_manager
+
+
+@app.get("/api/media-imports/status")
+async def get_media_imports_status():
+    """Return local media import feature status."""
+    if not MEDIA_IMPORTS_ENABLED:
+        return {
+            "enabled": False,
+            "running": False,
+            "lastScanAt": None,
+            "lastResult": None,
+        }
+
+    manager_ref = _get_media_import_manager()
+    return {
+        "enabled": True,
+        "running": manager_ref.running,
+        "lastScanAt": manager_ref.last_scan_at,
+        "lastResult": manager_ref.last_result,
+    }
+
+
+@app.post("/api/media-imports/rescan")
+async def rescan_media_imports():
+    """Trigger an immediate local media import scan."""
+    if not MEDIA_IMPORTS_ENABLED:
+        return {
+            "success": False,
+            "enabled": False,
+            "message": "Local media imports are disabled",
+        }
+
+    result = await _get_media_import_manager().scan()
+    return {
+        "enabled": True,
+        **result,
+    }
+
+
 @app.get("/api/all-recordings")
 async def get_all_recordings(
     page: int = 1,
@@ -1654,6 +2564,13 @@ async def get_all_recordings(
     recordings = []
     for rec in result["recordings"]:
         rec_username = rec.get("username", "")
+        if rec.get("media_kind") == "import":
+            formatted_import = _format_import_recording(rec, rec_username)
+            if formatted_import:
+                formatted_import["username"] = rec_username
+                recordings.append(formatted_import)
+            continue
+
         is_converted = bool(rec.get("is_converted"))
         mp4_raw = rec.get("mp4_path")
         ts_raw = rec.get("file_path")
@@ -1681,13 +2598,7 @@ async def get_all_recordings(
         ):
             continue
 
-        hours = duration_seconds // 3600
-        minutes = (duration_seconds % 3600) // 60
-        seconds = duration_seconds % 60
-        if hours > 0:
-            duration_str = f"{hours}h{minutes:02d}m"
-        else:
-            duration_str = f"{minutes}m{seconds:02d}s"
+        duration_str = _format_duration_label(duration_seconds)
 
         # Thumbnail
         thumb_path = OUTPUT_DIR / "thumbnails" / rec_username / f"{file_stem}.jpg"
@@ -1702,8 +2613,13 @@ async def get_all_recordings(
             "duration": duration_seconds,
             "duration_str": duration_str,
             "url": f"/streams/records/{rec_username}/{serve_file.name}",
+            "downloadUrl": f"/streams/records/{rec_username}/{serve_file.name}",
             "thumbnail": f"/api/recording-thumbnail/{rec_username}/{file_stem}.jpg" if thumb_path.exists() else None,
             "createdAt": rec.get("created_at"),
+            "isImported": False,
+            "mediaKind": "recording",
+            "importStatus": None,
+            "playable": True,
         })
 
     # Get distinct usernames for filter dropdown
@@ -1832,7 +2748,7 @@ async def add_model(model: dict):
         model.get("sourceType") or model.get("source_type")
     )
     source_type = requested_source or await _infer_source_type(username)
-    if source_type not in SOURCE_TYPES:
+    if source_type not in _available_source_types():
         raise HTTPException(
             status_code=400,
             detail=f"Source '{source_type}' non disponible",
@@ -1882,15 +2798,22 @@ async def update_model(username: str, model_data: dict):
     else:
         retention_days = existing.get("retention_days", 30)
 
+    requested_source = _normalize_source_type(
+        model_data.get('sourceType') or model_data.get('source_type')
+    )
+    if requested_source and requested_source not in _available_source_types():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{requested_source}' non disponible",
+        )
+
     # Mettre à jour dans SQLite
     await db.add_or_update_model(
         username=username,
         auto_record=model_data.get('autoRecord', existing.get('auto_record', True)),
         record_quality=model_data.get('recordQuality', existing.get('record_quality', 'best')),
         retention_days=retention_days,
-        source_type=_normalize_source_type(
-            model_data.get('sourceType') or model_data.get('source_type')
-        ),
+        source_type=requested_source,
     )
     
     # Récupérer le modèle mis à jour
@@ -1943,15 +2866,33 @@ async def delete_recording(username: str, filename: str):
     # Sécurité
     if ".." in filename or "/" in filename:
         raise HTTPException(status_code=400, detail="Nom invalide")
-    
-    if not (filename.endswith(".ts") or filename.endswith(".mp4")):
+
+    existing_recs = await db.get_recordings(username)
+    matching_rec = next((r for r in existing_recs if r.get("filename") == filename), None)
+    if matching_rec and matching_rec.get("media_kind") == "import":
+        deleted = await remove_import_record(
+            db,
+            matching_rec,
+            reason="user_delete",
+            delete_original=True,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Média importé introuvable")
+        return {
+            "success": True,
+            "message": "Média importé supprimé",
+            "deleted_files": ["Import"],
+        }
+
+    allowed_extensions = {".ts", ".mp4"} | SUPPORTED_VIDEO_EXTENSIONS
+    if Path(filename).suffix.lower() not in allowed_extensions:
         raise HTTPException(status_code=400, detail="Format invalide")
     
     # Vérifier que ce n'est pas l'enregistrement en cours
     file_stem = Path(filename).stem
     
     # Vérifier si CE FICHIER SPÉCIFIQUE est en cours d'enregistrement
-    active_sessions = manager.list_status()
+    active_sessions = _all_recording_statuses()
     for session in active_sessions:
         if session.get('person') == username and session.get('running'):
             # Récupérer le chemin du fichier en cours d'enregistrement
@@ -1966,15 +2907,15 @@ async def delete_recording(username: str, filename: str):
     records_dir = OUTPUT_DIR / "records" / username
     ts_path = records_dir / f"{file_stem}.ts"
     mp4_path = records_dir / f"{file_stem}.mp4"
+    original_path = records_dir / filename
     thumb_path = OUTPUT_DIR / "thumbnails" / username / f"{file_stem}.jpg"
 
     # Si les fichiers ont déjà disparu (cleanup externe, volume remonté, etc.)
     # on doit quand même pouvoir nettoyer la row DB orpheline — sinon elle
     # reste affichée dans /recordings sans jamais pouvoir être retirée.
-    existing_recs = await db.get_recordings(username)
     has_db_row = any(Path(r['filename']).stem == file_stem for r in existing_recs)
 
-    if not ts_path.exists() and not mp4_path.exists() and not has_db_row:
+    if not ts_path.exists() and not mp4_path.exists() and not original_path.exists() and not has_db_row:
         raise HTTPException(status_code=404, detail="Enregistrement introuvable")
 
     # Supprimer tous les fichiers associés
@@ -1993,13 +2934,20 @@ async def delete_recording(username: str, filename: str):
             files_deleted.append("MP4")
             logger.info("Fichier MP4 supprimé", username=username, file=mp4_path.name)
 
+        if original_path.exists() and original_path not in {ts_path, mp4_path}:
+            original_path.unlink()
+            files_deleted.append(original_path.suffix.upper().lstrip(".") or "Fichier")
+            logger.info("Fichier recording supprimé", username=username, file=original_path.name)
+
         # Supprimer miniature
         if thumb_path.exists():
             thumb_path.unlink()
             files_deleted.append("Miniature")
 
         # Supprimer de la base de données
-        await db.delete_recording(username, f"{file_stem}.ts")
+        await db.delete_recording(username, filename)
+        if filename != f"{file_stem}.ts":
+            await db.delete_recording(username, f"{file_stem}.ts")
         logger.info("Enregistrement supprimé de la DB", username=username, filename=filename)
 
         if not files_deleted and has_db_row:
@@ -2219,11 +3167,7 @@ async def check_for_update():
                 release = await resp.json(content_type=None) if status_code == 200 else None
         if status_code == 200 and release:
             latest_version = release.get("tag_name", "").lstrip("v")
-            update_available = (
-                current_version != "dev"
-                and latest_version != ""
-                and current_version != latest_version
-            )
+            update_available = _is_update_available(current_version, latest_version)
             return {
                 "current_version": current_version,
                 "latest_version": latest_version,
@@ -2703,7 +3647,7 @@ async def toggle_auto_record(username: str, body: dict):
     requested_source = _normalize_source_type(
         body.get("sourceType") or body.get("source_type")
     )
-    if requested_source and requested_source not in SOURCE_TYPES:
+    if requested_source and requested_source not in _available_source_types():
         raise HTTPException(
             status_code=400,
             detail=f"Source '{requested_source}' non disponible",
@@ -2758,8 +3702,18 @@ async def save_playback_position(recording_id: str, body: dict):
     # Check auto-delete
     should_delete = False
     if duration > 0 and position > 0:
+        rec = await db.get_recording_by_id(recording_id)
+        is_protected_import = bool(
+            rec
+            and rec.get("media_kind") == "import"
+            and rec.get("protected_from_retention")
+        )
         auto_delete_val = await db.get_setting("auto_delete_watched")
-        if auto_delete_val and auto_delete_val.lower() in {"1", "true", "yes"}:
+        if (
+            not is_protected_import
+            and auto_delete_val
+            and auto_delete_val.lower() in {"1", "true", "yes"}
+        ):
             threshold_val = await db.get_setting("auto_delete_threshold")
             try:
                 threshold = int(threshold_val) if threshold_val else 90
@@ -2977,7 +3931,7 @@ async def auto_record_task():
                 continue
             
             # Récupérer les sessions actives
-            active_sessions = manager.list_status()
+            active_sessions = _all_recording_statuses()
             
             for model in models:
                 username = model.get('username')
@@ -3001,11 +3955,12 @@ async def auto_record_task():
                     # Modèle en ligne: résoudre le flux HLS
                     try:
                         hls_source = None
+                        stream_headers = None
                         max_height = await _get_recording_height_for_quality(
                             cached_status.get("record_quality")
                         )
                         source_type = await _infer_source_type(username, cached_status)
-                        if source_type not in SOURCE_TYPES:
+                        if source_type not in _available_source_types():
                             logger.warning(
                                 "Source inconnue pour auto-record",
                                 task="auto-record",
@@ -3013,17 +3968,42 @@ async def auto_record_task():
                                 source_type=source_type,
                             )
                             continue
-                        try:
-                            hls_source = await _resolve_m3u8(
-                                source_type, username, max_height
-                            )
-                        except Exception as e:
-                            logger.debug(
-                                "Auto-record resolve échec",
-                                task="auto-record",
-                                username=username,
-                                error=str(e),
-                            )
+                        if _supports_browser_capture(source_type):
+                            logger.background_task("auto-record", "Modèle WebRTC en ligne détecté", username=username)
+                            try:
+                                sess = _start_browser_capture(
+                                    source_type,
+                                    username,
+                                    person=username,
+                                    display_name=username,
+                                    record=True,
+                                )
+                                ready = await asyncio.to_thread(sess.wait_until_ready, 35)
+                                if not ready:
+                                    browser_capture_manager.stop_session(sess.id)
+                                    raise RuntimeError("Aucun flux video capturable dans le navigateur")
+                                logger.success("Auto-enregistrement browser démarré",
+                                             task="auto-record",
+                                             username=username,
+                                             session_id=sess.id)
+                            except RuntimeError as e:
+                                logger.warning("Impossible démarrer browser capture",
+                                             task="auto-record",
+                                             username=username,
+                                             error=str(e))
+                        else:
+                            try:
+                                resolved = await _resolve_stream(
+                                    source_type, username, max_height
+                                )
+                                hls_source, stream_headers = _ffmpeg_stream_input(resolved)
+                            except Exception as e:
+                                logger.debug(
+                                    "Auto-record resolve échec",
+                                    task="auto-record",
+                                    username=username,
+                                    error=str(e),
+                                )
 
                         if hls_source:
                             # Lancer l'enregistrement
@@ -3038,6 +4018,7 @@ async def auto_record_task():
                                     max_height=max_height,
                                     segment_duration_seconds=segment_duration_seconds,
                                     segment_size_bytes=segment_size_bytes,
+                                    input_headers=stream_headers,
                                 )
 
                                 if sess:
@@ -3267,9 +4248,19 @@ async def startup_event():
     cb_api = ChaturbateAPI(cb_auth, flaresolverr)
     chaturbate_api = cb_api
 
+    global provider_registry, SOURCE_TYPES
+    provider_registry = create_provider_registry(
+        db,
+        chaturbate_api=cb_api,
+        chaturbate_auth=cb_auth,
+        cam4_auth=cam4_auth_service,
+        output_dir=OUTPUT_DIR,
+    )
+    SOURCE_TYPES = provider_registry.source_types()
+
     # Wire up API routers
     auth_router.init(cb_auth, flaresolverr)
-    discover_router.init(cb_api, db)
+    discover_router.init(cb_api, db, provider_registry)
     following_router.init(cb_api, cb_auth, db)
 
     # Set authenticated resolver for chaturbate
@@ -3289,11 +4280,22 @@ async def startup_event():
             logger.warning("Chaturbate auto-login failed", error=result.get("error"))
 
     # Démarrer les tâches de fond
-    asyncio.create_task(monitor_models_task(db, manager, FFMPEG_PATH, chaturbate_auth=cb_auth, cam4_auth=cam4_auth_service))
+    asyncio.create_task(monitor_models_task(
+        db,
+        manager,
+        FFMPEG_PATH,
+        chaturbate_auth=cb_auth,
+        cam4_auth=cam4_auth_service,
+        provider_registry=provider_registry,
+    ))
     asyncio.create_task(ffmpeg_watchdog_task())
     asyncio.create_task(auto_record_task())
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))
+    if MEDIA_IMPORTS_ENABLED:
+        global media_import_manager
+        media_import_manager = MediaImportManager(db, OUTPUT_DIR, FFMPEG_PATH)
+        asyncio.create_task(media_imports_task(media_import_manager))
     asyncio.create_task(sync_following_task(cb_api, cb_auth))
     asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     logger.info("Background tasks démarrés",

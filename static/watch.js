@@ -28,6 +28,15 @@ function sourceQuery() {
   return currentSourceType ? ('?source=' + encodeURIComponent(currentSourceType)) : '';
 }
 
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function goBackFromWatch() {
   if (window.history.length > 1) {
     window.history.back();
@@ -111,6 +120,7 @@ async function loadModelStatus() {
       statusDot.className = 'status-dot private';
       statusText.textContent = 'Private';
       viewerCount.style.display = 'none';
+      renderWatchTags([]);
       if (offlineIcon) offlineIcon.innerHTML = '&#128274;';
       if (offlineTitle) offlineTitle.textContent = 'Model is in a Private Show';
       if (offlineText) offlineText.textContent = formatPrivateText(data.roomStatus);
@@ -125,6 +135,7 @@ async function loadModelStatus() {
       statusText.textContent = 'Live';
       viewerCount.style.display = 'inline';
       viewerNum.textContent = Number(data.viewers || 0).toLocaleString();
+      renderWatchTags(data.tags || []);
       offlineOverlay.style.display = 'none';
 
       // Start stream if not already playing
@@ -139,6 +150,7 @@ async function loadModelStatus() {
         statusText.textContent = 'Live';
         viewerCount.style.display = 'inline';
         viewerNum.textContent = Number(data.viewers || 0).toLocaleString();
+        if (data.tags && data.tags.length) renderWatchTags(data.tags);
         offlineOverlay.style.display = 'none';
         return;
       }
@@ -152,6 +164,7 @@ async function loadModelStatus() {
           statusText.textContent = 'Live';
           viewerCount.style.display = 'inline';
           viewerNum.textContent = Number(data.viewers || 0).toLocaleString();
+          if (data.tags && data.tags.length) renderWatchTags(data.tags);
           offlineOverlay.style.display = 'none';
           return;
         }
@@ -160,6 +173,7 @@ async function loadModelStatus() {
       statusDot.className = 'status-dot offline';
       statusText.textContent = 'Offline';
       viewerCount.style.display = 'none';
+      renderWatchTags([]);
       if (offlineIcon) offlineIcon.innerHTML = '&#128308;';
       if (offlineTitle) offlineTitle.textContent = 'Model is Offline';
       if (offlineText) offlineText.textContent = 'This model is currently not streaming.';
@@ -200,6 +214,49 @@ function updatePlatformBadge(sourceType) {
   container.innerHTML = renderPlatformBadge(sourceType);
 }
 
+function renderWatchTags(tags) {
+  var container = document.getElementById('watchTags');
+  if (!container) return;
+
+  var seen = new Set();
+  var displayTags = [];
+  if (Array.isArray(tags)) {
+    tags.forEach(function(tag) {
+      tag = String(tag || '').trim().replace(/^#/, '');
+      var key = tag.toLowerCase();
+      if (!tag || seen.has(key)) return;
+      seen.add(key);
+      displayTags.push(tag);
+    });
+  }
+
+  if (displayTags.length === 0) {
+    container.style.display = 'none';
+    container.innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = displayTags.slice(0, 8).map(function(tag) {
+    return '<span class="watch-tag">#' + escapeHtml(tag) + '</span>';
+  }).join('');
+  container.style.display = 'flex';
+}
+
+function applyLiveMetadata(data) {
+  if (!data) return;
+  var viewerCount = document.getElementById('viewerCount');
+  var viewerNum = document.getElementById('viewerNum');
+  if (data.sourceType) {
+    currentSourceType = data.sourceType;
+    updatePlatformBadge(data.sourceType);
+  }
+  if (viewerCount && viewerNum && data.viewers !== undefined) {
+    viewerCount.style.display = 'inline';
+    viewerNum.textContent = Number(data.viewers || 0).toLocaleString();
+  }
+  renderWatchTags(data.tags || []);
+}
+
 function formatPrivateText(rs) {
   var s = (rs || '').toLowerCase();
   if (s === 'group') return 'The model is currently in a group show.';
@@ -220,6 +277,7 @@ async function tryLoadStream() {
     if (!data.streamUrl) return false;
 
     // Stream URL is available - start playing
+    applyLiveMetadata(data);
     startStreamWithUrl(data.streamUrl);
     return true;
   } catch (e) {
@@ -245,6 +303,7 @@ async function startStream() {
       return;
     }
 
+    applyLiveMetadata(data);
     startStreamWithUrl(streamUrl);
   } catch (e) {
     console.error('Error starting stream:', e);
@@ -264,7 +323,18 @@ function startStreamWithUrl(streamUrl) {
   streamLoaded = true;
   prepareMutedAutoplay(video);
 
-  if (Hls.isSupported()) {
+  if (isNativeVideoStream(streamUrl)) {
+    resetQualitySelector();
+    video.src = streamUrl;
+    video.addEventListener('loadedmetadata', function() {
+      startMutedAutoplay(video);
+    }, { once: true });
+    video.addEventListener('canplay', function() {
+      startMutedAutoplay(video);
+    }, { once: true });
+    video.load();
+    startMutedAutoplay(video);
+  } else if (Hls.isSupported()) {
     hlsPlayer = new Hls({
       enableWorker: true,
       lowLatencyMode: true,
@@ -310,6 +380,11 @@ function startStreamWithUrl(streamUrl) {
     video.load();
     startMutedAutoplay(video);
   }
+}
+
+function isNativeVideoStream(streamUrl) {
+  var url = String(streamUrl || '').toLowerCase();
+  return url.indexOf('/streams/browser/') !== -1 || /\.webm(?:$|[?#])/.test(url);
 }
 
 function prepareMutedAutoplay(video) {
@@ -449,7 +524,9 @@ async function retryStream() {
 // ============================================
 function followBasePath() {
   // Route vers le bon service selon la plateforme.
-  return currentSourceType === 'cam4' ? '/api/cam4' : '/api/chaturbate';
+  if (currentSourceType === 'cam4') return '/api/cam4';
+  if (currentSourceType === 'chaturbate') return '/api/chaturbate';
+  return '/api/providers/' + encodeURIComponent(currentSourceType || 'chaturbate');
 }
 
 async function loadFollowStatus() {

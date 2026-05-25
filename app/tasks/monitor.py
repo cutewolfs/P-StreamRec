@@ -143,6 +143,7 @@ async def check_model_status(
                     "viewers": viewers,
                     "hls_source": hls_source,
                     "room_status": room_status or None,
+                    "tags": data.get("tags") or data.get("room_tags") or [],
                 }
     except Exception as e:
         logger.debug("Erreur vérification statut modèle", username=username, error=str(e))
@@ -158,6 +159,7 @@ async def check_model_status(
             "viewers": 0,
             "hls_source": None,
             "room_status": "public" if is_live else None,
+            "tags": [],
         }
     except Exception as e:
         logger.debug("Erreur fallback CDN", username=username, error=str(e))
@@ -167,6 +169,7 @@ async def check_model_status(
         "viewers": 0,
         "hls_source": None,
         "room_status": None,
+        "tags": [],
     }
 
 async def generate_thumbnail_from_stream(
@@ -395,6 +398,8 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
         if records_root.exists():
             existing_recs = await db.get_recordings(username)
             for rec in existing_recs:
+                if rec.get('media_kind') == 'import':
+                    continue
                 ts_path_str = rec.get('file_path')
                 mp4_path_str = rec.get('mp4_path')
                 ts_exists = bool(ts_path_str) and Path(ts_path_str).exists()
@@ -534,12 +539,14 @@ async def monitor_models_task(
     ffmpeg_path: str = "ffmpeg",
     chaturbate_auth=None,
     cam4_auth=None,
+    provider_registry=None,
 ):
     """
     Tâche de monitoring en arrière-plan.
 
-    Pour chaque modèle trackée, vérifie son statut via la source appropriée
-    (Chaturbate ou CAM4) en switchant sur le source_type stocké.
+    Pour chaque modèle trackée, vérifie son statut via le registre provider
+    quand il est disponible, avec les anciens chemins Chaturbate/CAM4 en
+    fallback.
 
     ``chaturbate_auth`` fournit les cookies authentifiés pour check_model_status
     Chaturbate (évite le redirect login, GH #11). ``cam4_auth`` est reservé
@@ -579,7 +586,19 @@ async def monitor_models_task(
                             pass
 
                     try:
-                        if source_type == "cam4":
+                        if provider_registry is not None and provider_registry.has(source_type):
+                            try:
+                                status_obj = await provider_registry.get(source_type).check_status(username)
+                                status = status_obj.as_dict() if hasattr(status_obj, "as_dict") else dict(status_obj)
+                            except Exception as e:
+                                logger.debug(
+                                    "Provider check_status error",
+                                    source_type=source_type,
+                                    username=username,
+                                    error=str(e),
+                                )
+                                status = {'is_online': False, 'viewers': 0, 'hls_source': None, 'room_status': None, 'tags': []}
+                        elif source_type == "cam4":
                             try:
                                 from ..services import cam4_source
                                 status = await cam4_source.check_status(username)
@@ -589,7 +608,7 @@ async def monitor_models_task(
                                     username=username,
                                     error=str(e),
                                 )
-                                status = {'is_online': False, 'viewers': 0, 'hls_source': None, 'room_status': None}
+                                status = {'is_online': False, 'viewers': 0, 'hls_source': None, 'room_status': None, 'tags': []}
                         else:
                             # Chaturbate: check direct avec cookies authentifiés
                             auth_cookies = (

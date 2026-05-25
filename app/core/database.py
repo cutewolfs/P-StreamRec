@@ -79,6 +79,14 @@ class Database:
                     mp4_path TEXT,
                     mp4_size INTEGER,
                     is_converted BOOLEAN DEFAULT 0,
+                    media_kind TEXT DEFAULT 'recording',
+                    title TEXT,
+                    import_status TEXT,
+                    import_error TEXT,
+                    source_mtime INTEGER,
+                    playable_path TEXT,
+                    playable_size INTEGER,
+                    protected_from_retention BOOLEAN DEFAULT 0,
                     created_at INTEGER,
                     UNIQUE(username, filename)
                 )
@@ -152,6 +160,21 @@ class Database:
                 )
             """)
 
+            # Sessions generiques par provider: cookies/localStorage seulement,
+            # jamais les mots de passe.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS provider_sessions (
+                    source_type TEXT PRIMARY KEY,
+                    username TEXT,
+                    is_logged_in BOOLEAN DEFAULT 0,
+                    session_cookies TEXT,
+                    local_storage TEXT,
+                    last_login_at INTEGER,
+                    last_error TEXT,
+                    updated_at INTEGER
+                )
+            """)
+
             # Index pour les requêtes fréquentes
             await db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_models_online
@@ -177,6 +200,14 @@ class Database:
             ("recordings", "conversion_attempts", "INTEGER DEFAULT 0"),
             ("recordings", "conversion_error", "TEXT"),
             ("recordings", "last_conversion_attempt", "INTEGER"),
+            ("recordings", "media_kind", "TEXT DEFAULT 'recording'"),
+            ("recordings", "title", "TEXT"),
+            ("recordings", "import_status", "TEXT"),
+            ("recordings", "import_error", "TEXT"),
+            ("recordings", "source_mtime", "INTEGER"),
+            ("recordings", "playable_path", "TEXT"),
+            ("recordings", "playable_size", "INTEGER"),
+            ("recordings", "protected_from_retention", "BOOLEAN DEFAULT 0"),
             ("models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("models", "room_status", "TEXT"),
             ("followed_models", "source_type", "TEXT DEFAULT 'chaturbate'"),
@@ -368,12 +399,24 @@ class Database:
         thumbnail_path: Optional[str] = None,
         mp4_path: Optional[str] = None,
         mp4_size: Optional[int] = None,
-        is_converted: bool = False
+        is_converted: bool = False,
+        media_kind: Optional[str] = None,
+        title: Optional[str] = None,
+        import_status: Optional[str] = None,
+        import_error: Optional[str] = None,
+        source_mtime: Optional[int] = None,
+        playable_path: Optional[str] = None,
+        playable_size: Optional[int] = None,
+        protected_from_retention: Optional[bool] = None,
+        created_at: Optional[int] = None,
     ):
         """Ajoute ou met à jour un enregistrement"""
         await self.initialize()
         
         now = int(datetime.now().timestamp())
+        created_at = created_at or now
+        media_kind = (media_kind or "recording").strip().lower() or "recording"
+        protected_value = 1 if protected_from_retention else 0
         
         # Générer recording_id si non fourni
         if not recording_id:
@@ -383,20 +426,34 @@ class Database:
             await db.execute("""
                 INSERT INTO recordings (
                     username, recording_id, filename, file_path, file_size, 
-                    duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted, created_at
+                    duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
+                    media_kind, title, import_status, import_error, source_mtime,
+                    playable_path, playable_size, protected_from_retention, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, filename) DO UPDATE SET
                     file_size = ?,
                     duration_seconds = ?,
                     thumbnail_path = COALESCE(?, thumbnail_path),
                     mp4_path = COALESCE(?, mp4_path),
                     mp4_size = COALESCE(?, mp4_size),
-                    is_converted = ?
+                    is_converted = ?,
+                    media_kind = COALESCE(?, media_kind),
+                    title = COALESCE(?, title),
+                    import_status = COALESCE(?, import_status),
+                    import_error = ?,
+                    source_mtime = COALESCE(?, source_mtime),
+                    playable_path = COALESCE(?, playable_path),
+                    playable_size = COALESCE(?, playable_size),
+                    protected_from_retention = ?
             """, (
                 username, recording_id, filename, file_path, file_size,
-                duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted, now,
-                file_size, duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted
+                duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
+                media_kind, title, import_status, import_error, source_mtime,
+                playable_path, playable_size, protected_value, created_at,
+                file_size, duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
+                media_kind, title, import_status, import_error, source_mtime,
+                playable_path, playable_size, protected_value
             ))
             await db.commit()
     
@@ -413,6 +470,22 @@ class Database:
                 ORDER BY created_at DESC
                 """,
                 (username,)
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_import_recordings(self) -> List[Dict[str, Any]]:
+        """Récupère les médias importés."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM recordings
+                WHERE media_kind = 'import'
+                ORDER BY created_at DESC
+                """
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -437,6 +510,28 @@ class Database:
             await db.execute(
                 "DELETE FROM recordings WHERE username = ? AND filename = ?",
                 (username, filename)
+            )
+            await db.commit()
+
+    async def delete_recording_by_id(self, recording_id: str):
+        """Supprime un enregistrement de la base par son ID stable."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM recordings WHERE recording_id = ?",
+                (recording_id,)
+            )
+            await db.commit()
+
+    async def delete_playback_position(self, recording_id: str):
+        """Supprime la position de lecture associée à un média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM playback_positions WHERE recording_id = ?",
+                (recording_id,)
             )
             await db.commit()
 
@@ -553,6 +648,72 @@ class Database:
 
         async with self._connect() as db:
             await db.execute("DELETE FROM chaturbate_auth WHERE id = 1")
+            await db.commit()
+
+    # ==========================================
+    # Generic Provider Sessions CRUD
+    # ==========================================
+
+    async def save_provider_session(
+        self,
+        source_type: str,
+        username: Optional[str] = None,
+        is_logged_in: bool = False,
+        session_cookies: Optional[str] = None,
+        local_storage: Optional[str] = None,
+        last_login_at: Optional[int] = None,
+        last_error: Optional[str] = None,
+    ) -> None:
+        await self.initialize()
+        source_type = (source_type or "").strip().lower()
+        if not source_type:
+            raise ValueError("source_type is required")
+        now = int(datetime.now().timestamp())
+        last_login_at = last_login_at if last_login_at is not None else (now if is_logged_in else None)
+
+        async with self._connect() as db:
+            await db.execute("""
+                INSERT INTO provider_sessions (
+                    source_type, username, is_logged_in, session_cookies,
+                    local_storage, last_login_at, last_error, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type) DO UPDATE SET
+                    username = COALESCE(?, username),
+                    is_logged_in = ?,
+                    session_cookies = COALESCE(?, session_cookies),
+                    local_storage = COALESCE(?, local_storage),
+                    last_login_at = COALESCE(?, last_login_at),
+                    last_error = ?,
+                    updated_at = ?
+            """, (
+                source_type, username, is_logged_in, session_cookies,
+                local_storage, last_login_at, last_error, now,
+                username, is_logged_in, session_cookies, local_storage,
+                last_login_at, last_error, now,
+            ))
+            await db.commit()
+
+    async def get_provider_session(self, source_type: str) -> Optional[Dict[str, Any]]:
+        await self.initialize()
+        source_type = (source_type or "").strip().lower()
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM provider_sessions WHERE source_type = ?",
+                (source_type,),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def clear_provider_session(self, source_type: str) -> None:
+        await self.initialize()
+        source_type = (source_type or "").strip().lower()
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM provider_sessions WHERE source_type = ?",
+                (source_type,),
+            )
             await db.commit()
 
     # ==========================================
@@ -690,7 +851,7 @@ class Database:
             where_clauses = ["1=1"]
             where_params = []
             if not show_ts:
-                where_clauses.append("(is_converted = 1 OR mp4_path IS NOT NULL)")
+                where_clauses.append("(media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL)")
             if username_filter:
                 where_clauses.append("username = ?")
                 where_params.append(username_filter)
@@ -713,10 +874,10 @@ class Database:
 
             # Total size - respects show_ts filter
             if show_ts:
-                size_sql = f"SELECT COALESCE(SUM(COALESCE(mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
+                size_sql = f"SELECT COALESCE(SUM(COALESCE(playable_size, mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
             else:
                 # When not showing TS, only sum MP4 sizes for converted, or file_size for those with mp4_path
-                size_sql = f"SELECT COALESCE(SUM(COALESCE(mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
+                size_sql = f"SELECT COALESCE(SUM(COALESCE(playable_size, mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
 
             cursor = await db.execute(size_sql, where_params)
             size_row = await cursor.fetchone()
@@ -879,12 +1040,12 @@ class Database:
             if show_ts:
                 where_clause = ""
             else:
-                where_clause = "WHERE is_converted = 1 OR mp4_path IS NOT NULL"
+                where_clause = "WHERE media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL"
             cursor = await db.execute(f"""
                 SELECT
                     username,
                     COUNT(*) as recording_count,
-                    COALESCE(SUM(COALESCE(mp4_size, file_size)), 0) as total_size,
+                    COALESCE(SUM(COALESCE(playable_size, mp4_size, file_size)), 0) as total_size,
                     MAX(created_at) as last_recording_at,
                     COALESCE(SUM(duration_seconds), 0) as total_duration
                 FROM recordings

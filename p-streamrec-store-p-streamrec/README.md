@@ -27,7 +27,7 @@ Compared to the standalone `docker-compose.yml` at the repo root, the Umbrel ver
 
 ## Configuration
 
-To set Chaturbate credentials, a `PASSWORD`, `AUTO_RECORD_USERS`, the optional DNS cache (`PSTREAMREC_DNS_CACHE=true`), or an outbound proxy (`PSTREAMREC_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`), edit the `environment:` section of `docker-compose.yml` in the installed app directory on your Umbrel (`~/umbrel/app-data/p-streamrec-store-p-streamrec/`) and restart the app from the UI.
+To set provider credentials, a `PASSWORD`, `AUTO_RECORD_USERS`, the optional DNS cache (`PSTREAMREC_DNS_CACHE=true`), Playwright browser capture settings (`PSTREAMREC_BROWSER_HEADLESS`, `PSTREAMREC_BROWSER_CAPTURE_TIMEOUT`), or an outbound proxy (`PSTREAMREC_PROXY_URL`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`), edit the `environment:` section of `docker-compose.yml` in the installed app directory on your Umbrel (`~/umbrel/app-data/p-streamrec-store-p-streamrec/`) and restart the app from the UI.
 
 ## Updating
 

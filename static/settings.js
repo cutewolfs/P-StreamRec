@@ -31,6 +31,9 @@ function initTabs() {
         runAllTests();
         testsLoaded = true;
       }
+      if (tabId === 'providers') {
+        loadProviders();
+      }
       if (tabId === 'processes') {
         startProcessesPolling();
       } else {
@@ -143,6 +146,135 @@ async function syncCam4Following() {
     }
   } catch (e) {
     showNotification('Network error: ' + e.message, 'error');
+  }
+}
+
+// ============================================
+// Generic provider sessions
+// ============================================
+
+async function loadProviders() {
+  var list = document.getElementById('providersList');
+  if (!list) return;
+  list.innerHTML = '<div class="proc-empty">Loading providers...</div>';
+  try {
+    var res = await fetch('/api/providers', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    var data = await res.json();
+    renderProviders(data.providers || []);
+  } catch (e) {
+    list.innerHTML = '<div class="proc-empty">Provider list unavailable</div>';
+  }
+}
+
+function renderProviders(providers) {
+  var list = document.getElementById('providersList');
+  if (!list) return;
+  if (!providers.length) {
+    list.innerHTML = '<div class="proc-empty">No providers configured.</div>';
+    return;
+  }
+
+  list.innerHTML = providers.map(function(provider) {
+    var source = provider.sourceType;
+    var status = provider.status || {};
+    var caps = provider.capabilities || {};
+    var connected = !!status.isLoggedIn;
+    var statusClass = connected ? 'connected' : 'disconnected';
+    var statusText = connected ? 'Connected' : 'Not Connected';
+    var username = status.username ? '<div class="provider-muted">' + escapeHtml(status.username) + '</div>' : '';
+    var usernamePlaceholder = 'Username';
+    var passwordPlaceholder = 'Password';
+    var loginForm = caps.can_login && !connected
+      ? '<form class="provider-login" onsubmit="loginProvider(event, \'' + escapeHtml(source) + '\')">' +
+          '<input type="text" id="provider-user-' + escapeHtml(source) + '" placeholder="' + usernamePlaceholder + '" autocomplete="username" />' +
+          '<input type="password" id="provider-pass-' + escapeHtml(source) + '" placeholder="' + passwordPlaceholder + '" autocomplete="current-password" />' +
+          '<button type="submit" class="btn-primary">Connect</button>' +
+        '</form>'
+      : '';
+    var actions = '';
+    if (connected) {
+      if (caps.can_sync_following) {
+        actions += '<button class="btn-primary" onclick="syncProviderFollowing(\'' + escapeHtml(source) + '\')">Sync</button>';
+      }
+      actions += '<button class="btn-secondary" onclick="logoutProvider(\'' + escapeHtml(source) + '\')">Disconnect</button>';
+    } else if (!caps.can_login) {
+      actions = '<span class="provider-muted">Public stream resolver only</span>';
+    }
+    var features = [];
+    if (caps.uses_ytdlp) features.push('yt-dlp');
+    if (caps.uses_browser) features.push('browser');
+    if (caps.can_follow) features.push('follow');
+    if (caps.can_discover) features.push('discover');
+
+    return '<div class="provider-card">' +
+      '<div class="provider-card-main">' +
+        '<div>' +
+          '<div class="provider-title">' + escapeHtml(provider.displayName || source) + '</div>' +
+          username +
+          '<div class="provider-muted">' + escapeHtml(features.join(' / ') || 'public live + record') + '</div>' +
+        '</div>' +
+        '<span class="status-indicator ' + statusClass + '">' + statusText + '</span>' +
+      '</div>' +
+      loginForm +
+      (actions ? '<div class="provider-actions">' + actions + '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+async function loginProvider(event, source) {
+  event.preventDefault();
+  var user = document.getElementById('provider-user-' + source);
+  var pass = document.getElementById('provider-pass-' + source);
+  var username = user ? user.value.trim() : '';
+  var password = pass ? pass.value : '';
+  if (!username || !password) {
+    showNotification('Please enter both username and password', 'error');
+    return;
+  }
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username, password: password })
+    });
+    var data = await res.json().catch(function(){ return {}; });
+    if (res.ok && data.success) {
+      showNotification('Provider connected', 'success');
+      await loadProviders();
+    } else {
+      showNotification(data.detail || data.error || 'Login failed', 'error');
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  }
+}
+
+async function logoutProvider(source) {
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/logout', { method: 'POST' });
+    if (res.ok) {
+      showNotification('Provider disconnected', 'success');
+      await loadProviders();
+    } else {
+      showNotification('Disconnect failed', 'error');
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  }
+}
+
+async function syncProviderFollowing(source) {
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/following/sync', { method: 'POST' });
+    var data = await res.json().catch(function(){ return {}; });
+    if (res.ok) {
+      showNotification(data.message || 'Provider sync complete', 'success');
+    } else {
+      showNotification(data.detail || 'Sync failed', 'error');
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
   }
 }
 
@@ -340,19 +472,28 @@ async function loadAppInfo() {
     var res = await fetch('/api/version');
     if (res.ok) {
       var data = await res.json();
-      document.getElementById('appVersionSetting').textContent = 'v' + (data.version || 'unknown');
+      setText('appVersionSetting', 'v' + (data.version || 'unknown'));
+      setText('settingsApiPill', 'Connected');
+      var apiDot = document.getElementById('settingsApiDot');
+      if (apiDot) apiDot.classList.remove('disconnected');
 
       if (data.output_dir || data.config) {
         var config = data.config || data;
-        if (config.output_dir) document.getElementById('outputDir').textContent = config.output_dir;
-        if (config.ffmpeg_path) document.getElementById('ffmpegPath').textContent = config.ffmpeg_path;
-        if (config.check_interval) document.getElementById('checkInterval').textContent = config.check_interval + 's';
+        if (config.output_dir) setText('outputDir', config.output_dir);
+        if (config.ffmpeg_path) setText('ffmpegPath', config.ffmpeg_path);
+        if (config.check_interval) setText('checkInterval', config.check_interval + 's');
       }
     }
   } catch (e) {
     console.error('Error loading app info:', e);
-    document.getElementById('apiStatus').className = 'status-indicator disconnected';
-    document.getElementById('apiStatus').textContent = 'Disconnected';
+    var statusEl = document.getElementById('apiStatus');
+    if (statusEl) {
+      statusEl.className = 'status-indicator disconnected';
+      statusEl.textContent = 'Disconnected';
+    }
+    setText('settingsApiPill', 'Disconnected');
+    var apiDot = document.getElementById('settingsApiDot');
+    if (apiDot) apiDot.classList.add('disconnected');
   }
 }
 
@@ -612,6 +753,17 @@ function formatNumber(num) {
   return num.toLocaleString();
 }
 
+function formatPercent(value) {
+  if (value == null || isNaN(value)) return '-';
+  var fixed = Math.abs(value % 1) > 0 ? value.toFixed(1) : value.toFixed(0);
+  return fixed + '%';
+}
+
+function setText(id, value) {
+  var el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
 function formatUptime(seconds) {
   if (!seconds) return '-';
   var d = Math.floor(seconds / 86400);
@@ -655,6 +807,17 @@ async function loadSystemStats() {
 }
 
 function renderStats(data) {
+  var updatedAt = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  setText('statsUpdatedAt', 'Updated ' + updatedAt);
+  setText('statsSummaryDisk', formatPercent(data.disk.percent));
+  setText('statsSummaryDiskSub', formatBytes(data.disk.free) + ' free');
+  setText('statsSummaryCpu', formatPercent(data.cpu.usage_percent));
+  setText('statsSummaryCpuSub', (data.cpu.cores_logical || 0) + ' logical cores');
+  setText('statsSummaryRam', formatPercent(data.ram.percent));
+  setText('statsSummaryRamSub', formatBytes(data.ram.available) + ' available');
+  setText('statsSummaryRec', data.sessions.active_count);
+  setText('statsSummaryRecSub', 'active now');
+
   // --- System Overview ---
   var el;
   el = document.getElementById('stat-uptime');
@@ -670,7 +833,7 @@ function renderStats(data) {
   var diskPct = data.disk.percent;
   setGauge('disk-gauge', diskPct, getGaugeColor(diskPct));
   el = document.getElementById('disk-gauge-text');
-  if (el) el.textContent = diskPct + '%';
+  if (el) el.textContent = formatPercent(diskPct);
   el = document.getElementById('disk-gauge-sub');
   if (el) el.textContent = formatBytes(data.disk.free) + ' free';
   el = document.getElementById('stat-disk-total');
@@ -684,7 +847,7 @@ function renderStats(data) {
   var cpuPct = data.cpu.usage_percent;
   setGauge('cpu-gauge', cpuPct, getGaugeColor(cpuPct));
   el = document.getElementById('cpu-gauge-text');
-  if (el) el.textContent = cpuPct.toFixed(1) + '%';
+  if (el) el.textContent = formatPercent(cpuPct);
   el = document.getElementById('cpu-gauge-sub');
   if (el) el.textContent = (data.cpu.cores_logical || 0) + ' cores';
   el = document.getElementById('stat-cpu-physical');
@@ -714,7 +877,7 @@ function renderStats(data) {
   var ramPct = data.ram.percent;
   setGauge('ram-gauge', ramPct, getGaugeColor(ramPct));
   el = document.getElementById('ram-gauge-text');
-  if (el) el.textContent = ramPct.toFixed(1) + '%';
+  if (el) el.textContent = formatPercent(ramPct);
   el = document.getElementById('ram-gauge-sub');
   if (el) el.textContent = formatBytes(data.ram.used) + ' used';
   el = document.getElementById('stat-ram-total');
@@ -1044,8 +1207,7 @@ window.addEventListener('DOMContentLoaded', function() {
   initTabs();
 
   // Load all data in parallel
-  checkChaturbateStatus();
-  checkCam4Status();
+  loadProviders();
   checkFlareSolverr();
   loadAppInfo();
   loadBlacklistedTags();

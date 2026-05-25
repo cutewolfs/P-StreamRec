@@ -21,6 +21,7 @@ let globalMaxResolution = 0;          // 0 = no global cap; otherwise pixel heig
 let globalDefaultResolution = 0;      // 0 = "best"; otherwise pixel height (used when enrolling new models)
 let globalDefaultRetention = 30;      // 0 = keep forever
 let recordingIsSeeking = false;
+let mediaImportsEnabled = false;
 
 // ============================================
 // Load recordings grouped by model
@@ -89,6 +90,71 @@ async function loadAllRecordings() {
     console.error('Error loading all recordings:', e);
   }
   return { recordings: [], total: 0, totalSize: 0 };
+}
+
+async function loadMediaImportStatus() {
+  try {
+    var res = await fetch('/api/media-imports/status');
+    if (!res.ok) return;
+    var data = await res.json();
+    mediaImportsEnabled = !!data.enabled;
+
+    var toolbar = document.getElementById('mediaImportToolbar');
+    var statusEl = document.getElementById('mediaImportStatus');
+    if (toolbar) toolbar.style.display = mediaImportsEnabled ? 'flex' : 'none';
+    if (statusEl && data.lastResult) {
+      statusEl.textContent = 'Last scan: ' + (data.lastResult.imported || 0) + ' imported, ' +
+        (data.lastResult.updated || 0) + ' updated, ' + (data.lastResult.failed || 0) + ' failed';
+    }
+  } catch (e) {
+    console.warn('Could not load media import status:', e);
+  }
+}
+
+async function reloadRecordingsPageData() {
+  var results = await Promise.all([loadRecordingsByModel(), loadAllRecordings()]);
+  var models = results[0];
+  var allData = results[1];
+  document.getElementById('totalRecordings').textContent = allData.total || 0;
+  document.getElementById('totalSize').textContent = allData.totalSizeFormatted || formatSize(allData.totalSize || 0);
+  document.getElementById('totalModels').textContent = models.length;
+  renderModelGrid(models);
+  if (currentDetailUser) {
+    showModelRecordings(currentDetailUser, currentDetailSourceType);
+  }
+}
+
+async function rescanMediaImports() {
+  var btn = document.getElementById('mediaImportRescanBtn');
+  var statusEl = document.getElementById('mediaImportStatus');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+  }
+  if (statusEl) statusEl.textContent = 'Scanning library...';
+
+  try {
+    var res = await fetch('/api/media-imports/rescan', { method: 'POST' });
+    var data = await res.json().catch(function(){ return {}; });
+    if (res.ok && data.enabled && data.success !== false) {
+      showNotification('Library scan complete', 'success');
+      if (statusEl) {
+        statusEl.textContent = 'Last scan: ' + (data.imported || 0) + ' imported, ' +
+          (data.updated || 0) + ' updated, ' + (data.failed || 0) + ' failed';
+      }
+      await reloadRecordingsPageData();
+    } else {
+      showNotification(data.message || 'Library scan unavailable', 'error');
+    }
+  } catch (e) {
+    console.error('Error rescanning media imports:', e);
+    showNotification('Connection error', 'error');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Rescan library';
+    }
+  }
 }
 
 // ============================================
@@ -225,9 +291,13 @@ async function showModelRecordings(username, sourceType) {
     list.innerHTML = recordings.map(function(rec) {
       var thumbUrl = rec.thumbnail || '/api/thumbnail/' + username;
       var recId = rec.recordingId || '';
+      var recUrl = rec.url || '';
+      var downloadUrl = rec.downloadUrl || rec.url || '';
+      var playable = rec.playable !== false && !!recUrl;
+      var displayTitle = rec.isImported ? (rec.title || rec.filename) : '';
       var pos = positions[recId];
       var resumeBadge = '';
-      if (pos && pos.position > 0 && pos.duration > 0) {
+      if (playable && pos && pos.position > 0 && pos.duration > 0) {
         var pct = Math.round((pos.position / pos.duration) * 100);
         resumeBadge = '<div class="resume-badge">Resume at ' + formatDuration(pos.position) + ' (' + pct + '%)</div>';
         resumeBadge += '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%"></div></div>';
@@ -236,21 +306,30 @@ async function showModelRecordings(username, sourceType) {
       // Badge conversion failure + bouton retry
       var failBadge = '';
       var retryBtn = '';
-      if (!rec.isConverted && (rec.conversionAttempts || 0) > 0) {
+      if (rec.isImported && rec.importStatus === 'failed') {
+        var importErr = rec.importError ? escapeHtml(rec.importError) : 'Import conversion failed';
+        failBadge = '<div class="conversion-fail-badge" title="' + importErr + '">&#9888; Download original only</div>';
+      } else if (!rec.isConverted && (rec.conversionAttempts || 0) > 0) {
         var errMsg = rec.conversionError ? escapeHtml(rec.conversionError) : 'Conversion failed';
         failBadge = '<div class="conversion-fail-badge" title="' + errMsg + '">&#9888; Conversion failed (' + rec.conversionAttempts + ')</div>';
         retryBtn = '<button class="rec-action-btn" onclick="event.stopPropagation(); retryConversion(\'' + escapeHtml(recId) + '\', this)" title="Retry conversion">&#8635;</button>';
       }
 
-      return '<div class="recording-item" onclick="playRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\', \'' + escapeHtml(recId) + '\')">' +
+      var clickAttr = playable ? ' onclick="playRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\', \'' + escapeHtml(recId) + '\', \'' + escapeHtml(recUrl) + '\', \'' + escapeHtml(displayTitle) + '\')"' : '';
+      var importBadge = rec.isImported ? '<span class="recording-badge">Imported</span>' : '';
+      var titleLine = displayTitle ? '<div class="recording-title">' + escapeHtml(displayTitle) + '</div>' : '';
+
+      return '<div class="recording-item' + (rec.isImported ? ' imported' : '') + '"' + clickAttr + '>' +
         '<div class="recording-item-thumb">' +
           '<img src="' + escapeHtml(thumbUrl) + '" alt="" loading="lazy" ' +
             'onerror="this.style.display=\'none\'" />' +
           '<span class="recording-duration">' + (rec.duration_str || formatDuration(rec.duration)) + '</span>' +
         '</div>' +
         '<div class="recording-item-info">' +
+          titleLine +
           '<div class="recording-date">' + formatDate(rec.createdAt) + '</div>' +
           '<div class="recording-meta">' +
+            importBadge +
             '<span>' + (rec.size_display || formatSize(rec.size)) + '</span>' +
           '</div>' +
           failBadge +
@@ -258,7 +337,7 @@ async function showModelRecordings(username, sourceType) {
         '</div>' +
         '<div class="recording-item-actions">' +
           retryBtn +
-          '<button class="rec-action-btn" onclick="event.stopPropagation(); downloadRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\')" title="Download">&#11015;</button>' +
+          '<button class="rec-action-btn" onclick="event.stopPropagation(); downloadRecording(\'' + escapeHtml(downloadUrl) + '\', \'' + escapeHtml(rec.filename) + '\')" title="Download">&#11015;</button>' +
           '<button class="rec-action-btn danger" onclick="event.stopPropagation(); deleteRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\', this)" title="Delete">&#128465;</button>' +
         '</div>' +
       '</div>';
@@ -519,8 +598,8 @@ function renderTimeline(username, recordings) {
       (function(r) {
         seg.addEventListener('click', function(ev) {
           ev.stopPropagation();
-          if (r.filename) {
-            playRecording(username, r.filename, r.recordingId || '');
+          if (r.filename && r.url && r.playable !== false) {
+            playRecording(username, r.filename, r.recordingId || '', r.url, r.title || '');
           }
         });
       })(rec);
@@ -841,7 +920,7 @@ function setupRecordingPlayerControls() {
 // ============================================
 // Play recording with resume support
 // ============================================
-async function playRecording(username, filename, recordingId) {
+async function playRecording(username, filename, recordingId, mediaUrl, displayTitle) {
   var modal = document.getElementById('playerModal');
   var video = document.getElementById('recordingPlayer');
   var title = document.getElementById('playerTitle');
@@ -851,13 +930,13 @@ async function playRecording(username, filename, recordingId) {
   currentPlayingUsername = username;
   currentPlayingFilename = filename;
 
-  title.textContent = username + ' - ' + filename;
+  title.textContent = username + ' - ' + (displayTitle || filename);
   modal.style.display = 'flex';
   modal.setAttribute('aria-hidden', 'false');
   document.body.classList.add('player-modal-open');
   updateRecordingPlayerControls();
 
-  var url = '/streams/records/' + encodeURIComponent(username) + '/' + encodeURIComponent(filename);
+  var url = mediaUrl || ('/streams/records/' + encodeURIComponent(username) + '/' + encodeURIComponent(filename));
 
   // Clean up previous player
   if (currentPlayer) {
@@ -1057,8 +1136,8 @@ async function retryConversion(recordingId, btn) {
 // ============================================
 // Download recording
 // ============================================
-function downloadRecording(username, filename) {
-  var url = '/streams/records/' + encodeURIComponent(username) + '/' + encodeURIComponent(filename);
+function downloadRecording(url, filename) {
+  if (!url) return;
   var a = document.createElement('a');
   a.href = url;
   a.download = filename;
@@ -1259,8 +1338,8 @@ window.addEventListener('DOMContentLoaded', function() {
 
   var loadingState = document.getElementById('loadingState');
 
-  // Load show_ts setting first, then load recordings
-  loadShowTsSetting().then(function() {
+  // Load show_ts/import settings first, then load recordings
+  Promise.all([loadShowTsSetting(), loadMediaImportStatus()]).then(function() {
     return Promise.all([loadRecordingsByModel(), loadAllRecordings()]);
   }).then(function(results) {
     var models = results[0];

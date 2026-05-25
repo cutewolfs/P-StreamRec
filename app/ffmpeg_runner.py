@@ -19,11 +19,13 @@ from .core.config import MIN_RECORDING_SECONDS
 _LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
 _TS_PACKET_SIZE = 188
 _CHATURBATE_HLS_HOST_SUFFIXES = ("chaturbate.com", "highwebmedia.com", "mmcdn.com")
+_STREAMATE_HLS_HOST_SUFFIXES = ("naiadsystems.com",)
 _CHATURBATE_HLS_HEADERS = (
     "Referer: https://chaturbate.com/\r\n"
     "Origin: https://chaturbate.com\r\n"
     "Connection: keep-alive\r\n"
 )
+_FINISHED_SESSION_GRACE_SECONDS = 300
 
 
 def _llhls_video_stream_index(max_height: Optional[int]) -> int:
@@ -47,6 +49,26 @@ def _is_chaturbate_hls_url(input_url: str) -> bool:
     )
 
 
+def _is_streamate_hls_url(input_url: str) -> bool:
+    try:
+        hostname = (urlparse(input_url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return False
+    return any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in _STREAMATE_HLS_HOST_SUFFIXES
+    )
+
+
+def _is_local_hls_proxy_url(input_url: str) -> bool:
+    try:
+        parsed = urlparse(input_url)
+    except Exception:
+        return False
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    return hostname in {"127.0.0.1", "localhost", "::1"} and parsed.path.startswith("/api/proxy/hls/")
+
+
 def _chaturbate_hls_input_args(input_url: str) -> List[str]:
     if not _is_chaturbate_hls_url(input_url):
         return []
@@ -58,29 +80,90 @@ def _chaturbate_hls_input_args(input_url: str) -> List[str]:
     ]
 
 
+def _headers_dict_to_ffmpeg(headers: Optional[Dict[str, str]]) -> str:
+    if not headers:
+        return ""
+    lines = []
+    for key, value in headers.items():
+        if not key or value is None:
+            continue
+        clean_key = str(key).replace("\r", "").replace("\n", "").strip()
+        clean_value = str(value).replace("\r", " ").replace("\n", " ").strip()
+        if not clean_key or ":" in clean_key:
+            continue
+        lines.append(f"{clean_key}: {clean_value}\r\n")
+    return "".join(lines)
+
+
+def _hls_input_args(input_url: str, input_headers: Optional[Dict[str, str]]) -> List[str]:
+    args: List[str] = [
+        "-allowed_extensions", "ALL",
+        "-allowed_segment_extensions", "ALL",
+        "-extension_picky", "0",
+    ]
+    is_chaturbate = _is_chaturbate_hls_url(input_url)
+    if is_chaturbate:
+        args.extend([
+            "-http_persistent", "1",
+            "-http_multiple", "0",
+            "-multiple_requests", "1",
+        ])
+
+    header_blob = _headers_dict_to_ffmpeg(input_headers)
+    if header_blob:
+        args.extend(["-headers", header_blob])
+    elif is_chaturbate:
+        args.extend(["-headers", _CHATURBATE_HLS_HEADERS])
+    return args
+
+
+def _redact_ffmpeg_command(cmd: List[str]) -> List[str]:
+    safe_cmd = []
+    redact_next = False
+    for part in cmd:
+        if redact_next:
+            safe_cmd.append("***")
+            redact_next = False
+            continue
+        safe_cmd.append(part)
+        if part in {"-http_proxy", "-headers"}:
+            redact_next = True
+    return safe_cmd
+
+
 def _build_ffmpeg_command(
     ffmpeg_path: str,
     input_url: str,
     tee_spec: str,
     max_height: Optional[int] = None,
+    input_headers: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     cmd = [
         ffmpeg_path,
         "-nostdin", "-hide_banner", "-loglevel", "warning",
         "-y",
-        # Options de reconnexion pour stabilité
-        "-reconnect", "1",
-        "-reconnect_at_eof", "1",
-        "-reconnect_on_network_error", "1",
-        # 403/404 generally mean an expired HLS token/segment. Retrying
-        # the same URL keeps a dead session around; let the monitor
-        # re-resolve instead. 5xx remains worth retrying briefly.
-        "-reconnect_on_http_error", "5xx",
-        "-reconnect_streamed", "1",
-        "-reconnect_delay_max", "10",
-        "-reconnect_delay_total_max", "120",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     ]
+
+    if not (_is_streamate_hls_url(input_url) or _is_local_hls_proxy_url(input_url)):
+        # Options de reconnexion pour stabilité. Streamate/NaiadSystems HLS
+        # and the local HLS proxy serve short-lived playlists/segments;
+        # reconnecting at EOF can stall with an empty recording.
+        cmd.extend([
+            "-reconnect", "1",
+            "-reconnect_at_eof", "1",
+            "-reconnect_on_network_error", "1",
+            # 403/404 generally mean an expired HLS token/segment. Retrying
+            # the same URL keeps a dead session around; let the monitor
+            # re-resolve instead. 5xx remains worth retrying briefly.
+            "-reconnect_on_http_error", "5xx",
+            "-reconnect_streamed", "1",
+            "-reconnect_delay_max", "10",
+            "-reconnect_delay_total_max", "120",
+        ])
+
+    cmd.extend([
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ])
 
     proxy_url = ffmpeg_http_proxy_url()
     if proxy_url:
@@ -91,7 +174,7 @@ def _build_ffmpeg_command(
             "mais FFmpeg ne supporte ici que les proxys HTTP(S)"
         )
 
-    cmd.extend(_chaturbate_hls_input_args(input_url))
+    cmd.extend(_hls_input_args(input_url, input_headers))
 
     # For Chaturbate LL-HLS master playlists, the master URL contains both
     # video variants and a separate audio rendition group. Passing only a
@@ -123,9 +206,11 @@ class FFmpegSession:
         display_name: Optional[str] = None,
         segment_duration_seconds: int = 0,
         segment_size_bytes: int = 0,
+        input_headers: Optional[Dict[str, str]] = None,
     ):
         self.id = session_id
         self.input_url = input_url
+        self.input_headers = dict(input_headers or {})
         self.sessions_dir = sessions_dir
         self.records_dir_for_person = records_dir_for_person
         self.person = person
@@ -154,6 +239,7 @@ class FFmpegSession:
         self.last_progress_at = self.start_time
         self.exit_returncode: Optional[int] = None
         self.completed_at: Optional[str] = None
+        self.completed_monotonic: Optional[float] = None
         
         logger.debug("FFmpegSession initialisée", 
                     session_id=session_id, 
@@ -392,16 +478,14 @@ class FFmpegSession:
             if self.process:
                 self.exit_returncode = self.process.poll()
             self.completed_at = datetime.utcnow().isoformat() + "Z"
+            self.completed_monotonic = time.time()
             self._cleanup_short_recording(total_bytes, elapsed)
 
     def _cleanup_short_recording(self, total_bytes: int, elapsed_seconds: float):
         """Remove startup failures and tiny fragments before they reach the UI."""
-        if total_bytes == 0:
-            reason = "empty"
-        elif elapsed_seconds < MIN_RECORDING_SECONDS:
-            reason = "too_short"
-        else:
+        if total_bytes > 0:
             return
+        reason = "empty"
 
         try:
             deleted_paths = []
@@ -464,6 +548,7 @@ class FFmpegManager:
         max_height: Optional[int] = None,
         segment_duration_seconds: int = 0,
         segment_size_bytes: int = 0,
+        input_headers: Optional[Dict[str, str]] = None,
     ) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
@@ -496,6 +581,7 @@ class FFmpegManager:
                 display_name=display_name,
                 segment_duration_seconds=segment_duration_seconds,
                 segment_size_bytes=segment_size_bytes,
+                input_headers=input_headers,
             )
 
             # Build tee spec: one branch to stdout (pipe:1) as MPEG-TS, one for HLS playback
@@ -515,18 +601,10 @@ class FFmpegManager:
                 sess.input_url,
                 tee_spec,
                 max_height=max_height,
+                input_headers=sess.input_headers,
             )
 
-            safe_cmd = []
-            redact_next = False
-            for part in cmd:
-                if redact_next:
-                    safe_cmd.append("***")
-                    redact_next = False
-                    continue
-                safe_cmd.append(part)
-                if part == "-http_proxy":
-                    redact_next = True
+            safe_cmd = _redact_ffmpeg_command(cmd)
 
             logger.debug("Construction commande FFmpeg",
                         session_id=session_id,
@@ -605,6 +683,9 @@ class FFmpegManager:
             sess.exit_returncode = sess.process.poll()
         if sess._writer_thread and sess._writer_thread.is_alive():
             sess._writer_thread.join(timeout=join_timeout)
+        if sess.completed_monotonic is None and sess.exit_returncode is not None:
+            sess.completed_monotonic = time.time()
+            sess.completed_at = sess.completed_at or (datetime.utcnow().isoformat() + "Z")
 
     def _prune_finished_locked(self) -> int:
         pruned = 0
@@ -612,6 +693,12 @@ class FFmpegManager:
             if sess.is_running():
                 continue
             self._finalize_session_locked(sess)
+            if (
+                sess.bytes_written > 0
+                and sess.completed_monotonic is not None
+                and time.time() - sess.completed_monotonic < _FINISHED_SESSION_GRACE_SECONDS
+            ):
+                continue
             self._sessions.pop(session_id, None)
             pruned += 1
             logger.info(

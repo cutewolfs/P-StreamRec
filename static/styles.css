@@ -157,12 +157,38 @@ body::before {
   font-weight: 500;
   transition: all var(--transition-normal);
   cursor: default;
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.75rem;
+  position: relative;
 }
 
 .version:hover {
   background: rgba(99, 102, 241, 0.25);
   border-color: rgba(99, 102, 241, 0.5);
   transform: translateY(-1px);
+}
+
+.version.has-update {
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.version-update-dot {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: #f59e0b;
+  border: 2px solid var(--bg-secondary);
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.22);
+}
+
+.version-update-dot[hidden] {
+  display: none;
 }
 
 .header-right {
@@ -1144,6 +1170,22 @@ button {
   opacity: 0.5;
 }
 
+.empty-message .empty-detail {
+  max-width: 620px;
+  margin-top: 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.empty-message .empty-action {
+  margin-top: 1.25rem;
+  padding: 0.75rem 1.2rem;
+  border-radius: 8px;
+  font-size: 0.92rem;
+}
+
 /* Model page specific */
 .model-title {
   font-size: 1.25rem;
@@ -1566,6 +1608,10 @@ button {
   color: var(--text-primary);
 }
 
+.source-select {
+  min-width: 150px;
+}
+
 .discover-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
@@ -1585,6 +1631,24 @@ button {
   transform: translateY(-6px);
   box-shadow: var(--shadow-lg), var(--shadow-glow);
   border-color: var(--accent);
+}
+
+.discover-card.is-discover-only {
+  opacity: 0.72;
+}
+
+.discover-card.is-discover-only:hover {
+  transform: none;
+  box-shadow: none;
+  border-color: var(--border);
+}
+
+.discover-card.is-discover-only .discover-card-thumb {
+  cursor: default;
+}
+
+.discover-card.is-discover-only .discover-card-thumb img {
+  filter: grayscale(0.2);
 }
 
 .discover-card-thumb {
@@ -1627,6 +1691,20 @@ button {
   border-radius: 6px;
   font-size: 0.75rem;
   color: var(--text-secondary);
+}
+
+.discover-stream-status {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 0.75rem;
+  background: rgba(148, 27, 27, 0.88);
+  backdrop-filter: blur(8px);
+  padding: 0.3rem 0.65rem;
+  border-radius: 6px;
+  font-size: 0.72rem;
+  color: white;
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
 .discover-card-info {
@@ -3007,6 +3085,32 @@ button {
   color: var(--text-secondary);
 }
 
+.watch-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.55rem;
+}
+
+.watch-tag {
+  display: inline-flex;
+  align-items: center;
+  max-width: 14rem;
+  min-height: 1.6rem;
+  padding: 0.25rem 0.55rem;
+  border: 1px solid rgba(139, 92, 246, 0.35);
+  border-radius: 8px;
+  background: rgba(139, 92, 246, 0.12);
+  color: #c4b5fd;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .watch-info-right {
   display: flex;
   gap: 0.75rem;
@@ -3241,7 +3345,7 @@ button {
   border-radius: 6px;
   font-size: 0.7rem;
   font-weight: 700;
-  letter-spacing: 0.3px;
+  letter-spacing: 0;
   color: white;
   background: rgba(0, 0, 0, 0.75);
   backdrop-filter: blur(6px);
@@ -3260,6 +3364,77 @@ button {
 .platform-badge.platform-cam4 {
   background: linear-gradient(135deg, #00b050 0%, #008f40 100%);
   border-color: rgba(255, 255, 255, 0.25);
+}
+
+.platform-badge.platform-stripchat { background: #d946ef; }
+.platform-badge.platform-bongacams { background: #dc2626; }
+.platform-badge.platform-myfreecams { background: #2563eb; }
+.platform-badge.platform-livejasmin { background: #be185d; }
+.platform-badge.platform-camsoda { background: #16a34a; }
+.platform-badge.platform-streamate { background: #7c3aed; }
+.platform-badge.platform-flirt4free { background: #ea580c; }
+.platform-badge.platform-cams { background: #0891b2; }
+.platform-badge.platform-xcams { background: #475569; }
+
+.provider-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1rem;
+}
+
+.provider-card {
+  background: var(--bg-glass);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.provider-card-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.provider-title {
+  color: var(--text-primary);
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.provider-muted {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+.provider-login {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+.provider-login input {
+  min-width: 0;
+  padding: 0.55rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
+.provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+@media (max-width: 680px) {
+  .provider-login {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Cœur follow/unfollow sur les cartes Discover */
@@ -3440,6 +3615,40 @@ button {
   color: var(--text-secondary);
 }
 
+.media-import-toolbar {
+  max-width: 900px;
+  margin: 0 auto 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.media-import-rescan-btn {
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border-radius: 8px;
+  padding: 0.55rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.media-import-rescan-btn:hover {
+  border-color: var(--accent);
+  background: var(--bg-card-hover);
+}
+
+.media-import-rescan-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.media-import-status {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+}
+
 /* Recording Item */
 .recording-item {
   display: flex;
@@ -3457,6 +3666,10 @@ button {
 .recording-item:hover {
   background: var(--bg-card-hover);
   border-color: var(--accent);
+}
+
+.recording-item:not([onclick]) {
+  cursor: default;
 }
 
 .recording-item-thumb {
@@ -3502,6 +3715,31 @@ button {
 .recording-meta {
   font-size: 0.8rem;
   color: var(--text-muted);
+}
+
+.recording-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.15rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.recording-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.12rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.12);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.24);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 0.35rem;
 }
 
 .resume-badge {

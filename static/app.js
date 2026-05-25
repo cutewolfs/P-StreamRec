@@ -22,6 +22,25 @@ function renderPlatformBadge(sourceType) {
 
 // Store previous model statuses for change detection
 let previousModelStatuses = {};
+let availableProviders = [];
+
+const PROVIDER_LABELS = {
+  chaturbate: 'Chaturbate',
+  cam4: 'CAM4',
+  stripchat: 'Stripchat',
+  bongacams: 'BongaCams',
+  myfreecams: 'MyFreeCams',
+  livejasmin: 'LiveJasmin',
+  camsoda: 'CamSoda',
+  streamate: 'Streamate',
+  flirt4free: 'Flirt4Free',
+  cams: 'Cams.com',
+  xcams: 'Xcams'
+};
+
+function labelForProvider(sourceType) {
+  return PROVIDER_LABELS[(sourceType || '').toLowerCase()] || sourceType || 'Provider';
+}
 
 // Save models cache
 function saveModelsCache(models) {
@@ -87,21 +106,54 @@ async function getModels() {
   return [];
 }
 
-// Extract username from Chaturbate URL
-function extractUsername(url) {
-  if (!url) return null;
+async function loadProviderSelect() {
+  const select = document.getElementById('modelSource');
+  if (!select) return;
+  try {
+    const res = await fetch('/api/providers');
+    if (!res.ok) return;
+    const data = await res.json();
+    availableProviders = data.providers || [];
+    if (!availableProviders.length) return;
+    const current = select.value || 'chaturbate';
+    select.innerHTML = availableProviders.map(provider => {
+      const value = provider.sourceType;
+      return `<option value="${value}">${provider.displayName || labelForProvider(value)}</option>`;
+    }).join('');
+    select.value = availableProviders.some(provider => provider.sourceType === current) ? current : 'chaturbate';
+  } catch (e) {
+    console.debug('Provider list unavailable:', e);
+  }
+}
+
+// Extract username from a supported provider URL or plain username.
+function extractUsername(input, sourceType = 'chaturbate') {
+  if (!input) return null;
+  const raw = input.trim();
   
   // If it's just a username
-  if (!url.includes('/') && !url.includes('.')) {
-    return url.toLowerCase().trim();
+  if (!raw.includes('/') && !raw.includes('.')) {
+    return raw.toLowerCase();
   }
-  
-  // Extract from chaturbate.com/username URL
-  const match = url.match(/chaturbate\.com\/([a-zA-Z0-9_-]+)/);
-  if (match) {
-    return match[1].toLowerCase().trim();
+
+  try {
+    const parsed = new URL(raw);
+    if (sourceType === 'myfreecams' && parsed.hash) {
+      return parsed.hash.replace(/^#\/?/, '').split(/[/?#]/)[0].toLowerCase();
+    }
+    const parts = parsed.pathname.split('/').filter(Boolean);
+    const ignored = new Set(['en', 'girls', 'chat', 'cam', 'models', 'live', 'search']);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      let part = decodeURIComponent(parts[i]).replace(/\.html?$/i, '');
+      if (part && !ignored.has(part.toLowerCase())) {
+        return part.toLowerCase();
+      }
+    }
+  } catch (e) {
+    const match = raw.match(/\/([a-zA-Z0-9_-]+)\/?$/);
+    if (match) return match[1].toLowerCase();
   }
-  
+
   return null;
 }
 
@@ -118,6 +170,7 @@ function normalizeRetentionDays(value, fallback) {
 async function openAddModal() {
   document.getElementById('addModal').classList.add('active');
   document.getElementById('modelUrl').value = '';
+  await loadProviderSelect();
   document.getElementById('recordQuality').value = 'best';
   document.getElementById('retentionDays').value = '30';
   document.getElementById('autoRecord').checked = true;
@@ -146,7 +199,8 @@ async function addModel(event) {
   event.preventDefault();
   
   const url = document.getElementById('modelUrl').value.trim();
-  const username = extractUsername(url);
+  const sourceType = (document.getElementById('modelSource').value || 'chaturbate').toLowerCase();
+  const username = extractUsername(url, sourceType);
   const quality = document.getElementById('recordQuality').value;
   const retentionDays = normalizeRetentionDays(document.getElementById('retentionDays').value, 30);
   const autoRecord = document.getElementById('autoRecord').checked;
@@ -165,6 +219,7 @@ async function addModel(event) {
       },
       body: JSON.stringify({
         username: username,
+        sourceType: sourceType,
         addedAt: new Date().toISOString(),
         recordQuality: quality,
         retentionDays: retentionDays,
@@ -183,7 +238,7 @@ async function addModel(event) {
     }
     
     closeAddModal();
-    showNotification(`${username} added successfully!`, 'success');
+    showNotification(`${username} added to ${labelForProvider(sourceType)}!`, 'success');
     
     // Clear cache to force reload from server
     localStorage.removeItem('dashboard_cache');
@@ -749,6 +804,7 @@ window.addEventListener('DOMContentLoaded', () => {
   // Internal notifications only (browser notifications disabled)
   
   // Display models
+  loadProviderSelect();
   renderModels();
   
   // Update statuses every 30 seconds (backend monitor polls every 60s anyway)

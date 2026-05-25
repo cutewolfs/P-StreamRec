@@ -412,8 +412,8 @@
     }
   </style>
   <script src="/static/loader.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
   <script defer src="/static/app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -492,15 +492,31 @@
   <!-- Modal to add a model -->
   <div class="modal" id="addModal">
     <div class="modal-content">
-      <h2 class="modal-header">Add Chaturbate Model</h2>
+      <h2 class="modal-header">Add Model</h2>
       <form onsubmit="addModel(event)">
         <div class="form-group">
-          <label for="modelUrl">Chaturbate URL</label>
+          <label for="modelSource">Source</label>
+          <select id="modelSource" style="width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-card); color: var(--text-primary); font-size: 1rem;">
+            <option value="chaturbate">Chaturbate</option>
+            <option value="cam4">CAM4</option>
+            <option value="stripchat">Stripchat</option>
+            <option value="bongacams">BongaCams</option>
+            <option value="myfreecams">MyFreeCams</option>
+            <option value="livejasmin">LiveJasmin</option>
+            <option value="camsoda">CamSoda</option>
+            <option value="streamate">Streamate</option>
+            <option value="flirt4free">Flirt4Free</option>
+            <option value="cams">Cams.com</option>
+            <option value="xcams">Xcams</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label for="modelUrl">Username or profile URL</label>
           <input 
             type="text" 
             id="modelUrl"
  
-            placeholder="https://chaturbate.com/username/" 
+            placeholder="username or https://site.example/username"
             required
           />
         </div>

@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/discover.js?v=4"></script>
+  <script defer src="/static/discover.js?v=7"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -20,6 +20,9 @@
         <span class="search-icon">&#128269;</span>
         <input type="text" class="search-input" id="searchInput" placeholder="Search models..." autocomplete="off" />
       </div>
+      <select class="sort-select source-select" id="sourceFilter" aria-label="Source">
+        <option value="">All sources</option>
+      </select>
       <div class="filter-pills" id="genderFilters">
         <button class="filter-pill active" data-gender="" onclick="setGender('', this)">All</button>
         <button class="filter-pill" data-gender="female" onclick="setGender('female', this)">Female</button>

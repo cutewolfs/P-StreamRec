@@ -1,0 +1,216 @@
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+
+from app import main as app_main
+from app.core.database import Database
+from app.tasks import media_imports
+from app.tasks.media_imports import MediaImportManager, scan_media_imports
+
+
+class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.tmpdir.name)
+        self.db = Database(self.output_dir / "streamrec.db")
+        await self.db.initialize()
+
+    async def asyncTearDown(self):
+        self.tmpdir.cleanup()
+
+    def write_old_file(self, relative_path: str, data: bytes = b"video") -> Path:
+        path = self.output_dir / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        old = time.time() - 120
+        os.utime(path, (old, old))
+        return path
+
+    async def test_scan_imports_direct_mp4_and_creates_profile(self):
+        source = self.write_old_file("records/new_profile/paid_clip.mp4")
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=123)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["imported"], 1)
+        model = await self.db.get_model("new_profile")
+        self.assertIsNotNone(model)
+        self.assertFalse(bool(model["auto_record"]))
+
+        recs = await self.db.get_recordings("new_profile")
+        self.assertEqual(len(recs), 1)
+        rec = recs[0]
+        self.assertEqual(rec["media_kind"], "import")
+        self.assertEqual(rec["title"], "paid clip")
+        self.assertEqual(rec["file_path"], str(source))
+        self.assertEqual(rec["playable_path"], str(source))
+        self.assertTrue(bool(rec["protected_from_retention"]))
+        self.assertEqual(rec["duration_seconds"], 123)
+
+    async def test_rescan_is_idempotent_and_removes_missing_sources(self):
+        source = self.write_old_file("records/model/clip.mp4")
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=10)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+        ):
+            first = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+            second = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(first["imported"], 1)
+        self.assertEqual(second["skipped"], 1)
+        self.assertEqual(len(await self.db.get_recordings("model")), 1)
+
+        source.unlink()
+        cleanup = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+        self.assertEqual(cleanup["removed"], 1)
+        self.assertEqual(await self.db.get_recordings("model"), [])
+
+    async def test_scan_skips_recent_and_temp_files(self):
+        recent = self.output_dir / "records/model/recent.mp4"
+        recent.parent.mkdir(parents=True, exist_ok=True)
+        recent.write_bytes(b"video")
+        self.write_old_file("records/model/file.mp4.tmp")
+
+        result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["filesSeen"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(await self.db.get_recordings("model"), [])
+
+    async def test_mkv_import_uses_playable_mp4_copy(self):
+        source = self.write_old_file("records/model/bonus_clip.mkv")
+        converted = self.output_dir / "media_imports/model/import_test.mp4"
+        converted.parent.mkdir(parents=True, exist_ok=True)
+        converted.write_bytes(b"mp4")
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=90)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+            patch.object(
+                media_imports,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(True, converted, None)),
+            ),
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["imported"], 1)
+        rec = (await self.db.get_recordings("model"))[0]
+        self.assertEqual(rec["file_path"], str(source))
+        self.assertEqual(rec["playable_path"], str(converted))
+        self.assertEqual(rec["mp4_path"], str(converted))
+        self.assertEqual(rec["import_status"], "ready")
+
+
+class MediaImportApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.original_db = app_main.db
+        self.original_output_dir = app_main.OUTPUT_DIR
+        self.original_enabled = app_main.MEDIA_IMPORTS_ENABLED
+        self.original_manager = app_main.media_import_manager
+
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.output_dir = Path(self.tmpdir.name)
+        app_main.OUTPUT_DIR = self.output_dir
+        app_main.db = Database(self.output_dir / "streamrec.db")
+        app_main.MEDIA_IMPORTS_ENABLED = True
+        app_main.media_import_manager = MediaImportManager(app_main.db, self.output_dir, "ffmpeg")
+        await app_main.db.initialize()
+
+        self.source = self.output_dir / "records/model/imported.mp4"
+        self.source.parent.mkdir(parents=True, exist_ok=True)
+        self.source.write_bytes(b"0123456789")
+        old = time.time() - 120
+        os.utime(self.source, (old, old))
+
+        await app_main.db.add_or_update_model(
+            username="model",
+            display_name="model",
+            auto_record=False,
+            retention_days=0,
+        )
+        await app_main.db.add_or_update_recording(
+            username="model",
+            filename="imported.mp4",
+            file_path=str(self.source),
+            file_size=self.source.stat().st_size,
+            recording_id="import_test",
+            duration_seconds=10,
+            playable_path=str(self.source),
+            playable_size=self.source.stat().st_size,
+            is_converted=True,
+            media_kind="import",
+            title="Imported",
+            import_status="ready",
+            protected_from_retention=True,
+            created_at=int(old),
+        )
+        self.client = TestClient(app_main.app)
+
+    async def asyncTearDown(self):
+        app_main.db = self.original_db
+        app_main.OUTPUT_DIR = self.original_output_dir
+        app_main.MEDIA_IMPORTS_ENABLED = self.original_enabled
+        app_main.media_import_manager = self.original_manager
+        self.tmpdir.cleanup()
+
+    async def test_status_rescan_listing_stream_and_delete(self):
+        status = self.client.get("/api/media-imports/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertTrue(status.json()["enabled"])
+
+        app_main.media_import_manager.scan = AsyncMock(return_value={"success": True, "imported": 0})
+        rescan = self.client.post("/api/media-imports/rescan")
+        self.assertEqual(rescan.status_code, 200)
+        self.assertTrue(rescan.json()["success"])
+
+        listing = self.client.get("/api/recordings/model")
+        self.assertEqual(listing.status_code, 200)
+        item = listing.json()["recordings"][0]
+        self.assertTrue(item["isImported"])
+        self.assertEqual(item["url"], "/streams/media/import_test")
+        self.assertEqual(item["downloadUrl"], "/streams/media/import_test?download=1")
+
+        ranged = self.client.get(
+            "/streams/media/import_test",
+            headers={"Range": "bytes=0-3"},
+        )
+        self.assertEqual(ranged.status_code, 206)
+        self.assertEqual(ranged.content, b"0123")
+        self.assertEqual(ranged.headers["content-range"], "bytes 0-3/10")
+
+        await app_main.db.set_setting("auto_delete_watched", "true")
+        position = self.client.post(
+            "/api/playback-position/import_test",
+            json={"username": "model", "position": 10, "duration": 10},
+        )
+        self.assertEqual(position.status_code, 200)
+        self.assertFalse(position.json()["autoDelete"])
+
+        deleted = self.client.delete("/api/recordings/model/imported.mp4")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertFalse(self.source.exists())
+        self.assertEqual(await app_main.db.get_recordings("model"), [])
+
+    async def test_status_disabled_when_feature_flag_is_off(self):
+        app_main.MEDIA_IMPORTS_ENABLED = False
+        status = self.client.get("/api/media-imports/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertFalse(status.json()["enabled"])
+
+        rescan = self.client.post("/api/media-imports/rescan")
+        self.assertEqual(rescan.status_code, 200)
+        self.assertFalse(rescan.json()["success"])
+
+
+if __name__ == "__main__":
+    unittest.main()

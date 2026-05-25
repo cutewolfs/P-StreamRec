@@ -4,7 +4,7 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
 [![Open Source](https://img.shields.io/badge/Open%20Source-Yes-green.svg)](https://github.com/raccommode/P-StreamRec)
 
-**Watch, record, and follow live cam streams (Chaturbate, CAM4) + any m3u8 source — with a modern web interface.**
+**Watch, record, and follow live cam streams across integrated providers + any m3u8 source — with a modern web interface.**
 
 ## Features
 
@@ -12,11 +12,11 @@
 - **Recording segmentation** — optionally split captures by 30/60/90 minutes or by maximum file size
 - **Auto MP4 conversion** — converts TS to compressed MP4 in background (50-70% smaller)
 - **Discover** — browse live models from every supported site with gender, tag, and search filters
-- **Following** — one list aggregating your follows across Chaturbate and CAM4
+- **Following** — one list aggregating your follows across providers
 - **Recordings** — manage all recordings with built-in video player
 - **Live Watch** — watch streams directly in the browser with HLS player
-- **Account login** — username/password for Chaturbate and CAM4 (better stream quality + follow sync)
-- **FlareSolverr** — automatic Cloudflare bypass via dedicated container
+- **Account login** — provider sessions are stored as cookies/localStorage, never passwords
+- **Protected providers** — Playwright browser capture plus yt-dlp extractors for JS/Cloudflare-heavy sites
 - **Settings** — manage accounts, FlareSolverr status, tag blacklist
 - **Password protection** — optional login to secure the interface
 - **GitOps updates** — update the app directly from the UI
@@ -24,18 +24,21 @@
 
 ## Supported sites
 
-| Site | Watch | Record | Follow |
-|------|:-----:|:------:|:------:|
-| **Chaturbate** | ✅ | ✅ | ✅ |
-| **CAM4** | ✅ | ✅ | ✅ |
+| Site | Discover | Watch | Record | Follow |
+|------|:--------:|:-----:|:------:|:------:|
+| **Chaturbate** | ✅ | ✅ | ✅ | ✅ |
+| **CAM4** | ✅ | ✅ | ✅ | ✅ |
+| Stripchat | ✅ | ✅ | ✅ | Local |
+| BongaCams | ✅ | ✅ | ✅ | Local |
+| MyFreeCams | ✅ | ✅ | ✅ | Local |
+| LiveJasmin | ✅ | ✅ | ✅ | Local |
+| CamSoda | ✅ | ✅ | ✅ | Local |
+| Streamate | ✅ | ✅ | ✅ | Local |
+| Flirt4Free | ✅ | ✅ | ✅ | Local |
+| Cams.com | ✅ | ✅ | ✅ | Local |
+| Xcams | ✅ | ✅ | ✅ | Local |
 
-### Coming soon
-
-| Site | Watch | Record | Follow |
-|------|:-----:|:------:|:------:|
-| Stripchat | ⏳ | ⏳ | ⏳ |
-| BongaCams | ⏳ | ⏳ | ⏳ |
-| MyFreeCams | ⏳ | ⏳ | ⏳ |
+New providers expose Discover through provider-specific browse/search pages, then resolve public live HLS/DASH streams through yt-dlp or the integrated Playwright browser. Follow is local unless the provider exposes a compatible authenticated follow API.
 
 ## Screenshots
 
@@ -104,6 +107,8 @@ docker run -d --name p-streamrec \
 | `CB_RESOLVER_ENABLED` | `true` | Enable Chaturbate support |
 | `PSTREAMREC_DNS_CACHE` | `false` | Enable a container-local DNS cache for FFmpeg/HLS lookups |
 | `PSTREAMREC_DNS_CACHE_UPSTREAMS` | — | Optional comma-separated upstream DNS servers for the local DNS cache |
+| `PSTREAMREC_BROWSER_HEADLESS` | `true` | Run the integrated Playwright browser headless |
+| `PSTREAMREC_BROWSER_CAPTURE_TIMEOUT` | `25` | Seconds to capture HLS/DASH requests from browser-protected providers |
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |
 | `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
@@ -131,7 +136,7 @@ or your preferred upstream servers to avoid a resolver loop.
 
 ## Usage
 
-1. **Add a model** — click **+**, enter a Chaturbate username or m3u8 URL
+1. **Add a model** — click **+**, choose a source, then enter a username or profile URL
 2. **Auto-record** — the system checks every 2 minutes and records when live
 3. **Auto-convert** — when the stream ends, TS is converted to MP4 automatically
 4. **Watch live** — click a model card to open the live player

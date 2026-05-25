@@ -1,13 +1,13 @@
 manifestVersion: 1
 id: p-streamrec-store-p-streamrec
 name: P-StreamRec
-tagline: Watch, record & follow live cam streams — Chaturbate, CAM4, m3u8
+tagline: Watch, record & follow public live cam streams
 icon: https://raw.githubusercontent.com/raccommode/P-StreamRec/main/p-streamrec-store-p-streamrec/icon.svg
 category: media
 version: "2026.21.3"
 port: 8080
 description: >-
-  P-StreamRec is a self-hosted recorder for Chaturbate, CAM4 and any m3u8/HLS live stream, with a modern web interface.
+  P-StreamRec is a self-hosted recorder for supported public live cam providers and any m3u8/HLS live stream, with a modern web interface.
 
 
   Supported sites:
@@ -16,9 +16,11 @@ description: >-
 
   - CAM4 — watch, record, follow
 
-  - Any m3u8 / HLS URL — watch, record
+  - Stripchat, BongaCams, CamSoda — discover, watch and record via yt-dlp, with browser fallback
 
-  - Coming soon: Stripchat, BongaCams, MyFreeCams
+  - MyFreeCams, LiveJasmin, Streamate, Flirt4Free, Cams.com, Xcams — discover, watch and record via integrated browser capture
+
+  - Any m3u8 / HLS URL — watch, record
 
 
   Features:
@@ -29,15 +31,15 @@ description: >-
 
   - Discover — browse live models from every supported site with gender, tag, and search filters
 
-  - Following — one aggregated list across Chaturbate and CAM4 accounts
+  - Following — one aggregated list across providers
 
   - Recordings — manage all recordings with a built-in video player
 
   - Live Watch — watch streams directly in the browser with HLS.js
 
-  - FlareSolverr bundled — automatic Cloudflare bypass
+  - Playwright browser runtime bundled for protected providers
 
-  - Password protection and optional Chaturbate / CAM4 login for better stream quality
+  - Password protection and optional provider login for better stream access
 
 
   Built with FastAPI, SQLite, HLS.js and FFmpeg. All data stays on your Umbrel.

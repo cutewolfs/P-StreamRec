@@ -647,12 +647,16 @@
       try {
         const res = await fetch('/api/version');
         const data = await res.json();
+        const versionTextEl = document.getElementById('appVersionText');
         const versionEl = document.getElementById('appVersion');
-        if (versionEl) versionEl.textContent = `v${data.version}`;
+        if (versionTextEl) versionTextEl.textContent = `v${data.version}`;
+        else if (versionEl) versionEl.textContent = `v${data.version}`;
       } catch (e) {
         console.error('Error loading version:', e);
+        const versionTextEl = document.getElementById('appVersionText');
         const versionEl = document.getElementById('appVersion');
-        if (versionEl) versionEl.textContent = 'v?.?.?';
+        if (versionTextEl) versionTextEl.textContent = 'v?.?.?';
+        else if (versionEl) versionEl.textContent = 'v?.?.?';
       }
     })();
   </script>
