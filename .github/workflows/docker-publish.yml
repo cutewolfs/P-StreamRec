@@ -22,13 +22,6 @@ jobs:
       - name: Compute version (YEAR.WEEK.N)
         id: version
         run: |
-          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
-            VERSION="beta"
-            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-            echo "Computed beta image tag: $VERSION"
-            exit 0
-          fi
-
           YEAR=$(date -u +%Y)
           WEEK=$(date -u +%V)
           # Remove leading zero for clean version number
@@ -42,6 +35,9 @@ jobs:
 
           N=$(( LATEST + 1 ))
           VERSION="${PREFIX}.${N}"
+          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
+            VERSION="${VERSION}-beta"
+          fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Computed version: $VERSION"
@@ -69,6 +65,7 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=raw,value=beta,enable=${{ github.ref_name == 'beta' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
