@@ -14,6 +14,10 @@ from typing import Dict, Optional
 from .core.config import MIN_RECORDING_SECONDS
 from .logger import logger
 from .providers.browser import DEFAULT_USER_AGENT
+from .recording_names import (
+    FILENAME_FORMAT_TIMESTAMP,
+    recording_base_name,
+)
 
 
 def _decode_base64_payload(raw: str) -> bytes:
@@ -44,6 +48,7 @@ class BrowserCaptureSession:
         record: bool = True,
         browser_root: Optional[Path] = None,
         file_extension: str = "webm",
+        filename_format: str = FILENAME_FORMAT_TIMESTAMP,
     ):
         self.id = session_id
         self.source_type = source_type
@@ -55,11 +60,15 @@ class BrowserCaptureSession:
         self.record = bool(record)
         self.browser_root = browser_root
         self.file_extension = (file_extension or "webm").strip(".").lower() or "webm"
+        self.filename_format = filename_format
         self.created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         self.start_time = time.time()
         self.start_date = datetime.now().strftime("%Y-%m-%d")
         self.start_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.record_filename = f"{self.start_timestamp}_{session_id[:6]}.{self.file_extension}"
+        self.record_base = self._unique_record_base(
+            recording_base_name(person, self.start_timestamp, session_id, filename_format)
+        )
+        self.record_filename = f"{self.record_base}.{self.file_extension}"
         self.record_path = str(records_dir_for_person / self.record_filename)
         self.playback_url = f"/streams/browser/{self.id}/live.{self.file_extension}"
         self.bytes_written = 0
@@ -73,6 +82,12 @@ class BrowserCaptureSession:
         self._thread: Optional[threading.Thread] = None
         self._subscribers: list[queue.Queue[bytes]] = []
         self._first_chunk: Optional[bytes] = None
+
+    def _unique_record_base(self, base: str) -> str:
+        first_path = self.records_dir_for_person / f"{base}.{self.file_extension}"
+        if not first_path.exists():
+            return base
+        return f"{base}_{self.id[:6]}"
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -438,6 +453,7 @@ class BrowserCaptureManager:
         display_name: Optional[str] = None,
         record: bool = True,
         capture_mode: str = "media_recorder",
+        filename_format: str = FILENAME_FORMAT_TIMESTAMP,
     ) -> BrowserCaptureSession:
         with self._lock:
             self._prune_finished_locked()
@@ -471,6 +487,7 @@ class BrowserCaptureManager:
                 display_name=display_name,
                 record=record,
                 browser_root=None,
+                filename_format=filename_format,
             )
             session.capture_mode = (capture_mode or "media_recorder").strip().lower()
             self._sessions[session_id] = session

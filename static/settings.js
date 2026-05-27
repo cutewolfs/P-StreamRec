@@ -527,6 +527,7 @@ async function loadRecordingSettings() {
       var defaultRetentionInput = document.getElementById('defaultRetentionInput');
       var segmentDurationSelect = document.getElementById('segmentDurationSelect');
       var segmentSizeInput = document.getElementById('segmentSizeInput');
+      var filenameFormatSelect = document.getElementById('filenameFormatSelect');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
       if (keepTsToggle) keepTsToggle.checked = !!data.keep_ts;
@@ -556,6 +557,9 @@ async function loadRecordingSettings() {
       }
       if (segmentSizeInput) {
         segmentSizeInput.value = normalizeSegmentSizeMb(data.segment_size_mb);
+      }
+      if (filenameFormatSelect) {
+        filenameFormatSelect.value = data.filename_format || 'timestamp';
       }
     }
   } catch (e) {

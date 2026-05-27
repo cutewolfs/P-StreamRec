@@ -2,7 +2,9 @@ import queue
 import inspect
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from app.browser_recorder import (
     BrowserCaptureSession,
@@ -10,6 +12,13 @@ from app.browser_recorder import (
     _decode_base64_payload,
     _looks_like_mp4_fragment,
 )
+
+
+class FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 5, 27, 12, 34, 56)
+        return value if tz is None else value.replace(tzinfo=tz)
 
 
 class BrowserCaptureSessionTests(unittest.TestCase):
@@ -84,6 +93,44 @@ class BrowserCaptureSessionTests(unittest.TestCase):
             self.assertTrue(session.record_filename.endswith(".mp4"))
             self.assertTrue(session.record_path.endswith(".mp4"))
             self.assertEqual("/streams/browser/abc123/live.mp4", session.playback_url)
+
+    def test_username_timestamp_filename_applies_to_browser_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("app.browser_recorder.datetime", FixedDatetime):
+                session = BrowserCaptureSession(
+                    session_id="abc123",
+                    source_type="xcams",
+                    page_url="https://www.xcams.com/chat/model",
+                    sessions_dir=root / "sessions" / "abc123",
+                    records_dir_for_person=root / "records" / "model",
+                    person="model",
+                    record=True,
+                    filename_format="username_timestamp",
+                )
+
+        self.assertEqual("model_20260527-123456.webm", session.record_filename)
+
+    def test_username_timestamp_browser_capture_collision_adds_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records" / "model"
+            records.mkdir(parents=True)
+            (records / "model_20260527-123456.webm").write_bytes(b"existing")
+
+            with patch("app.browser_recorder.datetime", FixedDatetime):
+                session = BrowserCaptureSession(
+                    session_id="abc123",
+                    source_type="xcams",
+                    page_url="https://www.xcams.com/chat/model",
+                    sessions_dir=root / "sessions" / "abc123",
+                    records_dir_for_person=records,
+                    person="model",
+                    record=True,
+                    filename_format="username_timestamp",
+                )
+
+        self.assertEqual("model_20260527-123456_abc123.webm", session.record_filename)
 
 
 if __name__ == "__main__":

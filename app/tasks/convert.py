@@ -2,8 +2,8 @@
 Tâche de conversion automatique des enregistrements TS -> MP4
 """
 import asyncio
+import json
 import time
-import subprocess
 from pathlib import Path
 from typing import Optional
 from ..logger import logger
@@ -12,6 +12,60 @@ from ..core.config import AUTO_CONVERT, KEEP_TS, MIN_RECORDING_BYTES, MIN_RECORD
 # Nombre maximal de tentatives de conversion avant skip automatique
 MAX_CONVERSION_ATTEMPTS = 3
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
+
+
+def _video_stream_map_from_probe(probe_data: dict) -> str:
+    streams = probe_data.get("streams") if isinstance(probe_data, dict) else None
+    if not isinstance(streams, list) or not streams:
+        return "0:v:0"
+
+    def numeric(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked = sorted(
+        enumerate(streams),
+        key=lambda item: (
+            numeric(item[1].get("height")),
+            numeric(item[1].get("width")),
+            numeric(item[1].get("bit_rate")),
+        ),
+        reverse=True,
+    )
+    return f"0:v:{ranked[0][0]}"
+
+
+async def _best_video_stream_map(ts_path: Path, ffmpeg_path: str) -> str:
+    ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    try:
+        process = await asyncio.create_subprocess_exec(
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v",
+            "-show_entries",
+            "stream=width,height,bit_rate",
+            "-of",
+            "json",
+            str(ts_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            logger.debug(
+                "ffprobe video stream selection failed",
+                ts_file=ts_path.name,
+                error=(stderr or b"").decode("utf-8", "replace")[:300],
+            )
+            return "0:v:0"
+        return _video_stream_map_from_probe(json.loads(stdout.decode("utf-8") or "{}"))
+    except Exception as exc:
+        logger.debug("ffprobe video stream selection unavailable", ts_file=ts_path.name, error=str(exc))
+        return "0:v:0"
 
 
 async def convert_ts_to_mp4(
@@ -41,12 +95,13 @@ async def convert_ts_to_mp4(
     # produces a valid MP4 almost instantly with near-zero CPU usage. Keep a
     # conventional video-then-audio stream order for broad player compatibility.
     # -bsf:a aac_adtstoasc : reformat ADTS AAC (TS) into MP4-friendly ASC
+    video_map = await _best_video_stream_map(ts_path, ffmpeg_path)
     cmd = [
         ffmpeg_path,
         "-nostdin", "-hide_banner", "-loglevel", "error",
         "-fflags", "+genpts+igndts",
         "-i", str(ts_path),
-        "-map", "0:v:0",
+        "-map", video_map,
         "-map", "0:a:0?",
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",

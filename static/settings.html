@@ -344,6 +344,16 @@
               </div>
               <div class="settings-row">
                 <div>
+                  <span class="settings-row-label">Recording Filename Format</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Applies to new recordings only.</p>
+                </div>
+                <select id="filenameFormatSelect" onchange="updateRecordingSetting('filename_format', this.value)" style="padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;">
+                  <option value="timestamp">Timestamp + session id</option>
+                  <option value="username_timestamp">Username + timestamp</option>
+                </select>
+              </div>
+              <div class="settings-row">
+                <div>
                   <span class="settings-row-label">Default Retention</span>
                   <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Days assigned to newly tracked models. Use 0 to keep recordings forever.</p>
                 </div>
