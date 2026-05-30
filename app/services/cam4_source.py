@@ -8,8 +8,10 @@ le PluginManager).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -45,6 +47,10 @@ class CAM4ResolveError(CAM4Error):
 
 
 class CAM4StatusError(CAM4Error):
+    pass
+
+
+class CAM4FollowingError(CAM4Error):
     pass
 
 
@@ -323,6 +329,54 @@ async def _fetch_html(
         return None
 
 
+def _is_followed_page_html(html: str, final_url: str) -> bool:
+    final_url = (final_url or "").lower()
+    html = html or ""
+    html_lower = html.lower()
+    if "error-no-profile" in final_url or "error-no-profile" in html_lower:
+        return False
+    if "/login" in final_url or "loginform" in html_lower:
+        return False
+    if "/friends_favorites" in final_url:
+        return True
+    return "friends_favorites" in html or "pages-friendsFavorites" in html or "BroadcastItem:" in html
+
+
+async def _fetch_followed_html(cookies: Dict[str, str]) -> str:
+    headers = {
+        "User-Agent": _DEFAULT_UA,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    url = "https://www.cam4.com/friends_favorites?showOfflineBroadcasters=true"
+    try:
+        async with aiohttp_client_session(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                final_url = str(resp.url)
+                if resp.status in {401, 403}:
+                    raise CAM4FollowingError("CAM4 session expirée")
+                if resp.status != 200:
+                    raise CAM4FollowingError(f"CAM4 favorites HTTP {resp.status}")
+                html = await resp.text()
+    except CAM4FollowingError:
+        raise
+    except asyncio.TimeoutError as exc:
+        raise CAM4FollowingError("Timeout CAM4 favorites") from exc
+    except Exception as exc:
+        raise CAM4FollowingError(f"Échec CAM4 favorites: {exc}") from exc
+
+    if not _is_followed_page_html(html, final_url):
+        raise CAM4FollowingError("CAM4 favorites page invalide ou session expirée")
+    return html
+
+
 async def _fetch_stream_info(
     username: str, user_agent: str = _DEFAULT_UA
 ) -> Dict[str, Any]:
@@ -478,13 +532,8 @@ async def list_followed(cookies: Dict[str, str]) -> List[Dict[str, Any]]:
     `showOfflineBroadcasters=true` inclut les favoris offline.
     """
     if not cookies:
-        return []
-    html = await _fetch_html(
-        "https://www.cam4.com/friends_favorites?showOfflineBroadcasters=true",
-        cookies=cookies,
-    )
-    if not html:
-        return []
+        raise CAM4FollowingError("CAM4 session absente")
+    html = await _fetch_followed_html(cookies)
     return _parse_broadcasts(html)
 
 
@@ -494,6 +543,7 @@ async def list_followed(cookies: Dict[str, str]) -> List[Dict[str, Any]]:
 
 
 _FAVORITE_URL = "https://www.cam4.com/rest/v1.0/favorites/{username}/{performerName}"
+_ADD_FAVORITE_URL = "https://www.cam4.com/profiles/addFriendFavorite"
 
 
 async def _favorite_request(
@@ -509,9 +559,11 @@ async def _favorite_request(
     headers = {
         "User-Agent": _DEFAULT_UA,
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://www.cam4.com",
         "Referer": f"https://www.cam4.com/{target}",
         "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+        "X-Requested-With": "XMLHttpRequest",
     }
     # POST/DELETE exigent un Content-Type et un body vide — sans ça CAM4
     # renvoie 415 Unsupported Media Type.
@@ -528,6 +580,37 @@ async def _favorite_request(
             allow_redirects=False,
             **aiohttp_request_kwargs(),
             **kwargs
+        ) as resp:
+            body = await resp.text()
+            return resp.status, body
+
+
+async def _add_favorite_request(
+    target: str,
+    cookies: Dict[str, str],
+) -> tuple[int, str]:
+    headers = {
+        "User-Agent": _DEFAULT_UA,
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://www.cam4.com",
+        "Referer": f"https://www.cam4.com/{target}",
+        "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    params = {
+        "action": "addFavorite",
+        "object": target.strip(),
+        "_": str(int(time.time() * 1000)),
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp_client_session(timeout=timeout) as session:
+        async with session.post(
+            _ADD_FAVORITE_URL,
+            params=params,
+            headers=headers,
+            allow_redirects=False,
+            **aiohttp_request_kwargs(),
         ) as resp:
             body = await resp.text()
             return resp.status, body
@@ -574,7 +657,7 @@ async def follow(
     if not cookies or not auth_username:
         return {"success": False, "error": "CAM4 session absente"}
     try:
-        status, body = await _favorite_request("POST", auth_username, target, cookies)
+        status, body = await _add_favorite_request(target, cookies)
     except Exception as e:
         return {"success": False, "error": f"Erreur réseau: {e}"}
     if status in (200, 201, 204):

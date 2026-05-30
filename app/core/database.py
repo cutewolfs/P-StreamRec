@@ -16,6 +16,10 @@ class Database:
         self.db_path = db_path
         self._initialized = False
 
+    @staticmethod
+    def _normalize_source_type(source_type: Optional[str]) -> str:
+        return (source_type or "").strip().lower() or "chaturbate"
+
     def _connect(self):
         """Ouvre une connexion aiosqlite avec timeout de verrou.
 
@@ -47,7 +51,7 @@ class Database:
             # Table pour les modèles et leur statut
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS models (
-                    username TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
                     display_name TEXT,
                     is_online BOOLEAN DEFAULT 0,
                     is_recording BOOLEAN DEFAULT 0,
@@ -58,8 +62,34 @@ class Database:
                     auto_record BOOLEAN DEFAULT 1,
                     record_quality TEXT DEFAULT 'best',
                     retention_days INTEGER DEFAULT 30,
-                    source_type TEXT DEFAULT 'chaturbate',
+                    source_type TEXT NOT NULL DEFAULT 'chaturbate',
                     room_status TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    PRIMARY KEY(username, source_type)
+                )
+            """)
+
+            # Fiches locales enrichies pour la médiathèque. Ces informations
+            # restent séparées des réglages de stream dans models.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS media_profiles (
+                    username TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    age INTEGER,
+                    address TEXT,
+                    city TEXT,
+                    region TEXT,
+                    postal_code TEXT,
+                    country TEXT,
+                    aliases TEXT,
+                    tags TEXT,
+                    notes TEXT,
+                    social_urls TEXT,
+                    stream_urls TEXT,
+                    profile_urls TEXT,
                     created_at INTEGER,
                     updated_at INTEGER
                 )
@@ -111,15 +141,16 @@ class Database:
             # Table pour les modèles suivis sur Chaturbate
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS followed_models (
-                    username TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
                     display_name TEXT,
                     is_online BOOLEAN DEFAULT 0,
                     viewers INTEGER DEFAULT 0,
                     thumbnail_url TEXT,
                     last_seen_online_at INTEGER,
                     synced_at INTEGER,
-                    source_type TEXT DEFAULT 'chaturbate',
-                    room_status TEXT
+                    source_type TEXT NOT NULL DEFAULT 'chaturbate',
+                    room_status TEXT,
+                    PRIMARY KEY(username, source_type)
                 )
             """)
 
@@ -160,8 +191,8 @@ class Database:
                 )
             """)
 
-            # Sessions generiques par provider: cookies/localStorage seulement,
-            # jamais les mots de passe.
+            # Sessions generiques par provider. Credentials are local-only and
+            # allow reconnect retries after provider sessions expire.
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS provider_sessions (
                     source_type TEXT PRIMARY KEY,
@@ -169,6 +200,9 @@ class Database:
                     is_logged_in BOOLEAN DEFAULT 0,
                     session_cookies TEXT,
                     local_storage TEXT,
+                    credential_username TEXT,
+                    credential_password TEXT,
+                    credentials_updated_at INTEGER,
                     last_login_at INTEGER,
                     last_error TEXT,
                     updated_at INTEGER
@@ -182,12 +216,23 @@ class Database:
             """)
 
             await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_models_source_username
+                ON models(source_type, username)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_followed_source_username
+                ON followed_models(source_type, username)
+            """)
+
+            await db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_recordings_username
                 ON recordings(username, created_at DESC)
             """)
 
             # Migrations idempotentes pour schémas existants
             await self._migrate_schema(db)
+            await self._migrate_provider_identity_keys(db)
 
             await db.commit()
 
@@ -212,6 +257,9 @@ class Database:
             ("models", "room_status", "TEXT"),
             ("followed_models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("followed_models", "room_status", "TEXT"),
+            ("provider_sessions", "credential_username", "TEXT"),
+            ("provider_sessions", "credential_password", "TEXT"),
+            ("provider_sessions", "credentials_updated_at", "INTEGER"),
         ]
         for table, column, ddl in migrations:
             try:
@@ -220,6 +268,118 @@ class Database:
             except Exception:
                 # La colonne existe déjà - SQLite lève "duplicate column"
                 pass
+
+    async def _migrate_provider_identity_keys(self, db):
+        """Upgrade legacy username-only tables to provider-aware identities."""
+
+        async def table_pk_columns(table: str) -> list[str]:
+            cursor = await db.execute(f"PRAGMA table_info({table})")
+            rows = await cursor.fetchall()
+            return [
+                row[1]
+                for row in sorted(
+                    [row for row in rows if int(row[5] or 0) > 0],
+                    key=lambda item: int(item[5] or 0),
+                )
+            ]
+
+        async def rebuild_models() -> None:
+            await db.execute("ALTER TABLE models RENAME TO models_legacy_provider_identity")
+            await db.execute("""
+                CREATE TABLE models (
+                    username TEXT NOT NULL,
+                    display_name TEXT,
+                    is_online BOOLEAN DEFAULT 0,
+                    is_recording BOOLEAN DEFAULT 0,
+                    viewers INTEGER DEFAULT 0,
+                    thumbnail_path TEXT,
+                    thumbnail_updated_at INTEGER,
+                    last_check_at INTEGER,
+                    auto_record BOOLEAN DEFAULT 1,
+                    record_quality TEXT DEFAULT 'best',
+                    retention_days INTEGER DEFAULT 30,
+                    source_type TEXT NOT NULL DEFAULT 'chaturbate',
+                    room_status TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    PRIMARY KEY(username, source_type)
+                )
+            """)
+            await db.execute("""
+                INSERT OR REPLACE INTO models (
+                    username, display_name, is_online, is_recording, viewers,
+                    thumbnail_path, thumbnail_updated_at, last_check_at,
+                    auto_record, record_quality, retention_days, source_type,
+                    room_status, created_at, updated_at
+                )
+                SELECT
+                    username, display_name, is_online, is_recording, viewers,
+                    thumbnail_path, thumbnail_updated_at, last_check_at,
+                    auto_record, record_quality, retention_days,
+                    COALESCE(NULLIF(source_type, ''), 'chaturbate'),
+                    room_status, created_at, updated_at
+                FROM models_legacy_provider_identity
+                WHERE username IS NOT NULL AND username != ''
+            """)
+            await db.execute("DROP TABLE models_legacy_provider_identity")
+
+        async def rebuild_followed() -> None:
+            await db.execute("ALTER TABLE followed_models RENAME TO followed_models_legacy_provider_identity")
+            await db.execute("""
+                CREATE TABLE followed_models (
+                    username TEXT NOT NULL,
+                    display_name TEXT,
+                    is_online BOOLEAN DEFAULT 0,
+                    viewers INTEGER DEFAULT 0,
+                    thumbnail_url TEXT,
+                    last_seen_online_at INTEGER,
+                    synced_at INTEGER,
+                    source_type TEXT NOT NULL DEFAULT 'chaturbate',
+                    room_status TEXT,
+                    PRIMARY KEY(username, source_type)
+                )
+            """)
+            await db.execute("""
+                INSERT OR REPLACE INTO followed_models (
+                    username, display_name, is_online, viewers, thumbnail_url,
+                    last_seen_online_at, synced_at, source_type, room_status
+                )
+                SELECT
+                    username, display_name, is_online, viewers, thumbnail_url,
+                    last_seen_online_at, synced_at,
+                    COALESCE(NULLIF(source_type, ''), 'chaturbate'),
+                    room_status
+                FROM followed_models_legacy_provider_identity
+                WHERE username IS NOT NULL AND username != ''
+            """)
+            await db.execute("DROP TABLE followed_models_legacy_provider_identity")
+
+        try:
+            if await table_pk_columns("models") != ["username", "source_type"]:
+                await rebuild_models()
+                logger.info("Migration: models utilise username+source_type")
+        except Exception as exc:
+            logger.warning("Migration provider-aware models échouée", error=str(exc))
+
+        try:
+            if await table_pk_columns("followed_models") != ["username", "source_type"]:
+                await rebuild_followed()
+                logger.info("Migration: followed_models utilise username+source_type")
+        except Exception as exc:
+            logger.warning("Migration provider-aware followed_models échouée", error=str(exc))
+
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_models_online
+            ON models(is_online, username)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_models_source_username
+            ON models(source_type, username)
+        """)
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_followed_source_username
+            ON followed_models(source_type, username)
+        """)
     
     async def add_or_update_model(
         self, 
@@ -234,7 +394,7 @@ class Database:
         await self.initialize()
         
         now = int(datetime.now().timestamp())
-        source_type = (source_type or "").strip().lower() or None
+        source_type = self._normalize_source_type(source_type)
         
         async with self._connect() as db:
             await db.execute("""
@@ -243,17 +403,16 @@ class Database:
                     retention_days, source_type, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO UPDATE SET
+                ON CONFLICT(username, source_type) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     auto_record = ?,
                     record_quality = ?,
                     retention_days = ?,
-                    source_type = COALESCE(?, source_type),
                     updated_at = ?
             """, (
                 username, display_name, auto_record, record_quality,
-                retention_days, source_type or "chaturbate", now, now,
-                display_name, auto_record, record_quality, retention_days, source_type, now
+                retention_days, source_type, now, now,
+                display_name, auto_record, record_quality, retention_days, now
             ))
             await db.commit()
         
@@ -296,6 +455,7 @@ class Database:
         is_recording: bool = False,
         thumbnail_path: Optional[str] = None,
         room_status: Optional[str] = None,
+        source_type: Optional[str] = None,
     ):
         """Met à jour le statut d'un modèle"""
         await self.initialize()
@@ -318,23 +478,42 @@ class Database:
 
             placeholders = ', '.join(f"{k} = ?" for k in update_fields.keys())
             values = list(update_fields.values()) + [username]
-
-            await db.execute(
-                f"UPDATE models SET {placeholders} WHERE username = ?",
-                values
-            )
+            if source_type:
+                values.append(self._normalize_source_type(source_type))
+                await db.execute(
+                    f"UPDATE models SET {placeholders} WHERE username = ? AND source_type = ?",
+                    values,
+                )
+            else:
+                await db.execute(
+                    f"UPDATE models SET {placeholders} WHERE username = ?",
+                    values,
+                )
             await db.commit()
     
-    async def get_model(self, username: str) -> Optional[Dict[str, Any]]:
+    async def get_model(
+        self, username: str, source_type: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """Récupère les informations d'un modèle"""
         await self.initialize()
         
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM models WHERE username = ?",
-                (username,)
-            )
+            if source_type:
+                cursor = await db.execute(
+                    "SELECT * FROM models WHERE username = ? AND source_type = ?",
+                    (username, self._normalize_source_type(source_type)),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT * FROM models
+                    WHERE username = ?
+                    ORDER BY CASE WHEN source_type = 'chaturbate' THEN 0 ELSE 1 END, source_type
+                    LIMIT 1
+                    """,
+                    (username,),
+                )
             row = await cursor.fetchone()
             
             if row:
@@ -365,15 +544,190 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
     
-    async def delete_model(self, username: str):
+    async def delete_model(self, username: str, source_type: Optional[str] = None):
         """Supprime un modèle"""
         await self.initialize()
         
         async with self._connect() as db:
-            await db.execute("DELETE FROM models WHERE username = ?", (username,))
+            if source_type:
+                await db.execute(
+                    "DELETE FROM models WHERE username = ? AND source_type = ?",
+                    (username, self._normalize_source_type(source_type)),
+                )
+            else:
+                await db.execute("DELETE FROM models WHERE username = ?", (username,))
             await db.commit()
         
-        logger.info("Modèle supprimé", username=username)
+        logger.info("Modèle supprimé", username=username, source_type=source_type)
+
+    @staticmethod
+    def _json_list(value: Any) -> str:
+        if value is None:
+            return "[]"
+        if isinstance(value, str):
+            values = [line.strip() for line in value.splitlines() if line.strip()]
+        elif isinstance(value, list):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            values = []
+        return json.dumps(values, ensure_ascii=False)
+
+    @staticmethod
+    def _decode_json_list(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        try:
+            decoded = json.loads(value)
+            if isinstance(decoded, list):
+                return [str(item) for item in decoded if str(item).strip()]
+        except Exception:
+            pass
+        return [line.strip() for line in str(value).splitlines() if line.strip()]
+
+    def _format_media_profile_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(row)
+        data["social_urls"] = self._decode_json_list(data.get("social_urls"))
+        data["stream_urls"] = self._decode_json_list(data.get("stream_urls"))
+        data["profile_urls"] = self._decode_json_list(data.get("profile_urls"))
+        return data
+
+    async def get_media_profile(self, username: str) -> Optional[Dict[str, Any]]:
+        """Récupère la fiche locale d'un profil média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM media_profiles WHERE username = ? LIMIT 1",
+                (username,),
+            )
+            row = await cursor.fetchone()
+            return self._format_media_profile_row(dict(row)) if row else None
+
+    async def get_all_media_profiles(self) -> List[Dict[str, Any]]:
+        """Récupère toutes les fiches locales média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM media_profiles ORDER BY username")
+            rows = await cursor.fetchall()
+            return [self._format_media_profile_row(dict(row)) for row in rows]
+
+    async def upsert_media_profile(self, username: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Crée ou met à jour les informations enrichies d'un profil média."""
+        await self.initialize()
+
+        now = int(datetime.now().timestamp())
+        age = data.get("age")
+        try:
+            age = int(age) if age not in (None, "") else None
+        except (TypeError, ValueError):
+            age = None
+
+        payload = {
+            "display_name": data.get("display_name"),
+            "first_name": data.get("first_name"),
+            "last_name": data.get("last_name"),
+            "age": age,
+            "address": data.get("address"),
+            "city": data.get("city"),
+            "region": data.get("region"),
+            "postal_code": data.get("postal_code"),
+            "country": data.get("country"),
+            "aliases": data.get("aliases"),
+            "tags": data.get("tags"),
+            "notes": data.get("notes"),
+            "social_urls": self._json_list(data.get("social_urls")),
+            "stream_urls": self._json_list(data.get("stream_urls")),
+            "profile_urls": self._json_list(data.get("profile_urls")),
+        }
+
+        async with self._connect() as db:
+            await db.execute("""
+                INSERT INTO media_profiles (
+                    username, display_name, first_name, last_name, age,
+                    address, city, region, postal_code, country,
+                    aliases, tags, notes, social_urls, stream_urls, profile_urls,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    display_name = ?,
+                    first_name = ?,
+                    last_name = ?,
+                    age = ?,
+                    address = ?,
+                    city = ?,
+                    region = ?,
+                    postal_code = ?,
+                    country = ?,
+                    aliases = ?,
+                    tags = ?,
+                    notes = ?,
+                    social_urls = ?,
+                    stream_urls = ?,
+                    profile_urls = ?,
+                    updated_at = ?
+            """, (
+                username,
+                payload["display_name"],
+                payload["first_name"],
+                payload["last_name"],
+                payload["age"],
+                payload["address"],
+                payload["city"],
+                payload["region"],
+                payload["postal_code"],
+                payload["country"],
+                payload["aliases"],
+                payload["tags"],
+                payload["notes"],
+                payload["social_urls"],
+                payload["stream_urls"],
+                payload["profile_urls"],
+                now,
+                now,
+                payload["display_name"],
+                payload["first_name"],
+                payload["last_name"],
+                payload["age"],
+                payload["address"],
+                payload["city"],
+                payload["region"],
+                payload["postal_code"],
+                payload["country"],
+                payload["aliases"],
+                payload["tags"],
+                payload["notes"],
+                payload["social_urls"],
+                payload["stream_urls"],
+                payload["profile_urls"],
+                now,
+            ))
+            await db.commit()
+
+        profile = await self.get_media_profile(username)
+        return profile or {"username": username}
+
+    async def delete_media_profile(self, username: str) -> None:
+        """Supprime la fiche locale d'un profil média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            await db.execute("DELETE FROM media_profiles WHERE username = ?", (username,))
+            await db.commit()
+
+    async def delete_recordings_for_username(self, username: str) -> int:
+        """Supprime tous les enregistrements DB associés à un profil."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            cursor = await db.execute("DELETE FROM recordings WHERE username = ?", (username,))
+            await db.commit()
+            return cursor.rowcount or 0
 
     async def update_all_models_retention_days(self, retention_days: int) -> int:
         """Apply one retention window to every tracked model."""
@@ -683,7 +1037,7 @@ class Database:
                     is_logged_in = ?,
                     session_cookies = COALESCE(?, session_cookies),
                     local_storage = COALESCE(?, local_storage),
-                    last_login_at = COALESCE(?, last_login_at),
+                    last_login_at = ?,
                     last_error = ?,
                     updated_at = ?
             """, (
@@ -691,6 +1045,40 @@ class Database:
                 local_storage, last_login_at, last_error, now,
                 username, is_logged_in, session_cookies, local_storage,
                 last_login_at, last_error, now,
+            ))
+            await db.commit()
+
+    async def save_provider_credentials(
+        self,
+        source_type: str,
+        username: str,
+        password: str,
+    ) -> None:
+        await self.initialize()
+        source_type = (source_type or "").strip().lower()
+        username = (username or "").strip()
+        if not source_type:
+            raise ValueError("source_type is required")
+        if not username:
+            raise ValueError("username is required")
+        now = int(datetime.now().timestamp())
+
+        async with self._connect() as db:
+            await db.execute("""
+                INSERT INTO provider_sessions (
+                    source_type, username, credential_username,
+                    credential_password, credentials_updated_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_type) DO UPDATE SET
+                    username = ?,
+                    credential_username = ?,
+                    credential_password = ?,
+                    credentials_updated_at = ?,
+                    updated_at = ?
+            """, (
+                source_type, username, username, password, now, now,
+                username, username, password, now, now,
             ))
             await db.commit()
 
@@ -733,6 +1121,7 @@ class Database:
         """Add or update a followed model"""
         await self.initialize()
         now = int(datetime.now().timestamp())
+        source_type = self._normalize_source_type(source_type)
 
         async with self._connect() as db:
             await db.execute("""
@@ -742,21 +1131,20 @@ class Database:
                     room_status
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO UPDATE SET
+                ON CONFLICT(username, source_type) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     is_online = ?,
                     viewers = ?,
                     thumbnail_url = COALESCE(?, thumbnail_url),
                     last_seen_online_at = CASE WHEN ? THEN ? ELSE last_seen_online_at END,
                     synced_at = ?,
-                    source_type = ?,
                     room_status = ?
             """, (
                 username, display_name, is_online, viewers,
                 thumbnail_url, now if is_online else None, now, source_type,
                 room_status,
                 display_name, is_online, viewers, thumbnail_url,
-                is_online, now, now, source_type, room_status,
+                is_online, now, now, room_status,
             ))
             await db.commit()
 
@@ -772,17 +1160,30 @@ class Database:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
-    async def get_followed_model(self, username: str) -> Optional[Dict[str, Any]]:
-        """Récupère un followed_model par username (sans filtre source_type).
+    async def get_followed_model(
+        self, username: str, source_type: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Récupère un followed_model par username et source_type optionnel.
         Utilisé pour résoudre la plateforme d'un modèle qui n'est pas dans
         `tracked_models` mais dans la liste des favoris."""
         await self.initialize()
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                "SELECT * FROM followed_models WHERE username = ? LIMIT 1",
-                (username,),
-            )
+            if source_type:
+                cursor = await db.execute(
+                    "SELECT * FROM followed_models WHERE username = ? AND source_type = ? LIMIT 1",
+                    (username, self._normalize_source_type(source_type)),
+                )
+            else:
+                cursor = await db.execute(
+                    """
+                    SELECT * FROM followed_models
+                    WHERE username = ?
+                    ORDER BY CASE WHEN source_type = 'chaturbate' THEN 0 ELSE 1 END, source_type
+                    LIMIT 1
+                    """,
+                    (username,),
+                )
             row = await cursor.fetchone()
             return dict(row) if row else None
 
@@ -804,7 +1205,7 @@ class Database:
             if source_type:
                 await db.execute(
                     "DELETE FROM followed_models WHERE username = ? AND source_type = ?",
-                    (username, source_type),
+                    (username, self._normalize_source_type(source_type)),
                 )
             else:
                 await db.execute(
@@ -819,6 +1220,7 @@ class Database:
         """Remove followed models no longer in the followed list (scoped par
         source_type pour ne pas toucher les autres sources)."""
         await self.initialize()
+        source_type = self._normalize_source_type(source_type)
 
         async with self._connect() as db:
             cursor = await db.execute(

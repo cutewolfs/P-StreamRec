@@ -19,10 +19,14 @@ let isModelTracked = false;
 let profilePlaybackVolume = null;
 let volumeSaveTimeout = null;
 let hlsPlayer = null;
+let ivsPlayer = null;
+let ivsPlayerLoadPromise = null;
 let streamLoaded = false;
 let currentStreamUrl = '';
+let currentStreamType = '';
 let statusCheckInterval = null;
 let streamProblemStatusTimeout = null;
+let streamStartPromise = null;
 
 function sourceQuery() {
   return currentSourceType ? ('?source=' + encodeURIComponent(currentSourceType)) : '';
@@ -266,19 +270,57 @@ function formatPrivateText(rs) {
   return 'The model is in a private session.';
 }
 
+function showStreamLoading() {
+  var offlineOverlay = document.getElementById('offlineOverlay');
+  var offlineIcon = document.getElementById('offlineIcon');
+  var offlineTitle = document.getElementById('offlineTitle');
+  var offlineText = document.getElementById('offlineText');
+  var retryBtn = document.getElementById('retryBtn');
+  if (offlineIcon) offlineIcon.innerHTML = '&#9203;';
+  if (offlineTitle) offlineTitle.textContent = 'Starting live';
+  if (offlineText) offlineText.textContent = 'Connecting to the live video...';
+  if (retryBtn) retryBtn.style.display = 'none';
+  if (offlineOverlay) offlineOverlay.style.display = 'flex';
+}
+
+async function readStreamError(res) {
+  try {
+    var data = await res.json();
+    if (data && data.detail) return String(data.detail);
+    if (data && data.message) return String(data.message);
+  } catch (e) {
+    // Fall through to the generic HTTP status below.
+  }
+  return 'Live stream request failed (' + res.status + ').';
+}
+
+async function fetchStreamPayload(showErrors) {
+  var res = await fetch('/api/model/' + currentUsername + '/stream' + sourceQuery());
+  if (!res.ok) {
+    var detail = await readStreamError(res);
+    if (showErrors) showLivePlayerError(detail);
+    return null;
+  }
+  var data = await res.json();
+  if (!data.streamUrl) {
+    if (showErrors) showLivePlayerError('The live stream did not return a playable URL.');
+    return null;
+  }
+  return data;
+}
+
 // ============================================
 // Try loading stream (returns true if successful)
 // ============================================
 async function tryLoadStream() {
   try {
-    var res = await fetch('/api/model/' + currentUsername + '/stream' + sourceQuery());
-    if (!res.ok) return false;
-    var data = await res.json();
-    if (!data.streamUrl) return false;
+    if (streamStartPromise) return await streamStartPromise;
+    var data = await fetchStreamPayload(false);
+    if (!data) return false;
 
     // Stream URL is available - start playing
     applyLiveMetadata(data);
-    startStreamWithUrl(data.streamUrl);
+    startStreamWithUrl(data.streamUrl, data.streamType);
     return true;
   } catch (e) {
     return false;
@@ -289,41 +331,48 @@ async function tryLoadStream() {
 // Start HLS stream
 // ============================================
 async function startStream() {
-  try {
-    var res = await fetch('/api/model/' + currentUsername + '/stream' + sourceQuery());
-    if (!res.ok) {
-      console.error('Failed to get stream URL');
-      return;
-    }
-    var data = await res.json();
-    var streamUrl = data.streamUrl;
+  if (streamStartPromise) return streamStartPromise;
+  streamStartPromise = (async function() {
+    try {
+      showStreamLoading();
+      var data = await fetchStreamPayload(true);
+      if (!data) return false;
+      var streamUrl = data.streamUrl;
 
-    if (!streamUrl) {
-      console.error('No stream URL returned');
-      return;
+      applyLiveMetadata(data);
+      startStreamWithUrl(streamUrl, data.streamType);
+      return true;
+    } catch (e) {
+      console.error('Error starting stream:', e);
+      showLivePlayerError('This live stream cannot be loaded right now.');
+      return false;
+    } finally {
+      streamStartPromise = null;
     }
-
-    applyLiveMetadata(data);
-    startStreamWithUrl(streamUrl);
-  } catch (e) {
-    console.error('Error starting stream:', e);
-  }
+  })();
+  return streamStartPromise;
 }
 
-function startStreamWithUrl(streamUrl) {
+function startStreamWithUrl(streamUrl, streamType) {
   var video = document.getElementById('videoPlayer');
   if (!video) return;
 
-  if (hasActiveStream() && currentStreamUrl === streamUrl) {
+  streamType = String(streamType || '').toLowerCase();
+  if (hasActiveStream() && currentStreamUrl === streamUrl && currentStreamType === streamType) {
     return;
   }
 
   stopStream(false);
   currentStreamUrl = streamUrl;
+  currentStreamType = streamType;
   streamLoaded = true;
   prepareMutedAutoplay(video);
+  var offlineOverlay = document.getElementById('offlineOverlay');
+  if (offlineOverlay) offlineOverlay.style.display = 'none';
 
-  if (isNativeVideoStream(streamUrl)) {
+  if (isIvsStream(streamUrl, streamType)) {
+    startIvsStream(streamUrl, video);
+  } else if (isNativeVideoStream(streamUrl)) {
     resetQualitySelector();
     video.src = streamUrl;
     video.addEventListener('loadedmetadata', function() {
@@ -402,6 +451,78 @@ function startStreamWithUrl(streamUrl) {
   }
 }
 
+function isIvsStream(streamUrl, streamType) {
+  var url = String(streamUrl || '').toLowerCase();
+  return streamType === 'ivs' || url.indexOf('playback.live-video.net') !== -1;
+}
+
+function loadIvsPlayerApi() {
+  if (window.IVSPlayer) return Promise.resolve(window.IVSPlayer);
+  if (ivsPlayerLoadPromise) return ivsPlayerLoadPromise;
+
+  ivsPlayerLoadPromise = new Promise(function(resolve, reject) {
+    var script = document.createElement('script');
+    script.src = '/vendor/amazon-ivs-player.min.js';
+    script.async = true;
+    script.onload = function() {
+      if (window.IVSPlayer) {
+        resolve(window.IVSPlayer);
+      } else {
+        reject(new Error('IVS player did not initialize'));
+      }
+    };
+    script.onerror = function() {
+      reject(new Error('IVS player failed to load'));
+    };
+    document.head.appendChild(script);
+  });
+
+  return ivsPlayerLoadPromise;
+}
+
+function showLivePlayerError(message) {
+  stopStream(false);
+  var offlineOverlay = document.getElementById('offlineOverlay');
+  var offlineIcon = document.getElementById('offlineIcon');
+  var offlineTitle = document.getElementById('offlineTitle');
+  var offlineText = document.getElementById('offlineText');
+  var retryBtn = document.getElementById('retryBtn');
+  if (offlineIcon) offlineIcon.innerHTML = '&#9888;';
+  if (offlineTitle) offlineTitle.textContent = 'Live player unavailable';
+  if (offlineText) offlineText.textContent = message || 'This live stream cannot be loaded right now.';
+  if (retryBtn) retryBtn.style.display = 'inline-flex';
+  if (offlineOverlay) offlineOverlay.style.display = 'flex';
+}
+
+function startIvsStream(streamUrl, video) {
+  resetQualitySelector();
+  loadIvsPlayerApi().then(function(IVSPlayer) {
+    if (!IVSPlayer || !IVSPlayer.isPlayerSupported) {
+      throw new Error('IVS playback is not supported in this browser');
+    }
+    ivsPlayer = IVSPlayer.create();
+    ivsPlayer.attachHTMLVideoElement(video);
+    if (typeof ivsPlayer.setLiveLowLatencyEnabled === 'function') {
+      ivsPlayer.setLiveLowLatencyEnabled(false);
+    }
+    if (IVSPlayer.PlayerEventType && typeof ivsPlayer.addEventListener === 'function') {
+      ivsPlayer.addEventListener(IVSPlayer.PlayerEventType.READY, function() {
+        startMutedAutoplay(video);
+      });
+      ivsPlayer.addEventListener(IVSPlayer.PlayerEventType.ERROR, function(error) {
+        console.error('IVS playback error:', error);
+        scheduleStatusRefreshAfterStreamProblem();
+      });
+    }
+    ivsPlayer.load(streamUrl);
+    ivsPlayer.play();
+    startMutedAutoplay(video);
+  }).catch(function(error) {
+    console.error('IVS player error:', error);
+    showLivePlayerError('This live requires the IVS player and could not be loaded.');
+  });
+}
+
 function isNativeVideoStream(streamUrl) {
   var url = String(streamUrl || '').toLowerCase();
   return url.indexOf('/streams/browser/') !== -1 || /\.webm(?:$|[?#])/.test(url);
@@ -450,7 +571,7 @@ function startMutedAutoplay(video) {
 }
 
 function hasActiveStream() {
-  return streamLoaded || !!hlsPlayer;
+  return streamLoaded || !!hlsPlayer || !!ivsPlayer;
 }
 
 function stopStream(clearVideo) {
@@ -459,8 +580,16 @@ function stopStream(clearVideo) {
     hlsPlayer.destroy();
     hlsPlayer = null;
   }
+  if (ivsPlayer) {
+    try {
+      if (typeof ivsPlayer.pause === 'function') ivsPlayer.pause();
+      if (typeof ivsPlayer.delete === 'function') ivsPlayer.delete();
+    } catch (e) {}
+    ivsPlayer = null;
+  }
   streamLoaded = false;
   currentStreamUrl = '';
+  currentStreamType = '';
   resetQualitySelector();
 
   if (clearVideo !== false && video) {
@@ -615,7 +744,9 @@ async function loadTrackStatus() {
     var models = data.models || [];
     var found = null;
     for (var i = 0; i < models.length; i++) {
-      if (models[i].username === currentUsername) {
+      var modelSource = (models[i].sourceType || models[i].source_type || 'chaturbate').toLowerCase();
+      var currentSource = (currentSourceType || 'chaturbate').toLowerCase();
+      if (models[i].username === currentUsername && modelSource === currentSource) {
         found = models[i];
         break;
       }

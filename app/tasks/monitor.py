@@ -678,6 +678,7 @@ async def monitor_models_task(
                             is_recording=is_recording,
                             thumbnail_path=thumbnail_path,
                             room_status=status.get('room_status'),
+                            source_type=source_type,
                         )
                         
                         # Mettre à jour le cache des enregistrements

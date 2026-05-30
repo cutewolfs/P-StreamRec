@@ -45,19 +45,6 @@ class FFmpegCommandTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-extension_picky") + 1], "0")
         self.assertIn("-i", cmd)
 
-    def test_streamate_hls_skips_eof_reconnect(self):
-        cmd = self._build(
-            "https://manifest-server.naiadsystems.com/live/stream/playlist.m3u8"
-        )
-
-        self.assertNotIn("-reconnect", cmd)
-        self.assertNotIn("-reconnect_at_eof", cmd)
-        self.assertNotIn("-reconnect_streamed", cmd)
-        self.assertLess(cmd.index("-allowed_extensions"), cmd.index("-i"))
-        self.assertEqual(cmd[cmd.index("-allowed_extensions") + 1], "ALL")
-        self.assertLess(cmd.index("-allowed_segment_extensions"), cmd.index("-i"))
-        self.assertEqual(cmd[cmd.index("-allowed_segment_extensions") + 1], "ALL")
-
     def test_local_hls_proxy_skips_eof_reconnect(self):
         cmd = self._build("http://127.0.0.1:8080/api/proxy/hls/token.m3u8")
 

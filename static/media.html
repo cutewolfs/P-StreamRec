@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>M&eacute;dia - P-StreamRec</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/loader.js"></script>
+  <script defer src="/static/media.js?v=2"></script>
+</head>
+<body>
+  <div id="header-placeholder"></div>
+
+  <main class="container media-page">
+    <section class="media-stats" aria-label="Media totals">
+      <div class="media-stat">
+        <div class="media-stat-value" id="mediaTotalCount">-</div>
+        <div class="media-stat-label">Fichiers</div>
+      </div>
+      <div class="media-stat">
+        <div class="media-stat-value" id="mediaVideoCount">-</div>
+        <div class="media-stat-label">Videos</div>
+      </div>
+      <div class="media-stat">
+        <div class="media-stat-value" id="mediaImageCount">-</div>
+        <div class="media-stat-label">Photos</div>
+      </div>
+      <div class="media-stat">
+        <div class="media-stat-value" id="mediaTotalSize">-</div>
+        <div class="media-stat-label">Stockage</div>
+      </div>
+    </section>
+
+    <section class="media-profiles-section" aria-label="Profiles">
+      <div class="media-section-heading">
+        <div>
+          <h2>Profils</h2>
+          <div class="media-section-subtitle" id="mediaProfileMeta">Loading...</div>
+        </div>
+        <div class="media-carousel-actions">
+          <button class="media-carousel-btn" id="mediaProfilePrev" type="button" title="Previous" aria-label="Previous profiles">&#8592;</button>
+          <button class="media-carousel-btn" id="mediaProfileNext" type="button" title="Next" aria-label="Next profiles">&#8594;</button>
+        </div>
+      </div>
+      <div class="media-profile-carousel" id="mediaProfileRail">
+        <div class="empty-message">
+          <div class="icon">&#9203;</div>
+          <p>Loading profiles...</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="media-recent-section" aria-label="Recent media">
+      <div class="media-profile-detail" id="mediaProfileDetail" hidden>
+        <div class="media-profile-detail-main">
+          <div class="media-profile-avatar" id="mediaProfileAvatar">?</div>
+          <div>
+            <div class="media-profile-kicker">Cha&icirc;ne</div>
+            <h2 id="mediaProfileDetailName">Profil</h2>
+            <div class="media-profile-detail-meta" id="mediaProfileDetailMeta"></div>
+          </div>
+        </div>
+        <div class="media-profile-detail-actions">
+          <button class="media-profile-settings-btn" id="mediaProfileSettingsBtn" type="button" title="Param&egrave;tres du profil" aria-label="Param&egrave;tres du profil">
+            <span aria-hidden="true">&#9881;</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="media-section-heading">
+        <div>
+          <h2 id="mediaRecentTitle">Videos recentes</h2>
+          <div class="media-section-subtitle" id="mediaResultMeta">Loading...</div>
+        </div>
+        <button class="media-clear-profile-btn" id="mediaClearProfileBtn" type="button" hidden>All profiles</button>
+      </div>
+
+      <section class="media-controls" aria-label="Media filters">
+        <div class="media-search-wrap">
+          <span aria-hidden="true">&#8981;</span>
+          <input id="mediaSearchInput" type="search" placeholder="Search media" autocomplete="off">
+        </div>
+        <div class="media-kind-tabs" role="tablist" aria-label="Media type">
+          <button class="media-kind-btn" type="button" data-kind="all">Tous</button>
+          <button class="media-kind-btn active" type="button" data-kind="video">Videos</button>
+          <button class="media-kind-btn" type="button" data-kind="image">Photos</button>
+        </div>
+        <select id="mediaSortSelect" class="media-select" aria-label="Sort">
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+          <option value="largest">Largest first</option>
+          <option value="smallest">Smallest first</option>
+          <option value="name">Name</option>
+        </select>
+      </section>
+
+      <section class="media-results">
+        <div class="media-grid" id="mediaGrid">
+          <div class="empty-message">
+            <div class="icon">&#9203;</div>
+            <p>Loading media...</p>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="media-viewer" id="mediaViewer" style="display: none;" aria-hidden="true">
+    <div class="media-viewer-shell">
+      <div class="media-viewer-topbar">
+        <button class="media-viewer-close" id="mediaViewerClose" type="button" title="Close" aria-label="Close">
+          <span aria-hidden="true">&#8592;</span>
+        </button>
+        <div class="media-viewer-title-wrap">
+          <h2 id="mediaViewerTitle">Media</h2>
+          <div id="mediaViewerMeta"></div>
+        </div>
+        <div class="media-viewer-actions">
+          <button class="media-viewer-delete" id="mediaViewerDelete" type="button" title="Delete" aria-label="Delete">
+            <span aria-hidden="true">&#128465;</span>
+          </button>
+        </div>
+      </div>
+      <div class="media-viewer-stage" id="mediaViewerStage"></div>
+    </div>
+  </div>
+
+  <div class="media-delete-modal" id="mediaDeleteModal" style="display: none;" aria-hidden="true">
+    <div class="media-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="mediaDeleteTitle">
+      <h2 id="mediaDeleteTitle">Supprimer ce m&eacute;dia ?</h2>
+      <p id="mediaDeleteMessage">Etes-vous bien sur de vouloir le supprimer ? Cette action supprimera le fichier du dossier records.</p>
+      <div class="media-delete-target" id="mediaDeleteTarget"></div>
+      <div class="media-delete-actions">
+        <button class="media-delete-cancel" id="mediaDeleteCancel" type="button">Annuler</button>
+        <button class="media-delete-confirm" id="mediaDeleteConfirm" type="button">Supprimer</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="media-profile-settings-modal" id="mediaProfileSettingsModal" style="display: none;" aria-hidden="true">
+    <div class="media-profile-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="mediaProfileSettingsTitle">
+      <div class="media-profile-settings-head">
+        <div>
+          <h2 id="mediaProfileSettingsTitle">Param&egrave;tres du profil</h2>
+          <div id="mediaProfileSettingsSubtitle"></div>
+        </div>
+        <button class="media-profile-settings-close" id="mediaProfileSettingsClose" type="button" aria-label="Fermer">&#10005;</button>
+      </div>
+
+      <form id="mediaProfileSettingsForm" class="media-profile-settings-form">
+        <div class="media-settings-grid">
+          <section>
+            <h3>Identit&eacute;</h3>
+            <label>Nom affich&eacute;<input id="profileDisplayName" type="text" autocomplete="off"></label>
+            <label>Pr&eacute;nom<input id="profileFirstName" type="text" autocomplete="off"></label>
+            <label>Nom<input id="profileLastName" type="text" autocomplete="off"></label>
+            <label>&Acirc;ge<input id="profileAge" type="number" min="0" max="120"></label>
+            <label>Alias<input id="profileAliases" type="text" autocomplete="off" placeholder="alias, pseudo, variantes"></label>
+            <label>Tags<input id="profileTags" type="text" autocomplete="off" placeholder="tags separes par virgules"></label>
+          </section>
+
+          <section>
+            <h3>Adresse</h3>
+            <label>Adresse<input id="profileAddress" type="text" autocomplete="off"></label>
+            <label>Ville<input id="profileCity" type="text" autocomplete="off"></label>
+            <label>Region<input id="profileRegion" type="text" autocomplete="off"></label>
+            <label>Code postal<input id="profilePostalCode" type="text" autocomplete="off"></label>
+            <label>Pays<input id="profileCountry" type="text" autocomplete="off"></label>
+          </section>
+        </div>
+
+        <section>
+          <h3>Liens</h3>
+          <label>R&eacute;seaux sociaux<textarea id="profileSocialUrls" rows="3" placeholder="Une URL par ligne"></textarea></label>
+          <label>URLs de stream<textarea id="profileStreamUrls" rows="3" placeholder="Une URL par ligne"></textarea></label>
+          <label>Autres profils<textarea id="profileProfileUrls" rows="3" placeholder="Une URL par ligne"></textarea></label>
+        </section>
+
+        <section>
+          <h3>Notes</h3>
+          <label>Informations libres<textarea id="profileNotes" rows="4" placeholder="Notes, preferences, contexte, details utiles"></textarea></label>
+        </section>
+
+        <section>
+          <h3>Stream</h3>
+          <div class="media-settings-grid compact">
+            <label>Qualit&eacute;
+              <select id="profileRecordQuality">
+                <option value="best">Best</option>
+                <option value="2160p">2160p</option>
+                <option value="1440p">1440p</option>
+                <option value="1080p">1080p</option>
+                <option value="720p">720p</option>
+                <option value="480p">480p</option>
+                <option value="360p">360p</option>
+              </select>
+            </label>
+            <label>Conservation (jours)<input id="profileRetentionDays" type="number" min="0" max="365"></label>
+            <label>Source
+              <select id="profileSourceType">
+                <option value="chaturbate">Chaturbate</option>
+                <option value="cam4">CAM4</option>
+              </select>
+            </label>
+            <label class="media-settings-check">
+              <input id="profileAutoRecord" type="checkbox">
+              <span>Auto-record</span>
+            </label>
+          </div>
+        </section>
+
+        <div class="media-profile-settings-actions">
+          <button class="media-profile-delete-btn" id="mediaProfileDeleteBtn" type="button">Supprimer le profil</button>
+          <div>
+            <button class="media-profile-settings-secondary" id="mediaProfileSettingsCancel" type="button">Annuler</button>
+            <button class="media-profile-settings-primary" id="mediaProfileSettingsSave" type="submit">Enregistrer</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="media-delete-modal" id="mediaProfileDeleteModal" style="display: none;" aria-hidden="true">
+    <div class="media-delete-dialog" role="dialog" aria-modal="true" aria-labelledby="mediaProfileDeleteTitle">
+      <h2 id="mediaProfileDeleteTitle">Supprimer ce profil ?</h2>
+      <p>Cette action supprimera la fiche, les enregistrements index&eacute;s et le dossier records du profil.</p>
+      <div class="media-delete-target" id="mediaProfileDeleteTarget"></div>
+      <div class="media-delete-actions">
+        <button class="media-delete-cancel" id="mediaProfileDeleteCancel" type="button">Annuler</button>
+        <button class="media-delete-confirm" id="mediaProfileDeleteConfirm" type="button">Supprimer le profil</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="footer-placeholder"></div>
+</body>
+</html>

@@ -135,6 +135,17 @@ class BaseProvider:
     async def login(self, username: str, password: str) -> dict[str, Any]:
         raise ProviderError(f"Connexion non supportee pour {self.display_name or self.source_type}")
 
+    async def import_session(
+        self,
+        username: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+        cookies: Optional[list[dict[str, Any]]] = None,
+        local_storage: Optional[list[dict[str, Any]]] = None,
+        user_agent: Optional[str] = None,
+        x_bc: Optional[str] = None,
+    ) -> dict[str, Any]:
+        raise ProviderError(f"Import de session non supporte pour {self.display_name or self.source_type}")
+
     async def logout(self) -> dict[str, Any]:
         if self.session_store:
             await self.session_store.clear(self.source_type)

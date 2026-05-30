@@ -242,11 +242,12 @@ async def discover_models(
             item["source_type"] = item.get("source_type") or source_type
             item_caps = capabilities.get(item["source_type"])
             stream_available = bool(getattr(item_caps, "can_stream", True))
+            record_available = bool(getattr(item_caps, "can_record", stream_available))
             if not explicit_source and not stream_available:
                 continue
             item["stream_available"] = stream_available
-            item["record_available"] = bool(getattr(item_caps, "can_record", stream_available))
-            item["can_follow"] = bool(getattr(item_caps, "can_follow", False))
+            item["record_available"] = record_available
+            item["can_follow"] = bool(getattr(item_caps, "can_follow", False) or stream_available or record_available)
             out.append(item)
         return out
 
@@ -299,7 +300,10 @@ async def discover_models(
     if not explicit_source and sort_mode == "viewers":
         positive_items = [item for item in ranked_items if int(item.get("viewers") or 0) > 0]
         if positive_items:
-            ranked_items = positive_items
+            ranked_items = [
+                item for item in ranked_items
+                if int(item.get("viewers") or 0) > 0
+            ]
     if sort_mode == "newest":
         ranked_items.sort(key=lambda m: (m.get("age") or 99))
     else:

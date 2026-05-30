@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
 
   p-streamrec:
-    image: ghcr.io/raccommode/p-streamrec:latest
+    image: ${PSTREAMREC_IMAGE:-ghcr.io/raccommode/p-streamrec:latest}
     container_name: p-streamrec
     # Startup race against FlareSolverr is handled by the Python-side retry
     # loop in app/main.py — the docker healthcheck approach was blocking

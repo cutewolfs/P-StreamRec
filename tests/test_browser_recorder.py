@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.browser_recorder import (
+    BrowserCaptureManager,
     BrowserCaptureSession,
     BrowserWebSocketMP4CaptureSession,
     _decode_base64_payload,
@@ -84,6 +85,27 @@ class BrowserCaptureSessionTests(unittest.TestCase):
             self.assertTrue(session.record_filename.endswith(".mp4"))
             self.assertTrue(session.record_path.endswith(".mp4"))
             self.assertEqual("/streams/browser/abc123/live.mp4", session.playback_url)
+
+    def test_manager_uses_provider_profile_and_session_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = object()
+            manager = BrowserCaptureManager(str(root), session_store=store)
+
+            original_start = BrowserCaptureSession.start
+            try:
+                BrowserCaptureSession.start = lambda self: None
+                session = manager.start_session(
+                    source_type="xcams",
+                    page_url="https://www.xcams.com/chat/model",
+                    person="model",
+                    record=False,
+                )
+            finally:
+                BrowserCaptureSession.start = original_start
+
+            self.assertEqual(root / "provider-browser", session.browser_root)
+            self.assertIs(store, session.session_store)
 
 
 if __name__ == "__main__":

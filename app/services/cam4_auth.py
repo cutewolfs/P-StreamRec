@@ -26,6 +26,7 @@ from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 _PREFIX = "cam4:"
 
 LOGIN_URL = "https://www.cam4.com/rest/v2.0/login"
+LOGIN_USER_URL = "https://www.cam4.com/rest/v2.0/login/user"
 HOMEPAGE_URL = "https://www.cam4.com/"
 LOGIN_PAGE_URL = "https://www.cam4.com/login"
 
@@ -37,6 +38,7 @@ class CAM4AuthService:
         self._username: Optional[str] = None
         self._last_error: Optional[str] = None
         self._last_login_at: Optional[int] = None
+        self._is_logged_in: bool = False
         self._user_agent: str = (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -57,7 +59,12 @@ class CAM4AuthService:
             self._last_login_at = None
         self._last_error = await self.db.get_setting(f"{_PREFIX}last_error")
         if self._cookies:
-            logger.info("CAM4 session restaurée depuis la DB", username=self._username)
+            self._is_logged_in = await self._validate_session()
+            if self._is_logged_in:
+                logger.info("CAM4 session restaurée et vérifiée depuis la DB", username=self._username)
+            else:
+                self._last_error = "CAM4 session expirée, reconnectez le compte"
+                await self.db.set_setting(f"{_PREFIX}last_error", self._last_error)
 
     async def login(self, username: str, password: str) -> Dict[str, Any]:
         """Login programmatique via POST /rest/v2.0/login. Retourne
@@ -123,6 +130,7 @@ class CAM4AuthService:
                         self._username = username
                         self._last_login_at = int(time.time())
                         self._last_error = None
+                        self._is_logged_in = True
                         await self._persist_success(username)
                         logger.success("CAM4 login réussi", username=username)
                         return {"success": True, "username": username}
@@ -163,6 +171,7 @@ class CAM4AuthService:
         self._username = None
         self._last_login_at = None
         self._last_error = None
+        self._is_logged_in = False
         await self.db.set_setting(f"{_PREFIX}session_cookies", "")
         await self.db.set_setting(f"{_PREFIX}username", "")
         await self.db.set_setting(f"{_PREFIX}last_login_at", "")
@@ -177,12 +186,34 @@ class CAM4AuthService:
 
     def get_status(self) -> Dict[str, Any]:
         return {
-            "isLoggedIn": bool(self._cookies),
+            "isLoggedIn": bool(self._is_logged_in and self._cookies),
             "username": self._username,
             "lastError": self._last_error,
             "lastLoginAt": self._last_login_at,
             "hasCookies": bool(self._cookies),
         }
+
+    async def _validate_session(self) -> bool:
+        if not self._cookies:
+            return False
+        headers = {
+            "User-Agent": self._user_agent,
+            "Accept": "application/json",
+            "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
+        }
+        try:
+            async with aiohttp_client_session() as session:
+                async with session.get(
+                    LOGIN_USER_URL,
+                    headers=headers,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    **aiohttp_request_kwargs(),
+                ) as resp:
+                    return resp.status == 200
+        except Exception as exc:
+            logger.debug("CAM4 session validation failed", error=str(exc))
+            return False
 
     async def _persist_success(self, username: str) -> None:
         await self.db.set_setting(f"{_PREFIX}session_cookies", json.dumps(self._cookies))

@@ -19,7 +19,6 @@ from .core.config import MIN_RECORDING_SECONDS
 _LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
 _TS_PACKET_SIZE = 188
 _CHATURBATE_HLS_HOST_SUFFIXES = ("chaturbate.com", "highwebmedia.com", "mmcdn.com")
-_STREAMATE_HLS_HOST_SUFFIXES = ("naiadsystems.com",)
 _CHATURBATE_HLS_HEADERS = (
     "Referer: https://chaturbate.com/\r\n"
     "Origin: https://chaturbate.com\r\n"
@@ -46,17 +45,6 @@ def _is_chaturbate_hls_url(input_url: str) -> bool:
     return any(
         hostname == suffix or hostname.endswith(f".{suffix}")
         for suffix in _CHATURBATE_HLS_HOST_SUFFIXES
-    )
-
-
-def _is_streamate_hls_url(input_url: str) -> bool:
-    try:
-        hostname = (urlparse(input_url).hostname or "").lower().rstrip(".")
-    except Exception:
-        return False
-    return any(
-        hostname == suffix or hostname.endswith(f".{suffix}")
-        for suffix in _STREAMATE_HLS_HOST_SUFFIXES
     )
 
 
@@ -144,10 +132,10 @@ def _build_ffmpeg_command(
         "-y",
     ]
 
-    if not (_is_streamate_hls_url(input_url) or _is_local_hls_proxy_url(input_url)):
-        # Options de reconnexion pour stabilité. Streamate/NaiadSystems HLS
-        # and the local HLS proxy serve short-lived playlists/segments;
-        # reconnecting at EOF can stall with an empty recording.
+    if not _is_local_hls_proxy_url(input_url):
+        # Options de reconnexion pour stabilité. The local HLS proxy serves
+        # short-lived playlists/segments; reconnecting at EOF can stall with
+        # an empty recording.
         cmd.extend([
             "-reconnect", "1",
             "-reconnect_at_eof", "1",
@@ -677,6 +665,10 @@ class FFmpegManager:
                 raise
 
             return sess
+
+    def get_session(self, session_id: str) -> Optional[FFmpegSession]:
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def _finalize_session_locked(self, sess: FFmpegSession, join_timeout: float = 0.2):
         if sess.process:

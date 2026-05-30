@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
-import re
-from typing import Optional
-from urllib.error import URLError
+from typing import Any, Optional
 from urllib.parse import quote_plus, urlparse
-from urllib.request import Request, urlopen
 
 from ..logger import logger
 from .base import (
@@ -37,9 +33,12 @@ class YtDlpProvider(BaseProvider):
         self.url_template = url_template
         self.domains = domains
         self.browser_fallback = browser_fallback
+        fallback_caps = getattr(browser_fallback, "capabilities", None)
         self.capabilities = ProviderCapabilities(
-            can_login=bool(browser_fallback),
-            can_discover=bool(browser_fallback and getattr(browser_fallback, "capabilities", None) and browser_fallback.capabilities.can_discover),
+            can_login=bool(fallback_caps and fallback_caps.can_login),
+            can_follow=bool(fallback_caps and fallback_caps.can_follow),
+            can_sync_following=bool(fallback_caps and fallback_caps.can_sync_following),
+            can_discover=bool(fallback_caps and fallback_caps.can_discover),
             uses_browser=bool(browser_fallback),
             uses_ytdlp=True,
         )
@@ -71,31 +70,19 @@ class YtDlpProvider(BaseProvider):
                 title=info.get("title"),
             )
         except ProviderPrivateError as exc:
-            if self.source_type == "stripchat":
-                try:
-                    return await asyncio.to_thread(self._resolve_stripchat_hls, page_url, max_height)
-                except Exception as fallback_exc:
-                    logger.debug(
-                        "Stripchat direct HLS fallback failed",
-                        target=target,
-                        error=str(fallback_exc),
-                    )
+            if self._can_use_guarded_stripchat_fallback():
+                return await self._resolve_stripchat_guarded_fallback(target, max_height, exc)
             raise
-        except ProviderOfflineError:
+        except ProviderOfflineError as exc:
+            if self._can_use_guarded_stripchat_fallback():
+                return await self._resolve_stripchat_guarded_fallback(target, max_height, exc)
             raise
         except Exception as exc:
+            if self._can_use_guarded_stripchat_fallback():
+                return await self._resolve_stripchat_guarded_fallback(target, max_height, exc)
             if self._looks_offline(exc):
                 raise ProviderOfflineError(str(exc)) from exc
             if self._looks_private(exc):
-                if self.source_type == "stripchat":
-                    try:
-                        return await asyncio.to_thread(self._resolve_stripchat_hls, page_url, max_height)
-                    except Exception as fallback_exc:
-                        logger.debug(
-                            "Stripchat direct HLS fallback failed",
-                            target=target,
-                            error=str(fallback_exc),
-                        )
                 raise ProviderPrivateError(str(exc)) from exc
             logger.debug(
                 "yt-dlp provider resolve failed",
@@ -106,6 +93,23 @@ class YtDlpProvider(BaseProvider):
             if self.browser_fallback:
                 return await self.browser_fallback.resolve_stream(target, max_height=max_height)
             raise ProviderError(f"yt-dlp n'a pas trouve de flux pour {self.display_name}/{target}") from exc
+
+    def _can_use_guarded_stripchat_fallback(self) -> bool:
+        return self.source_type == "stripchat" and bool(self.browser_fallback)
+
+    async def _resolve_stripchat_guarded_fallback(
+        self,
+        target: str,
+        max_height: Optional[int],
+        original_exc: Exception,
+    ) -> ResolvedStream:
+        logger.debug(
+            "yt-dlp Stripchat resolve failed; trying guarded public API fallback",
+            target=target,
+            error=str(original_exc),
+        )
+        assert self.browser_fallback is not None
+        return await self.browser_fallback.resolve_stream(target, max_height=max_height)
 
     async def check_status(self, username: str) -> ProviderStatus:
         try:
@@ -125,9 +129,29 @@ class YtDlpProvider(BaseProvider):
             return ProviderStatus(False, room_status="offline", source_type=self.source_type, detail=str(exc))
 
     async def login(self, username: str, password: str) -> dict[str, object]:
-        if not self.browser_fallback:
+        if not self.browser_fallback or not self.capabilities.can_login:
             return {"success": False, "error": "Connexion non supportee"}
         return await self.browser_fallback.login(username, password)
+
+    async def import_session(
+        self,
+        username: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+        cookies: Optional[list[dict[str, Any]]] = None,
+        local_storage: Optional[list[dict[str, Any]]] = None,
+        user_agent: Optional[str] = None,
+        x_bc: Optional[str] = None,
+    ) -> dict[str, object]:
+        if not self.browser_fallback or not self.capabilities.can_login:
+            return {"success": False, "error": "Import de session non supporte"}
+        return await self.browser_fallback.import_session(
+            username=username,
+            cookie_header=cookie_header,
+            cookies=cookies,
+            local_storage=local_storage,
+            user_agent=user_agent,
+            x_bc=x_bc,
+        )
 
     async def logout(self) -> dict[str, object]:
         if self.browser_fallback:
@@ -138,6 +162,26 @@ class YtDlpProvider(BaseProvider):
         if self.browser_fallback:
             return await self.browser_fallback.list_live_models(**kwargs)
         return await super().list_live_models(**kwargs)
+
+    async def sync_following(self) -> list[dict[str, object]]:
+        if self.browser_fallback and self.capabilities.can_sync_following:
+            return await self.browser_fallback.sync_following()
+        return await super().sync_following()
+
+    async def follow(self, username: str) -> dict[str, object]:
+        if self.browser_fallback and self.capabilities.can_follow:
+            return await self.browser_fallback.follow(username)
+        return await super().follow(username)
+
+    async def unfollow(self, username: str) -> dict[str, object]:
+        if self.browser_fallback and self.capabilities.can_follow:
+            return await self.browser_fallback.unfollow(username)
+        return await super().unfollow(username)
+
+    async def is_following(self, username: str) -> bool:
+        if self.browser_fallback and self.capabilities.can_follow:
+            return await self.browser_fallback.is_following(username)
+        return await super().is_following(username)
 
     def _extract_info(self, page_url: str) -> dict:
         try:
@@ -205,81 +249,6 @@ class YtDlpProvider(BaseProvider):
         if origin:
             headers["Origin"] = origin
         return headers
-
-    def _resolve_stripchat_hls(self, page_url: str, max_height: Optional[int]) -> ResolvedStream:
-        del max_height
-        req = Request(
-            page_url,
-            headers={
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        with urlopen(req, timeout=20) as resp:
-            body = resp.read()
-            if resp.headers.get("Content-Encoding", "").lower() == "gzip":
-                body = gzip.decompress(body)
-        webpage = body.decode("utf-8", errors="replace")
-
-        model_id = self._stripchat_model_id(webpage)
-        if not model_id:
-            raise ProviderOfflineError("Stripchat model id introuvable")
-
-        hosts = self._stripchat_hls_hosts(webpage)
-        if not hosts:
-            hosts = ["doppiocdn.net", "doppiocdn.com", "doppiocdn.org", "doppiocdn.live", "doppiocdn.media"]
-
-        headers = self._headers(page_url)
-        for host in hosts:
-            playlist_url = f"https://edge-hls.{host}/hls/{model_id}/master/{model_id}_auto.m3u8"
-            try:
-                playlist_req = Request(playlist_url, headers=headers)
-                with urlopen(playlist_req, timeout=12) as resp:
-                    head = resp.read(256)
-                    if resp.headers.get("Content-Encoding", "").lower() == "gzip":
-                        head = gzip.decompress(head)
-                if head.lstrip().startswith(b"#EXTM3U"):
-                    return ResolvedStream(
-                        url=playlist_url,
-                        headers=headers,
-                        source_type=self.source_type,
-                        is_live=True,
-                        room_status="public",
-                    )
-            except (OSError, URLError, gzip.BadGzipFile):
-                continue
-        raise ProviderOfflineError("Aucun HLS Stripchat public valide")
-
-    def _stripchat_model_id(self, webpage: str) -> str:
-        patterns = [
-            r'https?://img\.doppiocdn\.net/(?:thumbs|snapshot)/\d+/(\d+)',
-            r'"streamName"\s*:\s*"(\d+)"',
-            r'"id"\s*:\s*(\d+)\s*,\s*"hasGroupShowAnnouncement"',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, webpage or "")
-            if match:
-                return match.group(1)
-        return ""
-
-    def _stripchat_hls_hosts(self, webpage: str) -> list[str]:
-        values: list[str] = []
-        for match in re.finditer(r'"hlsStreamHost"\s*:\s*"([^"]+)"', webpage or ""):
-            values.append(match.group(1))
-        for match in re.finditer(r'"fallbackDomains"\s*:\s*\[([^\]]+)\]', webpage or ""):
-            values.extend(re.findall(r'"([^"]+)"', match.group(1)))
-        for match in re.finditer(r'"[A-Z]\d*"\s*:\s*"([^"]*doppiocdn[^"]*)"', webpage or ""):
-            values.append(match.group(1))
-        seen = set()
-        hosts = []
-        for value in values:
-            host = str(value or "").strip().strip("/")
-            if not host or host in seen:
-                continue
-            seen.add(host)
-            hosts.append(host)
-        return hosts
 
     def _tags(self, info: dict) -> list[str]:
         values = []

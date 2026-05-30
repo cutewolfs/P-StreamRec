@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from typing import Any, Optional
 
 from .base import (
@@ -12,6 +14,33 @@ from .base import (
     ResolvedStream,
 )
 from .browser import DEFAULT_USER_AGENT
+
+
+def _cookies_to_dict(
+    cookies: Optional[list[dict[str, Any]]] = None,
+    cookie_header: Optional[str] = None,
+) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if cookie_header:
+        for part in cookie_header.split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if name:
+                values[name] = value.strip()
+    for cookie in cookies or []:
+        if not isinstance(cookie, dict):
+            continue
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name and value is not None:
+            values[str(name)] = str(value)
+    return values
+
+
+def _cookie_list(cookie_map: dict[str, str]) -> list[dict[str, str]]:
+    return [{"name": name, "value": value} for name, value in cookie_map.items()]
 
 
 class ChaturbateProvider(BaseProvider):
@@ -117,27 +146,94 @@ class ChaturbateProvider(BaseProvider):
             await self.auth.logout()
         return {"success": True}
 
+    async def import_session(
+        self,
+        username: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+        cookies: Optional[list[dict[str, Any]]] = None,
+        local_storage: Optional[list[dict[str, Any]]] = None,
+        user_agent: Optional[str] = None,
+        x_bc: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not self.auth:
+            raise ProviderAuthError("Chaturbate auth service non initialise")
+        cookie_map = _cookies_to_dict(cookies, cookie_header)
+        if not cookie_map:
+            return {"success": False, "error": "Chaturbate cookies are required"}
+        if user_agent:
+            self.auth._user_agent = user_agent
+        self.auth._cookies = cookie_map
+        self.auth._username = (username or self.auth._username or "").strip() or None
+        self.auth._last_error = None
+        verified = await self.auth._validate_session()
+        self.auth._is_logged_in = bool(verified)
+        now = int(time.time())
+        row = await self.auth.db.get_auth_state()
+        saved_username = self.auth._username or (row or {}).get("username") or ""
+        password_hash = (row or {}).get("password_hash") or ""
+        last_error = None if verified else "Imported Chaturbate session is not verified"
+        if not verified:
+            self.auth._last_error = last_error
+        await self.auth.db.save_auth_state(
+            username=saved_username,
+            password_hash=password_hash,
+            is_logged_in=bool(verified),
+            session_cookies=json.dumps(cookie_map),
+            cf_clearance=cookie_map.get("cf_clearance"),
+            csrf_token=cookie_map.get("csrftoken"),
+            last_login_at=now if verified else None,
+            last_error=last_error,
+        )
+        if self.session_store:
+            await self.session_store.save(
+                self.source_type,
+                username=saved_username or None,
+                is_logged_in=bool(verified),
+                cookies=cookies or _cookie_list(cookie_map),
+                local_storage=local_storage or [],
+                last_error=last_error,
+            )
+        if not verified:
+            return {"success": False, "error": last_error}
+        return {"success": True, "username": saved_username, "hasCookies": True}
+
     async def sync_following(self) -> list[dict[str, Any]]:
         if not self.api:
             raise ProviderAuthError("Chaturbate API non initialisee")
+        self._require_verified_auth()
         return await self.api.get_followed_models()
 
     async def follow(self, username: str) -> dict[str, Any]:
         if not self.api:
             raise ProviderAuthError("Chaturbate API non initialisee")
+        self._require_verified_auth()
         ok = await self.api.follow_model(username)
         return {"success": bool(ok)}
 
     async def unfollow(self, username: str) -> dict[str, Any]:
         if not self.api:
             raise ProviderAuthError("Chaturbate API non initialisee")
+        self._require_verified_auth()
         ok = await self.api.unfollow_model(username)
         return {"success": bool(ok)}
 
     async def is_following(self, username: str) -> bool:
         if not self.api:
             return False
+        if not self._has_verified_auth():
+            return False
         return bool(await self.api.is_following(username))
+
+    def _has_verified_auth(self) -> bool:
+        if not self.auth:
+            return False
+        status = self.auth.get_status()
+        cookies = self.auth.get_cookies()
+        return bool(status.get("isLoggedIn") and cookies.get("sessionid"))
+
+    def _require_verified_auth(self) -> None:
+        if not self._has_verified_auth():
+            raise ProviderAuthError("Connexion Chaturbate requise")
 
     def _headers(self, target: str) -> dict[str, str]:
         headers = {
@@ -238,6 +334,50 @@ class CAM4Provider(BaseProvider):
             await self.auth.logout()
         return {"success": True}
 
+    async def import_session(
+        self,
+        username: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+        cookies: Optional[list[dict[str, Any]]] = None,
+        local_storage: Optional[list[dict[str, Any]]] = None,
+        user_agent: Optional[str] = None,
+        x_bc: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if not self.auth:
+            raise ProviderAuthError("CAM4 auth service non initialise")
+        cookie_map = _cookies_to_dict(cookies, cookie_header)
+        if not cookie_map:
+            return {"success": False, "error": "CAM4 cookies are required"}
+        session_username = (username or self.auth.get_status().get("username") or "").strip()
+        if not session_username:
+            return {"success": False, "error": "Username is required for CAM4 session import"}
+        if user_agent:
+            self.auth._user_agent = user_agent
+        self.auth._cookies = cookie_map
+        self.auth._username = session_username
+        self.auth._last_error = None
+        verified = await self.auth._validate_session()
+        self.auth._is_logged_in = bool(verified)
+        self.auth._last_login_at = int(time.time()) if verified else None
+        last_error = None if verified else "Imported CAM4 session is not verified"
+        if verified:
+            await self.auth._persist_success(session_username)
+        else:
+            self.auth._last_error = last_error
+            await self.auth._persist_error(session_username, last_error)
+        if self.session_store:
+            await self.session_store.save(
+                self.source_type,
+                username=session_username,
+                is_logged_in=bool(verified),
+                cookies=cookies or _cookie_list(cookie_map),
+                local_storage=local_storage or [],
+                last_error=last_error,
+            )
+        if not verified:
+            return {"success": False, "error": last_error}
+        return {"success": True, "username": session_username, "hasCookies": True}
+
     async def sync_following(self) -> list[dict[str, Any]]:
         from ..services import cam4_source
 
@@ -246,7 +386,13 @@ class CAM4Provider(BaseProvider):
         cookies = self.auth.get_cookies()
         if not cookies:
             raise ProviderAuthError("CAM4 session absente")
-        return await cam4_source.list_followed(cookies)
+        try:
+            return await cam4_source.list_followed(cookies)
+        except cam4_source.CAM4FollowingError as exc:
+            message = str(exc)
+            if "session" in message.lower() or "login" in message.lower():
+                raise ProviderAuthError(message) from exc
+            raise ProviderError(message) from exc
 
     async def follow(self, username: str) -> dict[str, Any]:
         from ..services import cam4_source

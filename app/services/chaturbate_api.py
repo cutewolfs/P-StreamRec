@@ -435,18 +435,22 @@ class ChaturbateAPI:
             return False
 
         try:
-            url = f"https://chaturbate.com/follow/{action}/{username}/"
+            room_url = f"https://chaturbate.com/{username}/"
             headers = self._get_headers()
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            headers["Accept"] = "*/*"
             headers["X-Requested-With"] = "XMLHttpRequest"
-            headers["Referer"] = f"https://chaturbate.com/{username}/"
+            headers["Referer"] = room_url
 
+            # Prime room cookies before the AJAX follow endpoint, matching the
+            # browser flow used by CTBrec.
+            await self._request("GET", room_url, headers=headers)
+
+            url = f"https://chaturbate.com/follow/{action}/{username}/"
             csrf = self.auth.get_cookies().get("csrftoken", "")
             if csrf:
                 headers["X-CSRFToken"] = csrf
 
-            data = f"room_slug={username}"
-            resp = await self._request("POST", url, headers=headers, data=data)
+            resp = await self._request("POST", url, headers=headers, data=b"")
 
             if not resp or resp.status != 200:
                 logger.warning(f"Failed to {action} model", username=username,

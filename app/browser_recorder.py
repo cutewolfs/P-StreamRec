@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import os
 import queue
 import threading
@@ -14,6 +15,17 @@ from typing import Dict, Optional
 from .core.config import MIN_RECORDING_SECONDS
 from .logger import logger
 from .providers.browser import DEFAULT_USER_AGENT
+
+
+def _browser_launch_args() -> list[str]:
+    return [
+        "--autoplay-policy=no-user-gesture-required",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-setuid-sandbox",
+        "--lang=en-US,en",
+        "--no-sandbox",
+    ]
 
 
 def _decode_base64_payload(raw: str) -> bytes:
@@ -44,6 +56,7 @@ class BrowserCaptureSession:
         record: bool = True,
         browser_root: Optional[Path] = None,
         file_extension: str = "webm",
+        session_store=None,
     ):
         self.id = session_id
         self.source_type = source_type
@@ -54,6 +67,7 @@ class BrowserCaptureSession:
         self.name = display_name or person or session_id
         self.record = bool(record)
         self.browser_root = browser_root
+        self.session_store = session_store
         self.file_extension = (file_extension or "webm").strip(".").lower() or "webm"
         self.created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         self.start_time = time.time()
@@ -73,6 +87,74 @@ class BrowserCaptureSession:
         self._thread: Optional[threading.Thread] = None
         self._subscribers: list[queue.Queue[bytes]] = []
         self._first_chunk: Optional[bytes] = None
+
+    async def _apply_browser_stealth(self, context) -> None:
+        try:
+            await context.add_init_script(
+                """
+                (() => {
+                    try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch {}
+                    try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch {}
+                    try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch {}
+                    try { window.chrome = window.chrome || { runtime: {} }; } catch {}
+                })();
+                """
+            )
+        except Exception:
+            pass
+
+    async def _restore_provider_state(self, context) -> None:
+        await self._apply_browser_stealth(context)
+        if not self.session_store:
+            return
+        try:
+            state = await self.session_store.get(self.source_type)
+        except Exception as exc:
+            logger.debug("Browser capture provider state unavailable", source_type=self.source_type, error=str(exc))
+            return
+
+        cookies = state.get("cookies") or []
+        if cookies:
+            try:
+                await context.add_cookies(cookies)
+            except Exception as exc:
+                logger.debug("Browser capture cookie restore failed", source_type=self.source_type, error=str(exc))
+
+        local_storage = state.get("localStorage") or []
+        if local_storage:
+            try:
+                await context.add_init_script(
+                    """
+                    (() => {
+                        const origins = __PSTREAMREC_ORIGINS__;
+                        const originState = origins.find((entry) => entry && entry.origin === window.location.origin);
+                        if (!originState || !Array.isArray(originState.localStorage)) return;
+                        for (const item of originState.localStorage) {
+                            if (!item || !item.name || typeof item.value !== 'string') continue;
+                            try { window.localStorage.setItem(item.name, item.value); } catch {}
+                        }
+                    })();
+                    """.replace("__PSTREAMREC_ORIGINS__", json.dumps(local_storage))
+                )
+            except Exception as exc:
+                logger.debug("Browser capture localStorage restore failed", source_type=self.source_type, error=str(exc))
+
+    async def _save_provider_state(self, context) -> None:
+        if not self.session_store or self.bytes_written <= 0:
+            return
+        try:
+            stored = await self.session_store.get(self.source_type)
+            state = await context.storage_state()
+            await self.session_store.save(
+                self.source_type,
+                username=stored.get("username") or stored.get("credential_username"),
+                is_logged_in=bool(stored.get("is_logged_in")),
+                cookies=state.get("cookies") or [],
+                local_storage=state.get("origins") or [],
+                last_error=None,
+            )
+        except Exception as exc:
+            logger.debug("Browser capture provider state save failed", source_type=self.source_type, error=str(exc))
 
     def start(self) -> None:
         self._thread = threading.Thread(
@@ -149,6 +231,39 @@ class BrowserCaptureSession:
         self._publish_chunk(data)
         self._ready_evt.set()
 
+    async def _dismiss_entry_prompts(self, page) -> None:
+        try:
+            clicked = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === 'hidden' || style.display === 'none') return false;
+                    return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                  };
+                  const textOf = (el) => (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+                    .replace(/\\s+/g, ' ')
+                    .trim();
+                  const accept = /(i'?m\\s+over\\s+18|i\\s+am\\s+over\\s+18|enter|accept|agree|continue|got\\s+it)/i;
+                  const reject = /(exit|privacy|terms|parental|record-keeping|support|log\\s*in|sign\\s*up|create\\s+free)/i;
+                  const controls = Array.from(document.querySelectorAll('button, [role="button"], a'));
+                  for (const el of controls) {
+                    const text = textOf(el);
+                    if (visible(el) && accept.test(text) && !reject.test(text)) {
+                      el.click();
+                      return true;
+                    }
+                  }
+                  return false;
+                }
+                """
+            )
+            if clicked:
+                await page.wait_for_timeout(1200)
+        except Exception:
+            return
+
     async def _run(self) -> None:
         browser = None
         context = None
@@ -160,7 +275,7 @@ class BrowserCaptureSession:
                 self.records_dir_for_person.mkdir(parents=True, exist_ok=True)
 
             async with async_playwright() as playwright:
-                launch_args = ["--autoplay-policy=no-user-gesture-required"]
+                launch_args = _browser_launch_args()
                 if self.browser_root:
                     user_data_dir = self.browser_root / self.source_type
                     user_data_dir.mkdir(parents=True, exist_ok=True)
@@ -182,6 +297,7 @@ class BrowserCaptureSession:
                         viewport={"width": 1280, "height": 720},
                     )
                     page = await context.new_page()
+                await self._restore_provider_state(context)
 
                 async def receive_chunk(_source, payload):
                     raw = ""
@@ -201,11 +317,17 @@ class BrowserCaptureSession:
 
                 await page.expose_binding("__pstreamrecChunk", receive_chunk)
                 await page.goto(self.page_url, wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(12000)
+                for _ in range(4):
+                    await self._dismiss_entry_prompts(page)
+                    await page.wait_for_timeout(800)
+                await page.wait_for_timeout(5000)
                 try:
                     await page.mouse.click(640, 360)
                 except Exception:
                     pass
+                for _ in range(3):
+                    await self._dismiss_entry_prompts(page)
+                    await page.wait_for_timeout(700)
                 await page.wait_for_timeout(3000)
 
                 await page.evaluate(
@@ -292,6 +414,7 @@ class BrowserCaptureSession:
         finally:
             try:
                 if context:
+                    await self._save_provider_state(context)
                     await context.close()
             except Exception:
                 pass
@@ -346,7 +469,7 @@ class BrowserWebSocketMP4CaptureSession(BrowserCaptureSession):
                 self.records_dir_for_person.mkdir(parents=True, exist_ok=True)
 
             async with async_playwright() as playwright:
-                launch_args = ["--autoplay-policy=no-user-gesture-required"]
+                launch_args = _browser_launch_args()
                 if self.browser_root:
                     user_data_dir = self.browser_root / self.source_type
                     user_data_dir.mkdir(parents=True, exist_ok=True)
@@ -368,6 +491,7 @@ class BrowserWebSocketMP4CaptureSession(BrowserCaptureSession):
                         viewport={"width": 1280, "height": 720},
                     )
                     page = await context.new_page()
+                await self._restore_provider_state(context)
 
                 cdp = await context.new_cdp_session(page)
 
@@ -408,6 +532,7 @@ class BrowserWebSocketMP4CaptureSession(BrowserCaptureSession):
         finally:
             try:
                 if context:
+                    await self._save_provider_state(context)
                     await context.close()
             except Exception:
                 pass
@@ -422,11 +547,12 @@ class BrowserWebSocketMP4CaptureSession(BrowserCaptureSession):
 
 
 class BrowserCaptureManager:
-    def __init__(self, base_output_dir: str):
+    def __init__(self, base_output_dir: str, session_store=None):
         self.base_output_dir = Path(base_output_dir)
         self.sessions_root = self.base_output_dir / "browser-sessions"
         self.records_root = self.base_output_dir / "records"
         self.browser_root = self.base_output_dir / "provider-browser"
+        self.session_store = session_store
         self._lock = threading.Lock()
         self._sessions: Dict[str, BrowserCaptureSession] = {}
 
@@ -470,7 +596,8 @@ class BrowserCaptureManager:
                 person=person,
                 display_name=display_name,
                 record=record,
-                browser_root=None,
+                browser_root=self.browser_root,
+                session_store=self.session_store,
             )
             session.capture_mode = (capture_mode or "media_recorder").strip().lower()
             self._sessions[session_id] = session

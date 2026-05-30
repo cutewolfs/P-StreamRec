@@ -127,7 +127,7 @@ class DiscoverProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
             for item in result["models"]
         }
         self.assertTrue(follow_flags["chaturbate"])
-        self.assertFalse(follow_flags["stripchat"])
+        self.assertTrue(follow_flags["stripchat"])
 
     async def test_discover_source_filter_limits_provider(self):
         result = await discover.discover_models(

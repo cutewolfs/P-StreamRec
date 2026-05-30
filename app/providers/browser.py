@@ -7,20 +7,23 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import quote_plus, unquote, urlencode, urljoin, urlparse
 
 import aiohttp
+from yarl import URL
 
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from ..logger import logger
 from .base import (
     BaseProvider,
     ProviderCapabilities,
+    ProviderAuthError,
     ProviderError,
     ProviderInteractionRequired,
     ProviderOfflineError,
     ProviderPrivateError,
+    ProviderStatus,
     ResolvedStream,
 )
 from .sessions import ProviderSessionStore
@@ -30,6 +33,24 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+STRIPCHAT_BASE_URL = "https://stripchat.com"
+STRIPCHAT_API_BASE = f"{STRIPCHAT_BASE_URL}/api/front"
+STRIPCHAT_FRONT_VERSION = os.getenv("PSTREAMREC_STRIPCHAT_FRONT_VERSION", "11.7.28")
+STRIPCHAT_LOGIN_PATHS = (
+    "/auth/login",
+    "/v3/auth/login",
+    "/v2/auth/login",
+    "/login",
+)
+STRIPCHAT_HLS_HOSTS = (
+    "doppiocdn.net",
+    "doppiocdn.com",
+    "doppiocdn.org",
+    "doppiocdn.live",
+    "doppiocdn.media",
+)
+STRIPCHAT_PLAYBACK_KEY = os.getenv("PSTREAMREC_STRIPCHAT_PLAYBACK_KEY", "fncnu6utiWqsDLk8")
+BONGACAMS_BASE_URL = "https://bongacams.com"
 _MEDIA_URL_RE = re.compile(
     r"https?:\\?/\\?/[^\s\"'<>]+?\.(?:m3u8|mpd)(?:\?[^\s\"'<>]*)?",
     re.IGNORECASE,
@@ -38,7 +59,19 @@ _HLS_URL_FIELD_RE = re.compile(
     r"""["']hlsUrl["']\s*:\s*["']([^"']+)["']""",
     re.IGNORECASE,
 )
-_INTERACTION_RE = re.compile(r"captcha|2fa|two-factor|cloudflare|verify you are human", re.IGNORECASE)
+_INTERACTION_RE = re.compile(
+    r"captcha|hcaptcha|recaptcha|turnstile|2fa|two-factor|cloudflare|cloudfront|request blocked|verify you are human",
+    re.IGNORECASE,
+)
+_AUTH_REQUIRED_RE = re.compile(
+    r"\b(log\s*in|login|sign\s*in|signin)\b|please\s+log\s+in|auth(?:entication)?\s+required",
+    re.IGNORECASE,
+)
+_LOGIN_FAILED_RE = re.compile(
+    r"invalid|incorrect|wrong|failed|try again|not recognized|not recognised|"
+    r"could not log|unable to log|password.*required|username.*required",
+    re.IGNORECASE,
+)
 _OFFLINE_RE = re.compile(r"offline|not currently online|not live|away", re.IGNORECASE)
 _PRIVATE_RE = re.compile(r"private|ticket show|group show|premium", re.IGNORECASE)
 _ANCHOR_RE = re.compile(r"<a\b(?P<attrs>[^>]*)>(?P<body>.*?)</a>", re.IGNORECASE | re.DOTALL)
@@ -99,12 +132,15 @@ _GENERIC_TAG_STOPWORDS = {
     "profile",
     "root",
     "search",
+    "settings",
     "show",
     "shows",
     "signup",
     "standard",
+    "store",
     "stream",
     "streams",
+    "subscriptions",
     "video",
     "videos",
     "viewer",
@@ -151,6 +187,7 @@ _RESERVED_PROFILE_SEGMENTS = {
     "male",
     "members",
     "models",
+    "my",
     "new",
     "online",
     "performers",
@@ -159,10 +196,14 @@ _RESERVED_PROFILE_SEGMENTS = {
     "privacy.php",
     "profile",
     "search",
+    "settings",
     "sex-cam",
     "signup",
+    "store",
+    "subscriptions",
     "support",
     "terms",
+    "tos",
     "trans",
     "transgender",
     "videos",
@@ -180,6 +221,8 @@ def extract_media_urls(text: str) -> list[str]:
     out = []
     for match in _MEDIA_URL_RE.finditer(text or ""):
         url = _clean_media_url(match.group(0))
+        if not _is_probable_media_url(url):
+            continue
         if url not in seen:
             seen.add(url)
             out.append(url)
@@ -195,17 +238,6 @@ def extract_hls_url_fields(text: str) -> list[str]:
             seen.add(url)
             out.append(url)
     return out
-
-
-def streamate_hls_manifest(payload: object) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-    formats = payload.get("formats") if isinstance(payload.get("formats"), dict) else {}
-    hls_format = formats.get("mp4-hls") if isinstance(formats.get("mp4-hls"), dict) else {}
-    manifest = str(hls_format.get("manifest") or "").strip()
-    if manifest.startswith("http://") or manifest.startswith("https://"):
-        return manifest
-    return None
 
 
 def _parse_attrs(raw: str) -> dict[str, str]:
@@ -507,8 +539,15 @@ def _subject_from_context(context: str) -> str:
     return ""
 
 
+def _is_probable_media_url(value: str) -> bool:
+    lower = (value or "").lower()
+    if "/ping.m3u8" in lower:
+        return False
+    return ".m3u8" in lower or ".mpd" in lower
+
+
 class BrowserCaptureProvider(BaseProvider):
-    capabilities = ProviderCapabilities(can_login=True, uses_browser=True)
+    capabilities = ProviderCapabilities(can_follow=True, uses_browser=True)
 
     def __init__(
         self,
@@ -520,6 +559,8 @@ class BrowserCaptureProvider(BaseProvider):
         browser_root: Optional[Path] = None,
         login_templates: Optional[Iterable[str]] = None,
         discover_templates: Optional[Iterable[str]] = None,
+        can_login: bool = False,
+        can_remote_follow: Optional[bool] = None,
         can_stream: bool = True,
         can_record: bool = True,
     ):
@@ -532,13 +573,24 @@ class BrowserCaptureProvider(BaseProvider):
         self.login_templates = tuple(login_templates or self.url_templates)
         self.discover_templates = tuple(discover_templates or ())
         self.capabilities = ProviderCapabilities(
-            can_login=True,
+            can_login=can_login,
+            can_follow=True,
+            can_sync_following=False,
             can_discover=bool(self.discover_templates),
             can_stream=can_stream,
             can_record=can_record,
             uses_browser=True,
         )
         self._discover_cache: dict[tuple, tuple[float, dict]] = {}
+
+    def _browser_args(self) -> list[str]:
+        return [
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-setuid-sandbox",
+            "--lang=en-US,en",
+            "--no-sandbox",
+        ]
 
     def canonical_url(self, target: str) -> str:
         target = (target or "").strip()
@@ -608,6 +660,18 @@ class BrowserCaptureProvider(BaseProvider):
         if cached and time.monotonic() - cached[0] < ttl:
             return dict(cached[1])
 
+        if self.source_type == "stripchat":
+            api_result = await self._stripchat_list_live_models_api(
+                page=page,
+                limit=limit,
+                search=search,
+                gender=gender,
+                tags=tags,
+            )
+            if api_result is not None:
+                self._discover_cache[cache_key] = (time.monotonic(), api_result)
+                return dict(api_result)
+
         urls = self.discover_urls(page, search, gender, tags)
         items: list[dict[str, object]] = []
         for page_url in urls:
@@ -674,12 +738,8 @@ class BrowserCaptureProvider(BaseProvider):
     async def resolve_stream(
         self, target: str, max_height: Optional[int] = None
     ) -> ResolvedStream:
-        if self.source_type == "streamate":
-            stream = await self._resolve_streamate_hls(target, max_height=max_height)
-            if stream:
-                return stream
-        if self.source_type == "flirt4free":
-            stream = await self._resolve_flirt4free_hls(target)
+        if self.source_type == "stripchat":
+            stream = await self._resolve_stripchat_public_hls(target, max_height=max_height)
             if stream:
                 return stream
         urls = self.candidate_urls(target)
@@ -687,73 +747,6 @@ class BrowserCaptureProvider(BaseProvider):
         if stream:
             return stream
         return await self._resolve_from_browser(urls, target)
-
-    async def _resolve_streamate_hls(
-        self,
-        target: str,
-        max_height: Optional[int] = None,
-    ) -> Optional[ResolvedStream]:
-        del max_height
-        username = self._username_from_url(target) if target.startswith(("http://", "https://")) else (target or "").strip()
-        username = (username or "").strip("@/ ")
-        if not re.match(r"^[A-Za-z0-9_.-]{2,64}$", username):
-            return None
-
-        page_url = self.canonical_url(username)
-        manifest_probe_url = f"https://manifest-server.naiadsystems.com/live/s:{quote_plus(username)}.json"
-        cookie_header = await self._cookie_header(None)
-        headers = self._stream_headers(page_url, cookie_header)
-        headers["Accept"] = "application/json,text/plain,*/*"
-
-        try:
-            async with aiohttp_client_session(timeout=aiohttp.ClientTimeout(total=20)) as session:
-                async with session.get(
-                    manifest_probe_url,
-                    headers=headers,
-                    allow_redirects=True,
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    if resp.status == 404:
-                        raise ProviderOfflineError(f"Aucun flux public Streamate pour {username}")
-                    if resp.status in (401, 403):
-                        raise ProviderInteractionRequired("Streamate demande une session ou une interaction")
-                    if resp.status >= 400:
-                        return None
-                    payload = await resp.json(content_type=None)
-                manifest_url = streamate_hls_manifest(payload)
-                if not manifest_url:
-                    return None
-                async with session.get(
-                    manifest_url,
-                    headers=headers,
-                    allow_redirects=True,
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    text = await resp.text(errors="ignore")
-                    if resp.status >= 400 or "#EXTM3U" not in text:
-                        return None
-        except (ProviderOfflineError, ProviderInteractionRequired):
-            raise
-        except Exception as exc:
-            logger.debug(
-                "Streamate manifest probe failed",
-                source_type=self.source_type,
-                username=username,
-                error=str(exc),
-            )
-            return None
-
-        return ResolvedStream(
-            url=manifest_url,
-            headers=self._stream_headers(page_url, cookie_header),
-            source_type=self.source_type,
-            is_live=True,
-            room_status="public",
-            viewers=0,
-            tags=[],
-            thumbnail=None,
-            title=None,
-        )
 
     async def _resolve_from_http(self, urls: list[str]) -> Optional[ResolvedStream]:
         headers = {
@@ -848,13 +841,15 @@ class BrowserCaptureProvider(BaseProvider):
         headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
         user_data_dir = self.browser_root / self.source_type
         user_data_dir.mkdir(parents=True, exist_ok=True)
+        browser_user_agent = await self._stored_browser_user_agent()
 
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
                 str(user_data_dir),
                 headless=headless,
-                user_agent=DEFAULT_USER_AGENT,
+                user_agent=browser_user_agent,
                 viewport={"width": 1280, "height": 900},
+                args=self._browser_args(),
             )
             try:
                 await self._restore_cookies(context)
@@ -923,16 +918,14 @@ class BrowserCaptureProvider(BaseProvider):
         specialized_parser = {
             "camsoda": self._parse_camsoda_models,
             "cams": self._parse_cams_models,
-            "flirt4free": self._parse_flirt4free_models,
             "livejasmin": self._parse_livejasmin_models,
             "myfreecams": self._parse_myfreecams_models,
             "stripchat": self._parse_stripchat_models,
-            "streamate": self._parse_streamate_models,
             "xcams": self._parse_xcams_models,
         }.get(self.source_type)
         if specialized_parser:
             items.extend(specialized_parser(html_text, page_url))
-            if items or self.source_type in {"camsoda", "cams", "flirt4free", "livejasmin", "myfreecams", "streamate", "xcams"}:
+            if items or self.source_type in {"camsoda", "cams", "livejasmin", "myfreecams", "xcams"}:
                 return items
         for match in _ANCHOR_RE.finditer(html_text or ""):
             attrs = _parse_attrs(match.group("attrs"))
@@ -979,36 +972,88 @@ class BrowserCaptureProvider(BaseProvider):
         payloads = self._embedded_json_payloads(html_text)
         models: list[dict[str, object]] = []
         for payload in payloads:
+            models.extend(self._stripchat_models_from_payload(payload))
+        items = [item for model in models if (item := self._stripchat_model_item(model))]
+        return self._dedupe_discover_models(items)
+
+    def _stripchat_models_from_payload(self, payload: object) -> list[dict[str, object]]:
+        models: list[dict[str, object]] = []
+        if isinstance(payload, dict):
+            profile_model = self._stripchat_profile_model(payload)
+            if profile_model:
+                models.append(profile_model)
+            direct_models = payload.get("models")
+            if isinstance(direct_models, list):
+                models.extend(model for model in direct_models if isinstance(model, dict))
             for block in self._find_dicts_with_key(payload, "models"):
                 block_models = block.get("models")
                 if isinstance(block_models, list):
                     models.extend(model for model in block_models if isinstance(model, dict))
-        items: list[dict[str, object]] = []
+        elif isinstance(payload, list):
+            models.extend(model for model in payload if isinstance(model, dict))
+        return self._dedupe_stripchat_models(models)
+
+    def _stripchat_profile_model(self, payload: dict[str, object]) -> Optional[dict[str, object]]:
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("username"):
+            return dict(item)
+        user_block = payload.get("user")
+        if isinstance(user_block, dict):
+            inner = user_block.get("user")
+            if isinstance(inner, dict) and inner.get("username"):
+                model = dict(inner)
+                for key in ("isInFavorites", "tags", "lastTagsAliases", "tagGroups"):
+                    if key in user_block:
+                        model[key] = user_block[key]
+                cam = payload.get("cam")
+                if isinstance(cam, dict):
+                    if cam.get("streamName"):
+                        model["streamName"] = cam.get("streamName")
+                    if cam.get("isCamAvailable") is not None:
+                        model["isOnline"] = bool(cam.get("isCamAvailable"))
+                return model
+        return None
+
+    def _dedupe_stripchat_models(self, models: list[dict[str, object]]) -> list[dict[str, object]]:
+        by_key: dict[str, dict[str, object]] = {}
         for model in models:
-            username = str(model.get("username") or "").strip()
-            if not username:
+            username = str(model.get("username") or model.get("login") or "").strip().lower()
+            model_id = str(model.get("id") or model.get("streamName") or "").strip()
+            key = username or model_id
+            if not key:
                 continue
-            status = str(model.get("status") or "").lower()
-            if status and status != "public":
-                room_status = status
-            else:
-                room_status = "public"
-            tags = self._stripchat_tags(model)
-            thumbnail = self._stripchat_thumbnail(model)
-            items.append({
-                "username": username,
-                "display_name": username,
-                "thumbnail": thumbnail,
-                "viewers": int(model.get("viewersCount") or model.get("viewers") or 0),
-                "subject": str(model.get("groupShowTopic") or ""),
-                "age": None,
-                "gender": str(model.get("genderGroup") or model.get("gender") or "").lower(),
-                "is_online": bool(model.get("isOnline", model.get("isLive", True))),
-                "tags": tags,
-                "room_status": room_status,
-                "source_type": self.source_type,
-            })
-        return self._dedupe_discover_models(items)
+            existing = by_key.get(key)
+            if existing:
+                for field, value in model.items():
+                    if value not in (None, "", [], {}):
+                        existing.setdefault(field, value)
+                continue
+            by_key[key] = dict(model)
+        return list(by_key.values())
+
+    def _stripchat_model_item(self, model: dict[str, object]) -> Optional[dict[str, object]]:
+        username = str(model.get("username") or model.get("login") or "").strip()
+        if not username:
+            return None
+        status = str(model.get("status") or "").lower()
+        room_status = status if status and status != "public" else "public"
+        try:
+            viewers = int(model.get("viewersCount") or model.get("viewers") or model.get("usersCount") or 0)
+        except (TypeError, ValueError):
+            viewers = 0
+        return {
+            "username": username,
+            "display_name": str(model.get("name") or username),
+            "thumbnail": self._stripchat_thumbnail(model),
+            "viewers": viewers,
+            "subject": str(model.get("groupShowTopic") or model.get("offlineStatus") or ""),
+            "age": model.get("age") if isinstance(model.get("age"), int) else None,
+            "gender": str(model.get("genderGroup") or model.get("gender") or "").lower(),
+            "is_online": bool(model.get("isOnline", model.get("isLive", status == "public"))),
+            "tags": self._stripchat_tags(model),
+            "room_status": room_status,
+            "source_type": self.source_type,
+        }
 
     def _stripchat_tags(self, model: dict[str, object]) -> list[str]:
         gender = str(model.get("gender") or model.get("broadcastGender") or model.get("genderGroup") or "").strip()
@@ -1057,7 +1102,7 @@ class BrowserCaptureProvider(BaseProvider):
         timestamp = str(model.get("snapshotTimestamp") or model.get("verifiedSnapshotTimestamp") or "").strip()
         if model_id and timestamp:
             return f"https://img.doppiocdn.net/snapshot/{model_id}/{timestamp}"
-        for key in ("previewUrlThumbSmall", "avatarUrl"):
+        for key in ("previewUrlThumbSmall", "previewUrlThumbBig", "previewUrl", "avatarUrl", "avatarUrlThumb"):
             value = str(model.get(key) or "").strip()
             if not value:
                 continue
@@ -1066,6 +1111,97 @@ class BrowserCaptureProvider(BaseProvider):
             if value.startswith("/"):
                 return f"https://img.doppiocdn.net{value}"
         return None
+
+    async def _stripchat_list_live_models_api(
+        self,
+        page: int,
+        limit: int,
+        gender: Optional[str],
+        search: str,
+        tags: list[str],
+    ) -> Optional[dict[str, object]]:
+        try:
+            if search:
+                profile = await self._stripchat_model_by_username(search)
+                item = self._stripchat_model_item(profile)
+                items = [item] if item and item.get("is_online") else []
+                items = self._stripchat_filter_items(items, search="", tags=tags)
+                return {
+                    "models": items[:limit],
+                    "total": len(items),
+                    "page": page,
+                    "limit": limit,
+                    "total_pages": 1,
+                }
+
+            request_limit = min(max(limit, 24), 100)
+            payload = await self._stripchat_api_json(
+                "GET",
+                "/v2/models",
+                params={
+                    "primaryTag": self._stripchat_primary_tag(gender, tags),
+                    "limit": request_limit,
+                    "offset": max(0, (page - 1) * limit),
+                },
+                referer=f"{STRIPCHAT_BASE_URL}/girls",
+            )
+        except Exception as exc:
+            logger.debug("Stripchat public model API failed", error=str(exc))
+            return None
+
+        items = [item for model in self._stripchat_models_from_payload(payload) if (item := self._stripchat_model_item(model))]
+        items = self._stripchat_filter_items(items, search=search, tags=tags)
+        items.sort(key=lambda item: int(item.get("viewers") or 0), reverse=True)
+        total = len(items)
+        if isinstance(payload, dict) and not search and not tags:
+            try:
+                total = max(total, int(payload.get("totalCount") or 0))
+            except (TypeError, ValueError):
+                pass
+        total_pages = max(1, (total + limit - 1) // limit)
+        if search or tags:
+            start = (page - 1) * limit
+            page_items = items[start:start + limit]
+        else:
+            page_items = items[:limit]
+        return {
+            "models": page_items,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
+        }
+
+    def _stripchat_filter_items(
+        self,
+        items: list[dict[str, object]],
+        search: str = "",
+        tags: Optional[list[str]] = None,
+    ) -> list[dict[str, object]]:
+        tags = [str(tag).lower() for tag in (tags or []) if str(tag).strip()]
+        if search:
+            lowered = search.lower()
+            items = [
+                item for item in items
+                if lowered in str(item.get("username") or "").lower()
+                or lowered in str(item.get("display_name") or "").lower()
+            ]
+        if tags:
+            items = [
+                item for item in items
+                if all(tag in [str(value).lower() for value in (item.get("tags") or [])] for tag in tags)
+            ]
+        return items
+
+    def _stripchat_primary_tag(self, gender: Optional[str], tags: list[str]) -> str:
+        values = {str(gender or "").lower(), *(tag.lower() for tag in tags or [])}
+        if values & {"male", "men", "man"}:
+            return "men"
+        if values & {"trans", "transgender", "tranny"}:
+            return "trans"
+        if values & {"couple", "couples", "group"}:
+            return "couples"
+        return "girls"
 
     def _parse_camsoda_models(self, html_text: str, page_url: str) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
@@ -1098,258 +1234,6 @@ class BrowserCaptureProvider(BaseProvider):
             })
         return items
 
-    def _parse_flirt4free_models(self, html_text: str, page_url: str) -> list[dict[str, object]]:
-        home_models = self._flirt4free_homepage_models(html_text)
-        if home_models:
-            items = []
-            for model in home_models:
-                username = str(model.get("model_seo_name") or model.get("model_name") or "").strip()
-                if not username:
-                    continue
-                room_status = str(model.get("room_status") or "").strip().lower()
-                is_public = str(model.get("room_status_char") or "").upper() == "O" or "open" in room_status
-                if not is_public:
-                    continue
-                category_tags = [
-                    model.get("category_name"),
-                    model.get("category_name_2"),
-                    model.get("category_name_3"),
-                    model.get("login_group_title"),
-                    model.get("credit_tier"),
-                    model.get("languages"),
-                    model.get("country_code"),
-                    "hd" if str(model.get("is_high_quality") or "") == "1" else "",
-                    "new" if str(model.get("is_new") or "") not in {"", "0"} else "",
-                    "fetish" if str(model.get("is_fetish") or "").upper() == "Y" else "",
-                ]
-                tags = _normalize_tags(category_tags)
-                image_id = str(model.get("sample_image_id") or "").strip()
-                thumbnail = None
-                if image_id:
-                    thumbnail = f"https://cdn5-images.vscdns.com/images/photos2/{image_id[-3:]}/{image_id}/small.jpg"
-                items.append({
-                    "username": username,
-                    "display_name": str(model.get("display") or username),
-                    "thumbnail": thumbnail,
-                    "viewers": _parse_count(str(model.get("viewer_count") or model.get("viewers") or 0)),
-                    "subject": str(model.get("scheduled_info", {}).get("title") or "") if isinstance(model.get("scheduled_info"), dict) else "",
-                    "age": _parse_count(str(model.get("age") or 0)) or None,
-                    "gender": "female",
-                    "is_online": True,
-                    "tags": tags or ["female", "public"],
-                    "room_status": "public",
-                    "source_type": self.source_type,
-                })
-            if items:
-                return self._dedupe_discover_models(items)
-
-        items: list[dict[str, object]] = []
-        for match in re.finditer(
-            r'<div\b(?P<attrs>[^>]*class\s*=\s*["\'][^"\']*model-container-home[^"\']*["\'][^>]*)>(?P<body>.*?)(?=<div\b[^>]*class\s*=\s*["\'][^"\']*model-container-home|</body>|\Z)',
-            html_text or "",
-            re.IGNORECASE | re.DOTALL,
-        ):
-            attrs = _parse_attrs(match.group("attrs"))
-            body = match.group("body") or ""
-            username_match = re.search(r'href\s*=\s*["\'][^"\']*[?&]model=([^"&\']+)', body, re.IGNORECASE)
-            if not username_match:
-                continue
-            username = unquote(username_match.group(1)).strip()
-            title_match = re.search(r'<img\b[^>]*\balt\s*=\s*["\']([^"\']+)["\']', body, re.IGNORECASE)
-            display_name = html.unescape(title_match.group(1)).strip() if title_match else username.replace("-", " ")
-            tags = ["female"]
-            class_value = attrs.get("class") or ""
-            if "partyRoom" in class_value:
-                tags.append("group")
-            if "openRoom" in class_value:
-                tags.append("public")
-            if "tip-controlled" in body or "lovense" in body.lower():
-                tags.append("toy")
-            if "new-model" in body or " new " in f" {class_value.lower()} ":
-                tags.append("new")
-            items.append({
-                "username": username,
-                "display_name": display_name,
-                "thumbnail": _first_image(body, page_url),
-                "viewers": _viewer_count(body),
-                "subject": "",
-                "age": None,
-                "gender": "female",
-                "is_online": True,
-                "tags": _normalize_tags(tags),
-                "room_status": "public",
-                "source_type": self.source_type,
-            })
-        if items:
-            return items
-        for match in re.finditer(
-            r'<div\b(?P<attrs>[^>]*class\s*=\s*["\'][^"\']*model-container[^"\']*["\'][^>]*)>(?P<body>.*?)(?=<div\b[^>]*class\s*=\s*["\'][^"\']*model-container|</body>|\Z)',
-            html_text or "",
-            re.IGNORECASE | re.DOTALL,
-        ):
-            body = match.group("body") or ""
-            href_match = re.search(r'href\s*=\s*["\']/models/bios/([^/"\']+)/about\.php', body, re.IGNORECASE)
-            if not href_match:
-                continue
-            slug = unquote(href_match.group(1)).strip()
-            if not slug:
-                continue
-            title_match = re.search(r'<img\b[^>]*\balt\s*=\s*["\']([^"\']+)["\']', body, re.IGNORECASE)
-            display_name = html.unescape(title_match.group(1)).strip() if title_match else slug.replace("-", " ")
-            category_tags = [
-                html.unescape(category).strip()
-                for category in re.findall(r'title\s*=\s*["\']Category\s+([^"\']+)["\']', body, re.IGNORECASE)
-            ]
-            subject = _strip_html(body)[:240]
-            tags = _normalize_tags(category_tags + _subject_keyword_tags(subject) + ["female"])
-            items.append({
-                "username": slug,
-                "display_name": display_name,
-                "thumbnail": _first_image(body, page_url),
-                "viewers": _viewer_count(body),
-                "subject": "",
-                "age": None,
-                "gender": "female",
-                "is_online": True,
-                "tags": tags,
-                "room_status": "public",
-                "source_type": self.source_type,
-            })
-        if not items:
-            for match in _ANCHOR_RE.finditer(html_text or ""):
-                attrs = _parse_attrs(match.group("attrs"))
-                href = attrs.get("href") or ""
-                href_match = re.search(r"/models/([^/\"']+)\.html?$", href, re.IGNORECASE)
-                if not href_match:
-                    continue
-                username = unquote(href_match.group(1)).strip()
-                body = match.group("body") or ""
-                if not username or username.lower() in _RESERVED_PROFILE_SEGMENTS:
-                    continue
-                items.append({
-                    "username": username,
-                    "display_name": attrs.get("title") or _strip_html(body) or username,
-                    "thumbnail": _first_image(body, page_url),
-                    "viewers": _viewer_count(body),
-                    "subject": "",
-                    "age": None,
-                    "gender": "female",
-                    "is_online": True,
-                    "tags": ["female"],
-                    "room_status": "public",
-                    "source_type": self.source_type,
-                })
-        return items
-
-    async def _resolve_flirt4free_hls(self, target: str) -> Optional[ResolvedStream]:
-        slug = self._flirt4free_slug(target)
-        if not slug:
-            return None
-
-        pages = list(self.discover_urls(1, None, None, None))
-        if not pages:
-            pages = ["https://www.flirt4free.com/live/girls/"]
-        pages.append(f"https://www.flirt4free.com/search?q={quote_plus(slug)}")
-
-        matched: Optional[dict[str, object]] = None
-        referer = "https://www.flirt4free.com/live/girls/"
-        for page_url in pages:
-            html_text = await self._fetch_discover_html(page_url)
-            if not html_text:
-                continue
-            for model in self._flirt4free_homepage_models(html_text):
-                if self._flirt4free_model_matches(model, slug):
-                    matched = model
-                    referer = page_url
-                    break
-            if matched:
-                break
-        if not matched:
-            return None
-
-        if str(matched.get("video_blocked") or "0") == "1" or str(matched.get("is_hls") or "") != "1":
-            raise ProviderPrivateError("Flirt4Free ne fournit pas de HLS public pour ce modele")
-        room_status = str(matched.get("room_status") or "").lower()
-        if str(matched.get("room_status_char") or "").upper() != "O" and "open" not in room_status:
-            raise ProviderPrivateError("Le modele Flirt4Free n'est pas en room publique")
-
-        model_id = str(matched.get("model_id") or "").strip()
-        video_host = str(matched.get("video_host") or "").strip()
-        if not model_id or not video_host:
-            return None
-
-        stream_data = await self._fetch_flirt4free_stream_data(model_id, video_host, referer)
-        media_rows = []
-        data = stream_data.get("data") if isinstance(stream_data, dict) else {}
-        if isinstance(data, dict):
-            for key in ("llhls", "hls"):
-                rows = data.get(key)
-                if isinstance(rows, list):
-                    media_rows.extend(row for row in rows if isinstance(row, dict))
-
-        headers = self._stream_headers(referer, await self._provider_cookie_header())
-        for row in media_rows:
-            stream_url = str(row.get("url") or "").strip().replace("\\/", "/")
-            if stream_url.startswith("//"):
-                stream_url = "https:" + stream_url
-            if not stream_url:
-                continue
-            if await self._is_valid_playlist(stream_url, headers):
-                tags = _normalize_tags([
-                    matched.get("category_name"),
-                    matched.get("category_name_2"),
-                    matched.get("category_name_3"),
-                    matched.get("login_group_title"),
-                    matched.get("credit_tier"),
-                    "hd" if str(matched.get("is_high_quality") or "") == "1" else "",
-                    "public",
-                ])
-                return ResolvedStream(
-                    url=stream_url,
-                    headers=headers,
-                    source_type=self.source_type,
-                    is_live=True,
-                    room_status="public",
-                    viewers=_parse_count(str(matched.get("viewer_count") or matched.get("viewers") or 0)),
-                    tags=tags,
-                    thumbnail=None,
-                    title=str(matched.get("display") or slug),
-                )
-        raise ProviderOfflineError("Aucun HLS Flirt4Free public valide")
-
-    async def _fetch_flirt4free_stream_data(self, model_id: str, video_host: str, referer: str) -> dict[str, object]:
-        headers = {
-            "User-Agent": DEFAULT_USER_AGENT,
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": referer,
-        }
-        cookie_header = await self._provider_cookie_header()
-        if cookie_header:
-            headers["Cookie"] = cookie_header
-        url = "https://www.flirt4free.com/ws/chat/get-stream-urls.php?" + urlencode({
-            "model_id": model_id,
-            "video_host": video_host,
-        })
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp_client_session(timeout=timeout) as session:
-            async with session.get(url, headers=headers, **aiohttp_request_kwargs()) as resp:
-                if resp.status >= 400:
-                    raise ProviderOfflineError(f"Flirt4Free stream endpoint HTTP {resp.status}")
-                payload = await resp.json(content_type=None)
-        return payload if isinstance(payload, dict) else {}
-
-    async def _is_valid_playlist(self, stream_url: str, headers: dict[str, str]) -> bool:
-        timeout = aiohttp.ClientTimeout(total=12)
-        try:
-            async with aiohttp_client_session(timeout=timeout) as session:
-                async with session.get(stream_url, headers=headers, **aiohttp_request_kwargs()) as resp:
-                    if resp.status >= 400:
-                        return False
-                    head = await resp.content.read(256)
-        except Exception:
-            return False
-        return head.lstrip().startswith(b"#EXTM3U") or b"<MPD" in head[:256]
-
     async def _provider_cookie_header(self) -> str:
         if not self.session_store:
             return ""
@@ -1358,66 +1242,1530 @@ class BrowserCaptureProvider(BaseProvider):
         except Exception:
             return ""
 
-    def _flirt4free_homepage_models(self, html_text: str) -> list[dict[str, object]]:
-        source = html_text or ""
-        marker = source.find("window.__homePageData__")
-        if marker >= 0:
-            source = source[marker:]
-        array_text = self._extract_js_array_after_key(source, "models")
-        if not array_text:
-            return []
-        array_text = re.sub(r",\s*([\]}])", r"\1", array_text)
+    async def _provider_session_state(self) -> dict[str, Any]:
+        if not self.session_store:
+            return {}
         try:
-            data = json.loads(array_text)
+            return await self.session_store.get(self.source_type)
         except Exception:
-            return []
-        return [item for item in data if isinstance(item, dict)]
+            return {}
 
-    def _extract_js_array_after_key(self, text: str, key: str) -> str:
-        key_match = re.search(rf"['\"]{re.escape(key)}['\"]\s*:\s*\[", text or "")
-        if not key_match:
-            return ""
-        start = key_match.end() - 1
-        depth = 0
-        quote = ""
-        escaped = False
-        for idx in range(start, len(text)):
-            ch = text[idx]
-            if quote:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == quote:
-                    quote = ""
+    async def _provider_session_username(self) -> Optional[str]:
+        state = await self._provider_session_state()
+        username = str(state.get("username") or state.get("credential_username") or "").strip()
+        return username or None
+
+    async def _provider_has_session(self) -> bool:
+        state = await self._provider_session_state()
+        return bool(state.get("cookies") or state.get("localStorage") or state.get("is_logged_in"))
+
+    async def sync_following(self) -> list[dict[str, object]]:
+        if self.source_type == "stripchat":
+            return await self._stripchat_sync_following_http()
+        if self.source_type == "bongacams":
+            return await self._bongacams_sync_following()
+        return await super().sync_following()
+
+    async def follow(self, username: str) -> dict[str, object]:
+        if self.source_type == "stripchat":
+            try:
+                return await self._stripchat_follow_http(username, follow=True)
+            except ProviderAuthError:
+                raise
+            except ProviderError as exc:
+                logger.debug("Stripchat HTTP follow failed", username=username, error=str(exc))
+                try:
+                    return await self._stripchat_browser_follow_action(username, follow=True)
+                except ProviderAuthError:
+                    raise
+                except ProviderError as browser_exc:
+                    return {"success": False, "error": str(browser_exc)}
+        if self.source_type == "bongacams":
+            return await self._bongacams_follow_action(username, follow=True)
+        return await super().follow(username)
+
+    async def unfollow(self, username: str) -> dict[str, object]:
+        if self.source_type == "stripchat":
+            try:
+                return await self._stripchat_follow_http(username, follow=False)
+            except ProviderAuthError:
+                raise
+            except ProviderError as exc:
+                logger.debug("Stripchat HTTP unfollow failed", username=username, error=str(exc))
+                try:
+                    return await self._stripchat_browser_follow_action(username, follow=False)
+                except ProviderAuthError:
+                    raise
+                except ProviderError as browser_exc:
+                    return {"success": False, "error": str(browser_exc)}
+        if self.source_type == "bongacams":
+            return await self._bongacams_follow_action(username, follow=False)
+        return await super().unfollow(username)
+
+    async def is_following(self, username: str) -> bool:
+        if self.source_type == "stripchat":
+            try:
+                payload = await self._stripchat_api_json(
+                    "GET",
+                    f"/v2/models/username/{quote_plus(username)}/cam",
+                    auth_required=False,
+                    referer=self.canonical_url(username),
+                )
+                value = self._stripchat_find_value(payload, {"isinfavorites"})
+                if value is not None:
+                    return bool(value)
+            except Exception:
+                pass
+            try:
+                items = await self.sync_following()
+            except Exception:
+                return False
+            needle = username.strip().lower()
+            return any(str(item.get("username") or "").lower() == needle for item in items)
+        if self.source_type == "bongacams":
+            if await self._local_provider_is_following(username):
+                return True
+            return await self._bongacams_is_following_browser(username)
+        return await super().is_following(username)
+
+    async def _local_provider_following(self) -> list[dict[str, object]]:
+        db = getattr(self.session_store, "db", None) if self.session_store else None
+        if not db or not hasattr(db, "get_all_followed"):
+            return []
+        rows = await db.get_all_followed()
+        items: list[dict[str, object]] = []
+        for row in rows or []:
+            source_type = str(row.get("source_type") or "chaturbate").strip().lower()
+            if source_type != self.source_type:
                 continue
-            if ch in {"'", '"'}:
-                quote = ch
-            elif ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    return text[start:idx + 1]
+            username = str(row.get("username") or "").strip()
+            if not username:
+                continue
+            items.append({
+                "username": username,
+                "display_name": row.get("display_name") or username,
+                "thumbnail": row.get("thumbnail_url") or row.get("thumbnail"),
+                "viewers": int(row.get("viewers") or 0),
+                "is_online": bool(row.get("is_online")),
+                "room_status": row.get("room_status"),
+                "source_type": self.source_type,
+            })
+        return items
+
+    async def _local_provider_is_following(self, username: str) -> bool:
+        db = getattr(self.session_store, "db", None) if self.session_store else None
+        if not db or not hasattr(db, "get_followed_model"):
+            return False
+        try:
+            row = await db.get_followed_model(username, source_type=self.source_type)
+        except TypeError:
+            row = await db.get_followed_model(username)
+        source_type = str((row or {}).get("source_type") or "chaturbate").strip().lower()
+        return bool(row and source_type == self.source_type)
+
+    async def _bongacams_sync_following(self) -> list[dict[str, object]]:
+        return await self._local_provider_following()
+
+    async def _bongacams_follow_action(self, username: str, follow: bool) -> dict[str, object]:
+        username = (username or "").strip()
+        if not username:
+            return {"success": False, "error": "Username is required"}
+
+        remote_required = os.getenv("PSTREAMREC_BONGACAMS_REMOTE_FOLLOW_REQUIRED", "").lower() in {"1", "true", "yes"}
+        if await self._provider_has_session():
+            try:
+                return await self._bongacams_browser_follow_action(username, follow=follow)
+            except ProviderError as exc:
+                logger.debug(
+                    "BongaCams remote follow action failed; keeping local follow state",
+                    username=username,
+                    follow=follow,
+                    error=str(exc),
+                )
+                if remote_required:
+                    return {"success": False, "error": str(exc)}
+            except Exception as exc:
+                logger.debug(
+                    "BongaCams remote follow action crashed; keeping local follow state",
+                    username=username,
+                    follow=follow,
+                    error=str(exc),
+                )
+                if remote_required:
+                    return {"success": False, "error": str(exc)}
+
+        return {
+            "success": True,
+            "localOnly": True,
+            "provider": "bongacams",
+            "username": username,
+            "action": "follow" if follow else "unfollow",
+        }
+
+    async def _bongacams_is_following_browser(self, username: str) -> bool:
+        if not await self._provider_has_session():
+            return False
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception:
+            return False
+
+        headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        browser_user_agent = await self._stored_browser_user_agent()
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                user_agent=browser_user_agent,
+                viewport={"width": 1280, "height": 720},
+                args=self._browser_args(),
+            )
+            try:
+                await self._restore_cookies(context)
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    await page.goto(self.canonical_url(username), wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeoutError:
+                    pass
+                await self._dismiss_common_prompts(page)
+                if not await self._looks_logged_in(page, username=await self._provider_session_username()):
+                    return False
+                state = await self._bongacams_page_follow_state(page)
+                return state is True
+            finally:
+                await context.close()
+
+    async def _bongacams_browser_follow_action(self, username: str, follow: bool) -> dict[str, object]:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            raise ProviderError("Playwright n'est pas installe") from exc
+
+        headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        session_username = await self._provider_session_username()
+
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                args=self._browser_args(),
+            )
+            try:
+                await self._restore_cookies(context)
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    await page.goto(self.canonical_url(username), wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeoutError:
+                    pass
+                await self._dismiss_common_prompts(page)
+                if not await self._looks_logged_in(page, username=session_username):
+                    raise ProviderAuthError("Connexion BongaCams requise")
+
+                current_state = await self._bongacams_page_follow_state(page)
+                if current_state is follow:
+                    await self._save_browser_state(context, session_username, is_logged_in=True)
+                    return {"success": True, "remote": True, "provider": "bongacams", "username": username}
+
+                clicked = await self._bongacams_click_follow_button(page, follow=follow)
+                if not clicked:
+                    raise ProviderError("Bouton follow BongaCams introuvable")
+
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    await page.wait_for_timeout(500)
+                    state = await self._bongacams_page_follow_state(page)
+                    if state is follow:
+                        await self._save_browser_state(context, session_username, is_logged_in=True)
+                        return {"success": True, "remote": True, "provider": "bongacams", "username": username}
+
+                await self._save_browser_state(context, session_username, is_logged_in=True)
+                return {"success": True, "remote": True, "provider": "bongacams", "username": username}
+            finally:
+                await context.close()
+
+    async def _bongacams_page_follow_state(self, page) -> Optional[bool]:
+        try:
+            return await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.visibility === 'hidden' || style.display === 'none') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+                    const controls = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'))
+                        .filter((el) => visible(el) && !el.disabled);
+                    for (const el of controls) {
+                        const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim().toLowerCase();
+                        if (!text) continue;
+                        if (/\\b(unfollow|following|favorited|remove from favorites?)\\b/.test(text)) return true;
+                        if (/\\b(follow|favorite|add to favorites?)\\b/.test(text)) return false;
+                    }
+                    return null;
+                }
+                """
+            )
+        except Exception:
+            return None
+
+    async def _bongacams_click_follow_button(self, page, follow: bool) -> bool:
+        pattern = (
+            re.compile(r"^(follow|favorite|add to favorites?)$", re.IGNORECASE)
+            if follow
+            else re.compile(r"^(unfollow|following|favorited|remove from favorites?)$", re.IGNORECASE)
+        )
+        for role in ("button", "link"):
+            try:
+                locator = page.get_by_role(role, name=pattern)
+                count = min(await locator.count(), 3)
+                for idx in range(count):
+                    try:
+                        await locator.nth(idx).click(timeout=1500)
+                        return True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return False
+
+    def _normalize_playwright_cookie(self, cookie: dict[str, Any], default_url: Optional[str] = None) -> Optional[dict[str, Any]]:
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            return None
+        normalized: dict[str, Any] = {
+            "name": name,
+            "value": str(cookie.get("value") or ""),
+            "path": str(cookie.get("path") or "/"),
+        }
+        domain = str(cookie.get("domain") or "").strip()
+        if domain:
+            normalized["domain"] = domain
+        else:
+            url = str(cookie.get("url") or default_url or "").strip()
+            if url:
+                normalized["url"] = url
+            else:
+                return None
+        expires = cookie.get("expires", cookie.get("expiry"))
+        if isinstance(expires, (int, float)) and expires > 0:
+            normalized["expires"] = int(expires)
+        for key in ("httpOnly", "secure"):
+            if key in cookie:
+                normalized[key] = bool(cookie.get(key))
+        same_site = str(cookie.get("sameSite") or "").strip()
+        same_site_map = {
+            "strict": "Strict",
+            "lax": "Lax",
+            "none": "None",
+            "no_restriction": "None",
+            "unspecified": "Lax",
+        }
+        if same_site.lower() in same_site_map:
+            normalized["sameSite"] = same_site_map[same_site.lower()]
+        return normalized
+
+    def _merge_cookies(self, existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for cookie in existing + incoming:
+            if not isinstance(cookie, dict):
+                continue
+            normalized = self._normalize_playwright_cookie(cookie)
+            if not normalized:
+                continue
+            key = (
+                str(normalized.get("name") or ""),
+                str(normalized.get("domain") or normalized.get("url") or ""),
+                str(normalized.get("path") or "/"),
+            )
+            merged[key] = normalized
+        return list(merged.values())
+
+    def _default_cookie_url(self) -> str:
+        if self.source_type == "bongacams":
+            return BONGACAMS_BASE_URL
+        if self.url_templates:
+            template = self.url_templates[0]
+            return template.format(username="")
+        return "https://" + (self.domains[0] if self.domains else "localhost")
+
+    def _default_cookie_domain(self) -> str:
+        host = urlparse(self._default_cookie_url()).netloc.lower()
+        return f".{host.removeprefix('www.')}" if host else ""
+
+    def _cookie_header_to_playwright_cookies(self, cookie_header: str) -> list[dict[str, Any]]:
+        cookie_header = self._header_value(cookie_header, "cookie") or (cookie_header or "")
+        domain = self._default_cookie_domain()
+        if not domain:
+            return []
+        ignored_names = {
+            "domain",
+            "path",
+            "expires",
+            "max-age",
+            "samesite",
+            "secure",
+            "httponly",
+        }
+        cookies: list[dict[str, Any]] = []
+        for part in (cookie_header or "").split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if not name or name.lower() in ignored_names:
+                continue
+            normalized = self._normalize_playwright_cookie({
+                "name": name,
+                "value": value.strip(),
+                "domain": domain,
+                "path": "/",
+                "sameSite": "Lax",
+                "secure": True,
+            })
+            if normalized:
+                cookies.append(normalized)
+        return cookies
+
+    def _header_value(self, raw: str, name: str) -> str:
+        wanted = (name or "").strip().lower()
+        for line in (raw or "").splitlines():
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            if key.strip().lower() == wanted:
+                return value.strip()
         return ""
 
-    def _flirt4free_slug(self, target: str) -> str:
-        raw = (target or "").strip()
-        if raw.startswith(("http://", "https://")):
-            username = self._username_from_url(raw) or raw.rstrip("/").rsplit("/", 1)[-1]
-        else:
-            username = raw
-        username = re.sub(r"\.html?$", "", username)
-        return username.strip().lower().replace("_", "-")
+    def _cookie_value(self, cookies: list[dict[str, Any]], name: str) -> str:
+        wanted = (name or "").strip().lower()
+        for cookie in cookies or []:
+            if not isinstance(cookie, dict):
+                continue
+            if str(cookie.get("name") or "").strip().lower() == wanted:
+                return str(cookie.get("value") or "").strip()
+        return ""
 
-    def _flirt4free_model_matches(self, model: dict[str, object], slug: str) -> bool:
-        candidates = [
-            model.get("model_seo_name"),
-            str(model.get("model_name") or "").replace("_", "-"),
-            str(model.get("display") or "").replace(" ", "-"),
+    def _provider_metadata_from_storage(self, local_storage: list[dict[str, Any]]) -> dict[str, str]:
+        for entry in local_storage or []:
+            if not isinstance(entry, dict) or entry.get("origin") != "pstreamrec://provider":
+                continue
+            metadata: dict[str, str] = {}
+            for item in entry.get("localStorage") or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                value = str(item.get("value") or "").strip()
+                if name and value:
+                    metadata[name] = value
+            return metadata
+        return {}
+
+    def _merge_provider_metadata_storage(
+        self,
+        local_storage: list[dict[str, Any]],
+        metadata: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        cleaned = [
+            entry
+            for entry in (local_storage or [])
+            if not (isinstance(entry, dict) and entry.get("origin") == "pstreamrec://provider")
         ]
-        normalized = {str(value or "").strip().lower().replace("_", "-") for value in candidates}
-        return slug in normalized
+        values = [
+            {"name": name, "value": value}
+            for name, value in metadata.items()
+            if value
+        ]
+        if values:
+            cleaned.append({"origin": "pstreamrec://provider", "localStorage": values})
+        return cleaned
+
+    async def _stored_browser_user_agent(self) -> str:
+        state = await self._provider_session_state()
+        metadata = self._provider_metadata_from_storage(list(state.get("localStorage") or []))
+        return metadata.get("userAgent") or DEFAULT_USER_AGENT
+
+    def _session_check_url(self, username: Optional[str] = None) -> str:
+        if username:
+            return self.canonical_url(username)
+        if self.source_type == "bongacams":
+            return BONGACAMS_BASE_URL
+        return self._default_cookie_url()
+
+    async def import_session(
+        self,
+        username: Optional[str] = None,
+        cookie_header: Optional[str] = None,
+        cookies: Optional[list[dict[str, Any]]] = None,
+        local_storage: Optional[list[dict[str, Any]]] = None,
+        user_agent: Optional[str] = None,
+        x_bc: Optional[str] = None,
+    ) -> dict[str, object]:
+        username = (username or "").strip() or await self._provider_session_username()
+        raw_cookie_header = cookie_header or ""
+        check_url = self._session_check_url(username)
+        incoming = self._cookie_header_to_playwright_cookies(raw_cookie_header)
+        incoming.extend(
+            normalized
+            for cookie in (cookies or [])
+            if isinstance(cookie, dict)
+            for normalized in [self._normalize_playwright_cookie(cookie, default_url=check_url)]
+            if normalized
+        )
+        state = await self._provider_session_state()
+        merged = self._merge_cookies(list(state.get("cookies") or []), incoming)
+        storage = local_storage if local_storage is not None else list(state.get("localStorage") or [])
+        if not incoming:
+            return {"success": False, "error": "No session cookies provided"}
+        logged_in = await self._verify_imported_session(
+            username=username,
+            cookies=merged,
+            local_storage=storage,
+            check_url=check_url,
+        )
+        if logged_in:
+            return {"success": True, "username": username, "importedSession": True}
+        return {
+            "success": False,
+            "error": "Session cookies were saved but did not authenticate the provider",
+            "importedSession": True,
+        }
+
+    async def _verify_imported_session(
+        self,
+        username: Optional[str],
+        cookies: list[dict[str, Any]],
+        local_storage: list[dict[str, Any]],
+        check_url: str,
+    ) -> bool:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            raise ProviderError("Playwright n'est pas installe") from exc
+
+        headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                args=self._browser_args(),
+            )
+            try:
+                await self._apply_browser_stealth(context)
+                try:
+                    await context.add_cookies(cookies)
+                except Exception as exc:
+                    raise ProviderError("Session cookies invalides") from exc
+                if local_storage:
+                    try:
+                        await context.add_init_script(
+                            """
+                            (() => {
+                                const origins = __PSTREAMREC_ORIGINS__;
+                                const originState = origins.find((entry) => entry && entry.origin === window.location.origin);
+                                if (!originState || !Array.isArray(originState.localStorage)) return;
+                                for (const item of originState.localStorage) {
+                                    if (!item || !item.name || typeof item.value !== 'string') continue;
+                                    try { window.localStorage.setItem(item.name, item.value); } catch {}
+                                }
+                            })();
+                            """.replace("__PSTREAMREC_ORIGINS__", json.dumps(local_storage))
+                        )
+                    except Exception:
+                        pass
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    await page.goto(check_url, wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeoutError:
+                    pass
+                await self._dismiss_common_prompts(page)
+                await page.wait_for_timeout(1500)
+                logged_in = await self._looks_logged_in(page, username=username)
+                await self._save_browser_state(
+                    context,
+                    username,
+                    is_logged_in=logged_in,
+                    last_error=None if logged_in else "auth_required",
+                )
+                return logged_in
+            finally:
+                await context.close()
+
+    async def _refresh_flaresolverr_cookies(
+        self,
+        page_url: str,
+        username: Optional[str] = None,
+    ) -> tuple[list[dict[str, Any]], Optional[str]]:
+        flaresolverr_url = (os.getenv("FLARESOLVERR_URL") or os.getenv("PSTREAMREC_FLARESOLVERR_URL") or "").strip()
+        if not flaresolverr_url:
+            return [], None
+
+        payload = {
+            "cmd": "request.get",
+            "url": page_url,
+            "maxTimeout": int(os.getenv("PSTREAMREC_FLARESOLVERR_TIMEOUT_MS", "60000") or "60000"),
+        }
+        endpoint = flaresolverr_url.rstrip("/") + "/v1"
+        try:
+            timeout = aiohttp.ClientTimeout(total=max(10, payload["maxTimeout"] / 1000 + 5))
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
+                async with session.post(endpoint, json=payload) as resp:
+                    data = await resp.json(content_type=None)
+        except Exception as exc:
+            logger.debug("FlareSolverr cookie refresh failed", source_type=self.source_type, url=page_url, error=str(exc))
+            return [], None
+
+        if data.get("status") != "ok":
+            logger.debug("FlareSolverr cookie refresh rejected", source_type=self.source_type, response=data.get("message"))
+            return [], None
+
+        solution = data.get("solution") or {}
+        raw_cookies = solution.get("cookies") or []
+        cookies = [
+            normalized
+            for cookie in raw_cookies
+            if isinstance(cookie, dict)
+            for normalized in [self._normalize_playwright_cookie(cookie, default_url=page_url)]
+            if normalized
+        ]
+        user_agent = str(solution.get("userAgent") or "").strip() or None
+        if not cookies:
+            return [], user_agent
+
+        if self.session_store:
+            state = await self._provider_session_state()
+            merged = self._merge_cookies(list(state.get("cookies") or []), cookies)
+            await self.session_store.save(
+                self.source_type,
+                username=username or state.get("username") or state.get("credential_username"),
+                is_logged_in=bool(state.get("is_logged_in")),
+                cookies=merged,
+                local_storage=state.get("localStorage") or [],
+                last_error=state.get("last_error"),
+            )
+        return cookies, user_agent
+
+    async def _stripchat_sync_following_http(self) -> list[dict[str, object]]:
+        if not await self._stripchat_has_session():
+            raise ProviderAuthError("Connexion Stripchat requise pour synchroniser les favoris")
+
+        models: list[dict[str, object]] = []
+        page_limit = max(1, min(100, int(os.getenv("PSTREAMREC_STRIPCHAT_FAVORITES_LIMIT", "50") or "50")))
+        max_pages = max(1, int(os.getenv("PSTREAMREC_STRIPCHAT_FAVORITES_MAX_PAGES", "20") or "20"))
+        for path in ("/models/favorites", "/models/favorites/offline"):
+            offset = 0
+            for _ in range(max_pages):
+                payload = await self._stripchat_api_json(
+                    "GET",
+                    path,
+                    params={"limit": page_limit, "offset": offset},
+                    auth_required=True,
+                    referer=f"{STRIPCHAT_BASE_URL}/favorites",
+                )
+                page_models = self._stripchat_models_from_payload(payload)
+                models.extend(page_models)
+                total = int(payload.get("totalCount") or len(page_models)) if isinstance(payload, dict) else len(page_models)
+                if len(page_models) < page_limit or offset + page_limit >= total:
+                    break
+                offset += page_limit
+
+        items = [
+            item
+            for item in (self._stripchat_model_item(model) for model in self._dedupe_stripchat_models(models))
+            if item
+        ]
+        items.sort(key=lambda item: (not bool(item.get("is_online")), -int(item.get("viewers") or 0), str(item.get("username") or "").lower()))
+        return items
+
+    async def _stripchat_follow_http(self, username: str, follow: bool) -> dict[str, object]:
+        if not await self._stripchat_has_session():
+            raise ProviderAuthError("Connexion Stripchat requise")
+        model = await self._stripchat_model_by_username(username)
+        model_id = self._stripchat_model_id(model)
+        if not model_id:
+            raise ProviderError(f"Modele Stripchat introuvable: {username}")
+        current_user_id = await self._stripchat_current_user_id()
+        if not current_user_id:
+            raise ProviderAuthError("Utilisateur Stripchat connecte introuvable")
+
+        if follow:
+            await self._stripchat_api_json(
+                "PUT",
+                f"/users/{current_user_id}/favorites/{model_id}",
+                body={"uniq": int(time.time() * 1000)},
+                auth_required=True,
+                referer=self.canonical_url(username),
+            )
+        else:
+            await self._stripchat_api_json(
+                "DELETE",
+                f"/users/{current_user_id}/favorites",
+                body={"favoriteIds": [int(model_id)], "uniq": int(time.time() * 1000)},
+                auth_required=True,
+                referer=self.canonical_url(username),
+            )
+        return {"success": True, "remote": True, "provider": "stripchat", "username": username}
+
+    async def _stripchat_model_by_username(self, username: str) -> dict[str, object]:
+        payload = await self._stripchat_api_json(
+            "GET",
+            f"/v2/models/username/{quote_plus(username)}/cam",
+            auth_required=False,
+            referer=self.canonical_url(username),
+        )
+        model = self._stripchat_profile_model(payload)
+        if model:
+            return model
+        payload = await self._stripchat_api_json(
+            "GET",
+            f"/v2/users/username/{quote_plus(username)}",
+            auth_required=False,
+            referer=self.canonical_url(username),
+        )
+        model = self._stripchat_profile_model(payload)
+        if model:
+            return model
+        raise ProviderError(f"Modele Stripchat introuvable: {username}")
+
+    async def _resolve_stripchat_public_hls(
+        self,
+        target: str,
+        max_height: Optional[int] = None,
+    ) -> Optional[ResolvedStream]:
+        del max_height
+        username = self._stripchat_username_from_target(target)
+        if not username:
+            return None
+
+        page_url = self.canonical_url(username)
+        payload = await self._stripchat_api_json(
+            "GET",
+            f"/v2/models/username/{quote_plus(username)}/cam",
+            auth_required=False,
+            referer=page_url,
+        )
+        model = self._stripchat_profile_model(payload) if isinstance(payload, dict) else None
+        if not model:
+            raise ProviderOfflineError(f"Modele Stripchat introuvable ou hors ligne: {username}")
+
+        self._validate_stripchat_public_stream(payload, model, username)
+        model_id = self._stripchat_model_id(model)
+        if not model_id:
+            raise ProviderOfflineError(f"Flux Stripchat introuvable: {username}")
+
+        headers = self._stream_headers(page_url, await self._provider_cookie_header())
+        hosts = self._stripchat_hls_hosts_from_payload(payload) or list(STRIPCHAT_HLS_HOSTS)
+        for host in hosts:
+            playlist_url = (
+                f"https://edge-hls.{host}/hls/{model_id}/master/{model_id}_auto.m3u8"
+                f"{self._stripchat_master_playlist_query()}"
+            )
+            if await self._stripchat_probe_hls_playlist(playlist_url, headers):
+                item = self._stripchat_model_item(model) or {}
+                return ResolvedStream(
+                    url=playlist_url,
+                    headers=headers,
+                    source_type=self.source_type,
+                    is_live=True,
+                    room_status="public",
+                    viewers=int(item.get("viewers") or 0),
+                    tags=list(item.get("tags") or []),
+                    thumbnail=item.get("thumbnail") or None,
+                    title=str(item.get("display_name") or username),
+                )
+
+        raise ProviderOfflineError(f"Aucun HLS Stripchat public valide pour {username}")
+
+    def _stripchat_master_playlist_query(self) -> str:
+        params = {
+            "minHeight": os.getenv("PSTREAMREC_STRIPCHAT_MIN_HEIGHT", "240"),
+            "playlistType": os.getenv("PSTREAMREC_STRIPCHAT_PLAYLIST_TYPE", "standard"),
+        }
+        playback_key = (os.getenv("PSTREAMREC_STRIPCHAT_PLAYBACK_KEY", STRIPCHAT_PLAYBACK_KEY) or "").strip()
+        if playback_key:
+            params["pkey"] = playback_key
+        return "?" + urlencode(params)
+
+    def _stripchat_username_from_target(self, target: str) -> Optional[str]:
+        target = (target or "").strip().strip("@/ ")
+        if target.startswith(("http://", "https://")):
+            return self._username_from_url(target)
+        if not re.match(r"^[A-Za-z0-9_.-]{2,64}$", target):
+            return None
+        if target.lower() in _RESERVED_PROFILE_SEGMENTS:
+            return None
+        return target
+
+    def _validate_stripchat_public_stream(
+        self,
+        payload: object,
+        model: dict[str, object],
+        username: str,
+    ) -> None:
+        if self._stripchat_login_requires_interaction(payload):
+            raise ProviderInteractionRequired("Stripchat demande une verification interactive")
+
+        cam = payload.get("cam") if isinstance(payload, dict) and isinstance(payload.get("cam"), dict) else {}
+        private_indicators = (
+            cam.get("show"),
+            cam.get("privateMode"),
+            cam.get("groupShowAnnouncement"),
+            cam.get("ticketShow"),
+            cam.get("ticketShowAnnouncement"),
+            cam.get("privateShow"),
+        )
+        if any(self._stripchat_truthy_indicator(value) for value in private_indicators):
+            raise ProviderPrivateError(f"Stripchat/{username}: show prive, groupe ou ticket")
+
+        for value in (model.get("status"), cam.get("streamStatus"), cam.get("status")):
+            status = str(value or "").strip().lower()
+            if not status:
+                continue
+            if any(marker in status for marker in ("private", "group", "ticket", "premium", "spy", "p2p")):
+                raise ProviderPrivateError(f"Stripchat/{username}: show prive, groupe ou ticket")
+            if status in {"offline", "away", "idle", "inactive", "not_live", "not live"}:
+                raise ProviderOfflineError(f"Stripchat/{username}: modele hors ligne")
+
+        if cam.get("isCamAvailable") is False or cam.get("isCamActive") is False:
+            raise ProviderOfflineError(f"Stripchat/{username}: modele hors ligne")
+        if model.get("isOnline") is False or model.get("isLive") is False:
+            raise ProviderOfflineError(f"Stripchat/{username}: modele hors ligne")
+
+    def _stripchat_truthy_indicator(self, value: object) -> bool:
+        if value in (None, False, "", [], {}):
+            return False
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "none", "null", "no", "off"}
+        return bool(value)
+
+    def _stripchat_hls_hosts_from_payload(self, payload: object) -> list[str]:
+        values: list[str] = []
+
+        def walk(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    key_lower = str(key).lower()
+                    if key_lower == "hlsstreamhost" and child:
+                        values.append(str(child))
+                    elif key_lower == "fallbackdomains" and isinstance(child, list):
+                        values.extend(str(item) for item in child if item)
+                    else:
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(payload)
+        hosts: list[str] = []
+        seen = set()
+        for value in values:
+            host = str(value or "").strip().strip("/")
+            if not host or host in seen:
+                continue
+            seen.add(host)
+            hosts.append(host)
+        return hosts
+
+    async def _stripchat_probe_hls_playlist(self, playlist_url: str, headers: dict[str, str]) -> bool:
+        try:
+            timeout = aiohttp.ClientTimeout(total=int(os.getenv("PSTREAMREC_STRIPCHAT_HLS_PROBE_TIMEOUT", "12") or "12"))
+            async with aiohttp_client_session(timeout=timeout) as session:
+                async with session.get(
+                    playlist_url,
+                    headers=headers,
+                    allow_redirects=True,
+                    **aiohttp_request_kwargs(),
+                ) as resp:
+                    if resp.status in (401, 403):
+                        raise ProviderAuthError("Flux Stripchat refuse ou session requise")
+                    if resp.status >= 400:
+                        return False
+                    head = await resp.content.read(512)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            logger.debug("Stripchat HLS probe failed", url=playlist_url, error=str(exc))
+            return False
+        return head.lstrip().startswith(b"#EXTM3U")
+
+    async def _stripchat_user_by_username(self, username: str) -> dict[str, object]:
+        payload = await self._stripchat_api_json(
+            "GET",
+            f"/v2/users/username/{quote_plus(username)}",
+            auth_required=True,
+            referer=STRIPCHAT_BASE_URL,
+        )
+        model = self._stripchat_profile_model(payload)
+        if model:
+            return model
+        raise ProviderAuthError("Utilisateur Stripchat connecte introuvable")
+
+    async def _stripchat_current_user_id(self) -> Optional[int]:
+        state = await self._stripchat_session_state()
+        saved_username = self._stripchat_saved_username(state)
+        local_id = self._stripchat_find_user_id(state.get("localStorage"), saved_username)
+        if local_id:
+            return local_id
+        if saved_username:
+            user = await self._stripchat_user_by_username(saved_username)
+            model_id = self._stripchat_model_id(user)
+            if model_id:
+                try:
+                    return int(model_id)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def _stripchat_model_id(self, model: dict[str, object]) -> str:
+        return str(model.get("id") or model.get("streamName") or "").strip()
+
+    def _stripchat_front_version(self) -> str:
+        return (os.getenv("PSTREAMREC_STRIPCHAT_FRONT_VERSION") or STRIPCHAT_FRONT_VERSION).strip() or STRIPCHAT_FRONT_VERSION
+
+    def _stripchat_login_paths(self) -> tuple[str, ...]:
+        raw = (os.getenv("PSTREAMREC_STRIPCHAT_LOGIN_PATHS") or "").strip()
+        if not raw:
+            return STRIPCHAT_LOGIN_PATHS
+        paths = tuple(part.strip() for part in raw.split(",") if part.strip())
+        return paths or STRIPCHAT_LOGIN_PATHS
+
+    def _stripchat_login_payloads(
+        self,
+        username: str,
+        password: str,
+        seed: dict[str, object],
+    ) -> list[dict[str, object]]:
+        uniq = int(time.time() * 1000)
+        base: dict[str, object] = {
+            "loginOrEmail": username,
+            "password": password,
+            "uniq": uniq,
+        }
+        csrf_token = str(seed.get("csrfToken") or seed.get("csrf_token") or "").strip()
+        if csrf_token:
+            base["csrfToken"] = csrf_token
+
+        payloads = [base]
+        fingerprint = str(seed.get("fingerprint") or "").strip()
+        fingerprint_v2 = seed.get("fingerprintV2")
+        if fingerprint or fingerprint_v2:
+            payloads.insert(0, {
+                **base,
+                **({"fingerprint": fingerprint} if fingerprint else {}),
+                **({"fingerprintV2": fingerprint_v2} if fingerprint_v2 else {}),
+            })
+        if "@" in username:
+            payloads.append({"email": username, "password": password, "uniq": uniq})
+        else:
+            payloads.append({"username": username, "password": password, "uniq": uniq})
+        return payloads
+
+    async def _stripchat_seed_http_session(self, session, username: str) -> dict[str, object]:
+        seed: dict[str, object] = {"front_version": self._stripchat_front_version()}
+        login_url = f"{STRIPCHAT_BASE_URL}/login"
+
+        flaresolverr_cookies, _ = await self._refresh_flaresolverr_cookies(login_url, username=username)
+        if flaresolverr_cookies:
+            cookie_values = {
+                str(cookie.get("name")): str(cookie.get("value") or "")
+                for cookie in flaresolverr_cookies
+                if cookie.get("name")
+            }
+            try:
+                session.cookie_jar.update_cookies(cookie_values, response_url=URL(STRIPCHAT_BASE_URL))
+            except Exception:
+                pass
+
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": STRIPCHAT_BASE_URL,
+        }
+        try:
+            async with session.get(login_url, headers=headers, allow_redirects=True, **aiohttp_request_kwargs()) as resp:
+                text = await resp.text(errors="ignore")
+        except Exception:
+            text = ""
+
+        release_match = re.search(r'"releaseVersion"\s*:\s*"([^"]+)"', text)
+        if release_match:
+            seed["front_version"] = release_match.group(1)
+        csrf_match = re.search(r'"csrfToken"\s*:\s*"([^"]+)"', text)
+        if csrf_match:
+            seed["csrfToken"] = csrf_match.group(1)
+
+        try:
+            payload = await self._stripchat_http_json(
+                session,
+                "GET",
+                "/v3/config/initial-dynamic",
+                params={"requestPath": "/login"},
+                referer=login_url,
+                include_stored_auth=False,
+                front_version=str(seed.get("front_version") or ""),
+            )
+            version = self._stripchat_find_value(payload, {"releaseversion", "frontversion"})
+            if version:
+                seed["front_version"] = str(version)
+            csrf_token = self._stripchat_find_value(payload, {"csrftoken", "csrf"})
+            if csrf_token:
+                seed["csrfToken"] = str(csrf_token)
+        except ProviderError:
+            pass
+        return seed
+
+    async def _stripchat_http_json(
+        self,
+        session,
+        method: str,
+        path: str,
+        params: Optional[dict[str, object]] = None,
+        body: Optional[dict[str, object]] = None,
+        referer: Optional[str] = None,
+        include_stored_auth: bool = False,
+        front_version: Optional[str] = None,
+    ) -> object:
+        headers = await self._stripchat_api_headers(
+            referer=referer,
+            has_body=body is not None,
+            include_stored_auth=include_stored_auth,
+            front_version=front_version,
+        )
+        url = f"{STRIPCHAT_API_BASE}{path if path.startswith('/') else '/' + path}"
+        try:
+            async with session.request(
+                method.upper(),
+                url,
+                params=params or None,
+                json=body if body is not None else None,
+                headers=headers,
+                allow_redirects=True,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                text = await resp.text(errors="ignore")
+                stripped = text.lstrip()
+                if stripped.startswith(("{", "[")):
+                    try:
+                        payload = json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError("Reponse Stripchat JSON invalide") from exc
+                    if isinstance(payload, dict):
+                        payload.setdefault("_http_status", resp.status)
+                    return payload
+                if _INTERACTION_RE.search(text):
+                    raise ProviderInteractionRequired("Stripchat demande une verification interactive")
+                return {"_http_status": resp.status, "_raw": text[:1000]}
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Stripchat API indisponible: {exc}") from exc
+
+    def _stripchat_login_requires_interaction(self, value: object) -> bool:
+        challenge_keys = {
+            "captcha",
+            "recaptcha",
+            "hcaptcha",
+            "turnstile",
+            "needcodeconfirmation",
+            "needemailconfirmation",
+            "needxhconfirmation",
+            "twofa",
+            "twofactor",
+            "twofadata",
+            "isrequired",
+            "isaptcharequired",
+            "iscaptcharequired",
+        }
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_lower = str(key).lower()
+                if key_lower in challenge_keys and child not in (None, False, "", [], {}):
+                    return True
+                if self._stripchat_login_requires_interaction(child):
+                    return True
+        elif isinstance(value, list):
+            return any(self._stripchat_login_requires_interaction(child) for child in value)
+        elif isinstance(value, str):
+            return bool(_INTERACTION_RE.search(value))
+        return False
+
+    def _stripchat_text_values(self, value: object) -> list[str]:
+        values: list[str] = []
+        if isinstance(value, dict):
+            for child in value.values():
+                values.extend(self._stripchat_text_values(child))
+        elif isinstance(value, list):
+            for child in value:
+                values.extend(self._stripchat_text_values(child))
+        elif isinstance(value, str):
+            text = value.strip()
+            if text:
+                values.append(text)
+        return values
+
+    def _stripchat_login_error(self, payload: object) -> Optional[str]:
+        status = int(payload.get("_http_status") or 0) if isinstance(payload, dict) else 0
+        if status in (404, 405):
+            return None
+        text = " ".join(self._stripchat_text_values(payload))
+        if _LOGIN_FAILED_RE.search(text) or status in (400, 401):
+            return "Login failed. Check username and password."
+        if status == 429:
+            return "Stripchat login rate limited. Retry later."
+        if status >= 400:
+            return f"Stripchat login refused (HTTP {status})"
+        return None
+
+    def _stripchat_user_matches(self, user: dict[str, object], username: str) -> bool:
+        if not user.get("id"):
+            return False
+        needle = username.lower().strip()
+        if not needle:
+            return True
+        candidates = [
+            str(user.get("username") or "").lower().strip(),
+            str(user.get("login") or "").lower().strip(),
+            str(user.get("email") or "").lower().strip(),
+        ]
+        return needle in {candidate for candidate in candidates if candidate}
+
+    def _stripchat_current_user_from_payload(self, value: object, username: str = "") -> Optional[dict[str, object]]:
+        if isinstance(value, dict):
+            for key in ("currentUser", "current_user"):
+                child = value.get(key)
+                if isinstance(child, dict) and child.get("id"):
+                    return child
+            for key in ("user", "account", "viewer"):
+                child = value.get(key)
+                if isinstance(child, dict) and self._stripchat_user_matches(child, username):
+                    return child
+            if self._stripchat_user_matches(value, username):
+                return value
+            for child in value.values():
+                found = self._stripchat_current_user_from_payload(child, username)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._stripchat_current_user_from_payload(child, username)
+                if found:
+                    return found
+        elif isinstance(value, str) and value.strip().startswith(("{", "[")):
+            try:
+                return self._stripchat_current_user_from_payload(json.loads(value), username)
+            except Exception:
+                return None
+        return None
+
+    def _stripchat_login_state_from_payload(
+        self,
+        payload: object,
+        username: str,
+    ) -> Optional[tuple[str, dict[str, object], str]]:
+        user = self._stripchat_current_user_from_payload(payload, username)
+        if not user:
+            return None
+        resolved_username = str(user.get("username") or user.get("login") or username or "").strip()
+        jwt_token = self._stripchat_find_value(payload, {"jwttoken", "jwt", "authjwt", "accesstoken"})
+        return resolved_username or username, user, str(jwt_token or "").strip()
+
+    def _stripchat_local_storage_state(
+        self,
+        user: dict[str, object],
+        jwt_token: str = "",
+    ) -> list[dict[str, object]]:
+        entries = [
+            {"name": "currentUser", "value": json.dumps({"currentUser": user}, separators=(",", ":"))},
+        ]
+        if jwt_token:
+            entries.append({"name": "jwtToken", "value": jwt_token})
+        return [{"origin": STRIPCHAT_BASE_URL, "localStorage": entries}]
+
+    def _stripchat_cookie_jar_to_playwright(self, session) -> list[dict[str, Any]]:
+        cookies: list[dict[str, Any]] = []
+        try:
+            morsels = session.cookie_jar.filter_cookies(URL(STRIPCHAT_BASE_URL)).values()
+        except Exception:
+            morsels = []
+        for morsel in morsels:
+            normalized = self._normalize_playwright_cookie({
+                "name": morsel.key,
+                "value": morsel.value,
+                "domain": ".stripchat.com",
+                "path": morsel["path"] or "/",
+                "secure": True,
+                "httpOnly": bool(morsel["httponly"]),
+                "sameSite": "Lax",
+            })
+            if normalized:
+                cookies.append(normalized)
+        return cookies
+
+    async def _stripchat_save_login_failure(self, username: str, last_error: str) -> None:
+        if self.session_store:
+            await self.session_store.save(
+                self.source_type,
+                username=username,
+                is_logged_in=False,
+                last_error=last_error,
+            )
+
+    async def _stripchat_login_http(self, username: str, password: str) -> dict[str, object]:
+        username = (username or "").strip()
+        if not username or not password:
+            return {"success": False, "error": "Username and password are required"}
+
+        timeout = aiohttp.ClientTimeout(total=int(os.getenv("PSTREAMREC_STRIPCHAT_LOGIN_TIMEOUT", "30") or "30"))
+        cookie_jar = aiohttp.CookieJar(unsafe=True)
+        async with aiohttp_client_session(timeout=timeout, cookie_jar=cookie_jar) as session:
+            seed = await self._stripchat_seed_http_session(session, username)
+            last_error: Optional[str] = None
+            for path in self._stripchat_login_paths():
+                for body in self._stripchat_login_payloads(username, password, seed):
+                    try:
+                        payload = await self._stripchat_http_json(
+                            session,
+                            "POST",
+                            path,
+                            body=body,
+                            referer=f"{STRIPCHAT_BASE_URL}/login",
+                            include_stored_auth=False,
+                            front_version=str(seed.get("front_version") or ""),
+                        )
+                    except ProviderInteractionRequired:
+                        await self._stripchat_save_login_failure(username, "interaction_required")
+                        raise
+                    except ProviderError as exc:
+                        last_error = str(exc)
+                        continue
+
+                    if self._stripchat_login_requires_interaction(payload):
+                        await self._stripchat_save_login_failure(username, "interaction_required")
+                        raise ProviderInteractionRequired(
+                            "Stripchat demande un CAPTCHA/2FA; importez une session navigateur verifiee"
+                        )
+
+                    error = self._stripchat_login_error(payload)
+                    if error:
+                        status = int(payload.get("_http_status") or 0) if isinstance(payload, dict) else 0
+                        if status in (404, 405):
+                            continue
+                        if status == 403:
+                            await self._stripchat_save_login_failure(username, "interaction_required")
+                            raise ProviderInteractionRequired(
+                                "Stripchat refuse le login automatique; importez une session navigateur verifiee"
+                            )
+                        await self._stripchat_save_login_failure(username, "login_failed")
+                        return {"success": False, "error": error}
+
+                    state = self._stripchat_login_state_from_payload(payload, username)
+                    if state:
+                        resolved_username, user, jwt_token = state
+                        if self.session_store:
+                            await self.session_store.save(
+                                self.source_type,
+                                username=resolved_username,
+                                is_logged_in=True,
+                                cookies=self._stripchat_cookie_jar_to_playwright(session),
+                                local_storage=self._stripchat_local_storage_state(user, jwt_token),
+                                last_error=None,
+                            )
+                        return {"success": True, "username": resolved_username}
+
+            for path in ("/v3/config/initial-dynamic", "/v3/config/dynamic"):
+                try:
+                    payload = await self._stripchat_http_json(
+                        session,
+                        "GET",
+                        path,
+                        params={"requestPath": "/"},
+                        referer=STRIPCHAT_BASE_URL,
+                        include_stored_auth=False,
+                        front_version=str(seed.get("front_version") or ""),
+                    )
+                except ProviderInteractionRequired:
+                    await self._stripchat_save_login_failure(username, "interaction_required")
+                    raise
+                except ProviderError as exc:
+                    last_error = str(exc)
+                    continue
+                state = self._stripchat_login_state_from_payload(payload, username)
+                if state:
+                    resolved_username, user, jwt_token = state
+                    if self.session_store:
+                        await self.session_store.save(
+                            self.source_type,
+                            username=resolved_username,
+                            is_logged_in=True,
+                            cookies=self._stripchat_cookie_jar_to_playwright(session),
+                            local_storage=self._stripchat_local_storage_state(user, jwt_token),
+                            last_error=None,
+                        )
+                    return {"success": True, "username": resolved_username}
+
+        await self._stripchat_save_login_failure(username, "interaction_required")
+        if last_error:
+            logger.debug("Stripchat HTTP login did not produce a verified session", error=last_error)
+        raise ProviderInteractionRequired(
+            "Stripchat demande un CAPTCHA/2FA ou refuse le login automatique; importez une session navigateur verifiee"
+        )
+
+    async def _stripchat_api_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict[str, object]] = None,
+        body: Optional[dict[str, object]] = None,
+        auth_required: bool = False,
+        referer: Optional[str] = None,
+    ) -> object:
+        if auth_required and not await self._stripchat_has_session():
+            raise ProviderAuthError("Connexion Stripchat requise")
+        headers = await self._stripchat_api_headers(referer=referer, has_body=body is not None)
+        url = f"{STRIPCHAT_API_BASE}{path if path.startswith('/') else '/' + path}"
+        timeout = aiohttp.ClientTimeout(total=int(os.getenv("PSTREAMREC_STRIPCHAT_API_TIMEOUT", "20") or "20"))
+        try:
+            async with aiohttp_client_session(timeout=timeout) as session:
+                async with session.request(
+                    method.upper(),
+                    url,
+                    params=params or None,
+                    json=body if body is not None else None,
+                    headers=headers,
+                    allow_redirects=True,
+                    **aiohttp_request_kwargs(),
+                ) as resp:
+                    text = await resp.text(errors="ignore")
+                    if resp.status in (401, 403):
+                        raise ProviderAuthError("Session Stripchat expiree ou refusee")
+                    if resp.status >= 400:
+                        raise ProviderError(f"Stripchat API HTTP {resp.status}")
+                    stripped = text.lstrip()
+                    if not stripped:
+                        return {}
+                    if not stripped.startswith(("{", "[")):
+                        if auth_required and _INTERACTION_RE.search(text):
+                            raise ProviderInteractionRequired("Interaction Stripchat requise")
+                        raise ProviderError("Reponse Stripchat non JSON")
+                    try:
+                        return json.loads(text)
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError("Reponse Stripchat JSON invalide") from exc
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(f"Stripchat API indisponible: {exc}") from exc
+
+    async def _stripchat_api_headers(
+        self,
+        referer: Optional[str],
+        has_body: bool,
+        include_stored_auth: bool = True,
+        front_version: Optional[str] = None,
+    ) -> dict[str, str]:
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": STRIPCHAT_BASE_URL,
+            "Referer": referer or f"{STRIPCHAT_BASE_URL}/",
+            "Front-Version": (front_version or self._stripchat_front_version()).strip(),
+        }
+        if has_body:
+            headers["Content-Type"] = "application/json"
+        if include_stored_auth:
+            cookie_header = await self._provider_cookie_header()
+            if cookie_header:
+                headers["Cookie"] = cookie_header
+            jwt_token = await self._stripchat_jwt_token()
+            if jwt_token:
+                headers["Authorization"] = jwt_token
+        return headers
+
+    async def _stripchat_session_state(self) -> dict[str, Any]:
+        if not self.session_store:
+            return {}
+        try:
+            return await self.session_store.get(self.source_type)
+        except Exception:
+            return {}
+
+    async def _stripchat_has_session(self) -> bool:
+        state = await self._stripchat_session_state()
+        return bool(state.get("is_logged_in") and (state.get("cookies") or state.get("localStorage")))
+
+    def _stripchat_saved_username(self, state: dict[str, Any]) -> str:
+        return str(state.get("username") or state.get("credential_username") or "").strip()
+
+    async def _stripchat_jwt_token(self) -> str:
+        state = await self._stripchat_session_state()
+        token = self._stripchat_find_value(state.get("localStorage"), {"jwttoken", "jwt"})
+        return str(token or "").strip()
+
+    def _stripchat_find_user_id(self, value: object, username: str = "") -> Optional[int]:
+        username = username.lower().strip()
+        def to_int(raw: object) -> Optional[int]:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        if isinstance(value, dict):
+            current = value.get("currentUser")
+            if isinstance(current, dict) and current.get("id"):
+                return to_int(current.get("id"))
+            user = value.get("user")
+            if isinstance(user, dict) and user.get("id") and (not username or str(user.get("username") or "").lower() == username):
+                return to_int(user.get("id"))
+            if value.get("id") and value.get("username") and (not username or str(value.get("username") or "").lower() == username):
+                return to_int(value.get("id"))
+            for child in value.values():
+                found = self._stripchat_find_user_id(child, username)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._stripchat_find_user_id(child, username)
+                if found:
+                    return found
+        elif isinstance(value, str) and value.strip().startswith(("{", "[")):
+            try:
+                return self._stripchat_find_user_id(json.loads(value), username)
+            except Exception:
+                return None
+        return None
+
+    def _stripchat_find_value(self, value: object, keys: set[str]) -> object:
+        keys = {str(key).lower() for key in keys}
+        if isinstance(value, dict):
+            storage_name = str(value.get("name") or "").lower()
+            storage_value = value.get("value")
+            if storage_name in keys and storage_value not in (None, "", [], {}):
+                return storage_value
+            for key, child in value.items():
+                if str(key).lower() in keys:
+                    return child
+                found = self._stripchat_find_value(child, keys)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._stripchat_find_value(child, keys)
+                if found is not None:
+                    return found
+        elif isinstance(value, str):
+            if value.strip().startswith(("{", "[")):
+                try:
+                    return self._stripchat_find_value(json.loads(value), keys)
+                except Exception:
+                    return None
+        return None
+
+    async def _stripchat_browser_follow_action(self, username: str, follow: bool) -> dict[str, object]:
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            raise ProviderError("Playwright n'est pas installe") from exc
+
+        headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                user_agent=DEFAULT_USER_AGENT,
+                viewport={"width": 1280, "height": 720},
+                args=self._browser_args(),
+            )
+            try:
+                await self._restore_cookies(context)
+                page = context.pages[0] if context.pages else await context.new_page()
+                try:
+                    await page.goto(self.canonical_url(username), wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeoutError:
+                    pass
+                await self._dismiss_common_prompts(page)
+                result = await page.evaluate(
+                    """
+                    async ({ username, follow }) => {
+                        const frontVersion = window.DEPLOY_CONFIG && window.DEPLOY_CONFIG.releaseVersion;
+                        const headers = {
+                            Accept: "application/json",
+                            "Content-Type": "application/json",
+                            ...(frontVersion ? { "Front-Version": frontVersion } : {})
+                        };
+                        const currentUser = (() => {
+                            const candidates = [];
+                            try {
+                                const state = window.getState && window.getState();
+                                candidates.push(state && state.userSession && state.userSession.currentUser);
+                            } catch {}
+                            try {
+                                candidates.push(window.__PRELOADED_STATE__ &&
+                                    window.__PRELOADED_STATE__.userSession &&
+                                    window.__PRELOADED_STATE__.userSession.currentUser);
+                            } catch {}
+                            try {
+                                if (window.StripChat && typeof window.StripChat.getCurrentUser === "function") {
+                                    candidates.push(window.StripChat.getCurrentUser());
+                                }
+                            } catch {}
+                            return candidates.find((item) => item && item.id) || null;
+                        })();
+                        if (!currentUser || !currentUser.id) return { authError: true, error: "not_logged_in" };
+                        const profile = await fetch(`/api/front/v2/models/username/${encodeURIComponent(username)}/cam`, {
+                            credentials: "include",
+                            headers: { Accept: "application/json", ...(frontVersion ? { "Front-Version": frontVersion } : {}) }
+                        });
+                        if (profile.status === 401 || profile.status === 403) return { authError: true, error: "auth_required" };
+                        if (!profile.ok) return { success: false, error: `profile_http_${profile.status}` };
+                        const payload = await profile.json();
+                        const model = (payload.user && payload.user.user) || payload.item || {};
+                        const modelId = model.id || (payload.cam && payload.cam.streamName);
+                        if (!modelId) return { success: false, error: "model_id_missing" };
+                        const response = follow
+                            ? await fetch(`/api/front/users/${currentUser.id}/favorites/${modelId}`, {
+                                method: "PUT",
+                                credentials: "include",
+                                headers,
+                                body: JSON.stringify({ uniq: Date.now() })
+                            })
+                            : await fetch(`/api/front/users/${currentUser.id}/favorites`, {
+                                method: "DELETE",
+                                credentials: "include",
+                                headers,
+                                body: JSON.stringify({ favoriteIds: [Number(modelId)], uniq: Date.now() })
+                            });
+                        if (response.status === 401 || response.status === 403) return { authError: true, error: "auth_required" };
+                        return { success: response.ok, status: response.status };
+                    }
+                    """,
+                    {"username": username, "follow": follow},
+                )
+                if result.get("authError"):
+                    raise ProviderAuthError("Connexion Stripchat requise")
+                if not result.get("success"):
+                    raise ProviderError(f"Action favoris Stripchat refusee ({result.get('error') or result.get('status')})")
+                await self._save_browser_state(context, username, is_logged_in=True)
+                return {"success": True, "remote": True, "provider": "stripchat", "username": username}
+            finally:
+                await context.close()
 
     def _parse_xcams_models(self, html_text: str, page_url: str) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
@@ -1514,53 +2862,6 @@ class BrowserCaptureProvider(BaseProvider):
                 "source_type": self.source_type,
             })
         return items
-
-    def _parse_streamate_models(self, html_text: str, page_url: str) -> list[dict[str, object]]:
-        payloads = self._embedded_json_payloads(html_text)
-        performers: list[dict[str, object]] = []
-        for payload in payloads:
-            performers.extend(self._find_dicts_with_key(payload, "nickname"))
-        items: list[dict[str, object]] = []
-        for performer in performers:
-            username = str(performer.get("nickname") or "").strip()
-            if not username:
-                continue
-            subject = str(performer.get("headlineMessage") or performer.get("headline") or "")
-            tags = [
-                performer.get("categoryName"),
-                performer.get("gender"),
-                performer.get("country"),
-            ]
-            languages = performer.get("languages") or performer.get("languagesSpoken") or []
-            if isinstance(languages, list):
-                tags.extend(languages)
-            if performer.get("new"):
-                tags.append("new")
-            if performer.get("hd") or performer.get("isHD"):
-                tags.append("hd")
-            tags = _normalize_tags(tags + _subject_keyword_tags(subject))
-            thumbnail = (
-                performer.get("thumbnail")
-                or performer.get("thumbnailUrl")
-                or performer.get("previewUrl")
-                or performer.get("image")
-            )
-            items.append({
-                "username": username,
-                "display_name": username,
-                "thumbnail": thumbnail,
-                "viewers": int(performer.get("viewerCount") or performer.get("viewers") or 0),
-                "subject": subject,
-                "age": performer.get("age"),
-                "gender": str(performer.get("gender") or ""),
-                "is_online": bool(performer.get("online", True)),
-                "tags": tags,
-                "room_status": "public",
-                "source_type": self.source_type,
-            })
-        if items:
-            return self._dedupe_discover_models(items)
-        return []
 
     def _embedded_json_payloads(self, html_text: str) -> list[object]:
         payloads: list[object] = []
@@ -1731,13 +3032,6 @@ class BrowserCaptureProvider(BaseProvider):
                         break
             if not candidate and path_parts:
                 candidate = path_parts[-1]
-        elif self.source_type == "streamate":
-            if "cam" in path_parts:
-                idx = path_parts.index("cam")
-                if len(path_parts) > idx + 1:
-                    candidate = path_parts[idx + 1]
-            elif path_parts:
-                candidate = path_parts[-1]
         elif self.source_type == "xcams":
             for marker in ("chat", "profile"):
                 if marker in path_parts:
@@ -1747,16 +3041,6 @@ class BrowserCaptureProvider(BaseProvider):
                         break
             if not candidate and path_parts:
                 candidate = path_parts[-1]
-        elif self.source_type == "flirt4free":
-            if len(path_parts) >= 4 and path_parts[0] == "models" and path_parts[1] == "bios":
-                candidate = path_parts[2]
-            elif "models" in path_parts:
-                idx = path_parts.index("models")
-                if len(path_parts) > idx + 1:
-                    candidate = path_parts[idx + 1]
-            else:
-                return None
-            candidate = re.sub(r"\.html?$", "", candidate)
         else:
             if "model" in path_parts:
                 idx = path_parts.index("model")
@@ -1789,13 +3073,16 @@ class BrowserCaptureProvider(BaseProvider):
         user_data_dir = self.browser_root / self.source_type
         user_data_dir.mkdir(parents=True, exist_ok=True)
         captured: list[str] = []
+        session_username = await self._provider_session_username()
+        browser_user_agent = await self._stored_browser_user_agent()
 
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
                 str(user_data_dir),
                 headless=headless,
-                user_agent=DEFAULT_USER_AGENT,
+                user_agent=browser_user_agent,
                 viewport={"width": 1280, "height": 720},
+                args=self._browser_args(),
             )
             try:
                 await self._restore_cookies(context)
@@ -1847,13 +3134,11 @@ class BrowserCaptureProvider(BaseProvider):
                         continue
 
                     await self._dismiss_common_prompts(page)
-                    if self.source_type == "flirt4free" and not target.startswith(("http://", "https://")):
-                        await self._try_search(page, target)
 
                     deadline = time.monotonic() + max(5, timeout_seconds)
                     while time.monotonic() < deadline:
                         if captured:
-                            await self._save_browser_state(context, target, is_logged_in=True)
+                            await self._save_browser_state(context, session_username, is_logged_in=True)
                             stream_url = captured[0]
                             try:
                                 last_html = await page.content()
@@ -1876,7 +3161,7 @@ class BrowserCaptureProvider(BaseProvider):
                             remember_hls_field_urls(last_html)
                             media_urls = extract_media_urls(last_html)
                             if media_urls:
-                                await self._save_browser_state(context, target, is_logged_in=True)
+                                await self._save_browser_state(context, session_username, is_logged_in=True)
                                 meta = _page_metadata(last_html, page.url)
                                 return ResolvedStream(
                                     url=media_urls[0],
@@ -1893,13 +3178,20 @@ class BrowserCaptureProvider(BaseProvider):
                             pass
                         await page.wait_for_timeout(500)
 
-                await self._save_browser_state(context, target, is_logged_in=False)
+                logged_in = await self._looks_logged_in(page, username=session_username)
+                await self._save_browser_state(context, session_username, is_logged_in=logged_in)
                 self._raise_page_state(last_html)
                 raise ProviderOfflineError(f"Aucun flux public trouve pour {self.display_name}/{target}")
             finally:
                 await context.close()
 
-    async def login(self, username: str, password: str) -> dict[str, object]:
+    def _bongacams_interaction_required_message(self, page_url: str, visible_text: str) -> str:
+        lower = f"{page_url or ''}\n{visible_text or ''}".lower()
+        if "suspect-login" in lower or "unfamiliar device" in lower or "new ip address" in lower:
+            return "BongaCams demande un captcha pour ce nouvel appareil ou cette nouvelle IP"
+        return "Automatic login blocked by the provider challenge"
+
+    async def _bongacams_login(self, username: str, password: str) -> dict[str, object]:
         try:
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
             from playwright.async_api import async_playwright
@@ -1907,23 +3199,37 @@ class BrowserCaptureProvider(BaseProvider):
             raise ProviderError("Playwright n'est pas installe") from exc
 
         headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
-        user_data_dir = self.browser_root / self.source_type
-        user_data_dir.mkdir(parents=True, exist_ok=True)
         login_urls = [
             template.format(username=quote_plus(username))
             for template in self.login_templates
-        ]
+        ] or [f"{BONGACAMS_BASE_URL}/login"]
+
+        flaresolverr_cookies: list[dict[str, Any]] = []
+        flaresolverr_user_agent: Optional[str] = None
+        for login_url in login_urls:
+            flaresolverr_cookies, flaresolverr_user_agent = await self._refresh_flaresolverr_cookies(login_url, username=username)
+            if flaresolverr_cookies:
+                break
+
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
 
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(
                 str(user_data_dir),
                 headless=headless,
-                user_agent=DEFAULT_USER_AGENT,
+                args=self._browser_args(),
+                user_agent=flaresolverr_user_agent or DEFAULT_USER_AGENT,
                 viewport={"width": 1280, "height": 720},
             )
             try:
                 await self._restore_cookies(context)
-                page = context.pages[0] if context.pages else await context.new_page()
+                if flaresolverr_cookies:
+                    try:
+                        await context.add_cookies(flaresolverr_cookies)
+                    except Exception:
+                        pass
+                page = await context.new_page()
                 for login_url in login_urls:
                     try:
                         await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
@@ -1932,16 +3238,163 @@ class BrowserCaptureProvider(BaseProvider):
                     except Exception:
                         continue
                     await self._dismiss_common_prompts(page)
-                    await self._fill_login_form(page, username, password)
-                    await page.wait_for_timeout(2500)
-                    content = await page.content()
-                    if _INTERACTION_RE.search(content):
-                        await self._save_browser_state(context, username, is_logged_in=False, last_error="interaction_required")
-                        raise ProviderInteractionRequired("Interaction manuelle requise dans le navigateur integre")
+                    await page.wait_for_timeout(2000)
+
+                    visible_text = await self._visible_page_text(page)
+                    if _INTERACTION_RE.search(visible_text) or await self._has_challenge_widget(page):
+                        refreshed, _ = await self._refresh_flaresolverr_cookies(login_url, username=username)
+                        if refreshed:
+                            try:
+                                await context.add_cookies(refreshed)
+                                await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+                                await self._dismiss_common_prompts(page)
+                                await page.wait_for_timeout(1500)
+                            except Exception:
+                                pass
+
                     cookies = await context.cookies()
-                    if cookies:
+                    if cookies and await self._looks_logged_in(page, username=username):
                         await self._save_browser_state(context, username, is_logged_in=True)
-                        return {"success": True, "username": username}
+                        return {"success": True, "username": username, "reusedSession": True}
+
+                    submitted = await self._fill_login_form(page, username, password)
+                    if submitted:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=7000)
+                        except Exception:
+                            pass
+
+                    verify_seconds = int(os.getenv("PSTREAMREC_PROVIDER_LOGIN_VERIFY_SECONDS", "25") or "25")
+                    challenge_seen = False
+                    for _ in range(max(5, verify_seconds)):
+                        await page.wait_for_timeout(1000)
+                        visible_text = await self._visible_page_text(page)
+                        if _LOGIN_FAILED_RE.search(visible_text):
+                            await self._save_browser_state(context, username, is_logged_in=False, last_error="login_failed")
+                            return {"success": False, "error": "Login failed. Check username and password."}
+                        cookies = await context.cookies()
+                        if cookies and await self._looks_logged_in(page, username=username):
+                            await self._save_browser_state(context, username, is_logged_in=True)
+                            return {"success": True, "username": username}
+                        if _INTERACTION_RE.search(visible_text) or await self._has_challenge_widget(page):
+                            challenge_seen = True
+                            break
+
+                    if challenge_seen:
+                        visible_text = await self._visible_page_text(page)
+                        await self._save_browser_state(context, username, is_logged_in=False, last_error="interaction_required")
+                        raise ProviderInteractionRequired(
+                            self._bongacams_interaction_required_message(page.url, visible_text)
+                        )
+
+                await self._save_browser_state(context, username, is_logged_in=False, last_error="login_failed")
+                return {"success": False, "error": "Login form introuvable ou connexion refusee"}
+            finally:
+                await context.close()
+
+    async def login(self, username: str, password: str) -> dict[str, object]:
+        if self.source_type == "stripchat":
+            result = await self._stripchat_login_http(username, password)
+            if result.get("success"):
+                return result
+            try:
+                return await self._browser_login(username, password)
+            except ProviderInteractionRequired:
+                raise
+            except ProviderError:
+                return result
+        if self.source_type == "bongacams":
+            return await self._bongacams_login(username, password)
+        return await self._browser_login(username, password)
+
+    async def _browser_login(self, username: str, password: str) -> dict[str, object]:
+        username = (username or "").strip()
+        if not username or not password:
+            return {"success": False, "error": "Username and password are required"}
+
+        try:
+            from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.async_api import async_playwright
+        except Exception as exc:
+            raise ProviderError("Playwright n'est pas installe") from exc
+
+        headless = os.getenv("PSTREAMREC_BROWSER_HEADLESS", "true").lower() not in {"0", "false", "no"}
+        login_urls = [
+            template.format(username=quote_plus(username))
+            for template in self.login_templates
+        ]
+        user_data_dir = self.browser_root / self.source_type
+        user_data_dir.mkdir(parents=True, exist_ok=True)
+        browser_user_agent = await self._stored_browser_user_agent()
+
+        async with async_playwright() as playwright:
+            context = await playwright.chromium.launch_persistent_context(
+                str(user_data_dir),
+                headless=headless,
+                args=self._browser_args(),
+                user_agent=browser_user_agent,
+                viewport={"width": 1280, "height": 720},
+            )
+            try:
+                await self._restore_cookies(context)
+                page = await context.new_page()
+                for login_url in login_urls:
+                    try:
+                        await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+                    except PlaywrightTimeoutError:
+                        pass
+                    except Exception:
+                        continue
+                    await self._dismiss_common_prompts(page)
+                    await page.wait_for_timeout(2500)
+                    cookies = await context.cookies()
+                    if cookies and await self._looks_logged_in(page, username=username):
+                        await self._save_browser_state(context, username, is_logged_in=True)
+                        return {"success": True, "username": username, "reusedSession": True}
+                    submitted = await self._fill_login_form(page, username, password)
+                    if submitted:
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                    verify_seconds = int(os.getenv("PSTREAMREC_PROVIDER_LOGIN_VERIFY_SECONDS", "25") or "25")
+                    challenge_seen = False
+                    for _ in range(max(5, verify_seconds)):
+                        await page.wait_for_timeout(1000)
+                        visible_text = await self._visible_page_text(page)
+                        if _LOGIN_FAILED_RE.search(visible_text):
+                            await self._save_browser_state(context, username, is_logged_in=False, last_error="login_failed")
+                            return {"success": False, "error": "Login failed. Check username and password."}
+                        cookies = await context.cookies()
+                        if (submitted or cookies) and cookies and await self._looks_logged_in(page, username=username):
+                            await self._save_browser_state(context, username, is_logged_in=True)
+                            return {"success": True, "username": username}
+                        if _INTERACTION_RE.search(visible_text):
+                            challenge_seen = True
+                            break
+                        if submitted and await self._has_challenge_widget(page):
+                            challenge_seen = True
+                    if challenge_seen:
+                        visible_text = await self._visible_page_text(page)
+                        cookies = await context.cookies()
+                        if not (submitted and cookies and await self._looks_logged_in(page, username=username)):
+                            interactive_wait = int(os.getenv("PSTREAMREC_PROVIDER_LOGIN_INTERACTIVE_WAIT_SECONDS", "0") or "0")
+                            if interactive_wait > 0 and not headless:
+                                deadline = time.monotonic() + interactive_wait
+                                while time.monotonic() < deadline:
+                                    await page.wait_for_timeout(1000)
+                                    visible_text = await self._visible_page_text(page)
+                                    if _LOGIN_FAILED_RE.search(visible_text):
+                                        await self._save_browser_state(context, username, is_logged_in=False, last_error="login_failed")
+                                        return {"success": False, "error": "Login failed. Check username and password."}
+                                    cookies = await context.cookies()
+                                    if cookies and await self._looks_logged_in(page, username=username):
+                                        await self._save_browser_state(context, username, is_logged_in=True)
+                                        return {"success": True, "username": username, "interactiveSession": True}
+                            await self._save_browser_state(context, username, is_logged_in=False, last_error="interaction_required")
+                            raise ProviderInteractionRequired(
+                                "Automatic login blocked by the provider challenge"
+                            )
                 await self._save_browser_state(context, username, is_logged_in=False, last_error="login_failed")
                 return {"success": False, "error": "Login form introuvable ou connexion refusee"}
             finally:
@@ -1966,19 +3419,54 @@ class BrowserCaptureProvider(BaseProvider):
         return headers
 
     def _is_media_url(self, value: str) -> bool:
-        lower = (value or "").lower()
-        return ".m3u8" in lower or ".mpd" in lower
+        return _is_probable_media_url(value)
 
     def _raise_page_state(self, content: str) -> None:
         text = content or ""
         if _INTERACTION_RE.search(text):
             raise ProviderInteractionRequired("Interaction manuelle requise")
+        if _AUTH_REQUIRED_RE.search(text):
+            raise ProviderAuthError("Connexion requise")
         if _PRIVATE_RE.search(text):
             raise ProviderPrivateError("Le modele semble en show prive ou premium")
         if _OFFLINE_RE.search(text):
             raise ProviderOfflineError("Le modele semble hors ligne")
 
+    async def _apply_browser_stealth(self, context) -> None:
+        try:
+            await context.add_init_script(
+                """
+                (() => {
+                    try {
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    } catch {}
+                    try {
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                    } catch {}
+                    try {
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    } catch {}
+                    try {
+                        window.chrome = window.chrome || { runtime: {} };
+                    } catch {}
+                    try {
+                        const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+                        if (originalQuery) {
+                            window.navigator.permissions.query = (parameters) => (
+                                parameters && parameters.name === 'notifications'
+                                    ? Promise.resolve({ state: Notification.permission })
+                                    : originalQuery(parameters)
+                            );
+                        }
+                    } catch {}
+                })();
+                """
+            )
+        except Exception:
+            return
+
     async def _restore_cookies(self, context) -> None:
+        await self._apply_browser_stealth(context)
         if not self.session_store:
             return
         state = await self.session_store.get(self.source_type)
@@ -1986,6 +3474,24 @@ class BrowserCaptureProvider(BaseProvider):
         if cookies:
             try:
                 await context.add_cookies(cookies)
+            except Exception:
+                pass
+        local_storage = state.get("localStorage") or []
+        if local_storage:
+            try:
+                await context.add_init_script(
+                    """
+                    (() => {
+                        const origins = __PSTREAMREC_ORIGINS__;
+                        const originState = origins.find((entry) => entry && entry.origin === window.location.origin);
+                        if (!originState || !Array.isArray(originState.localStorage)) return;
+                        for (const item of originState.localStorage) {
+                            if (!item || !item.name || typeof item.value !== 'string') continue;
+                            try { window.localStorage.setItem(item.name, item.value); } catch {}
+                        }
+                    })();
+                    """.replace("__PSTREAMREC_ORIGINS__", json.dumps(local_storage))
+                )
             except Exception:
                 pass
 
@@ -2019,7 +3525,7 @@ class BrowserCaptureProvider(BaseProvider):
 
     async def _dismiss_common_prompts(self, page) -> None:
         labels = re.compile(
-            r"(^(accept|i agree|agree|continue|enter|yes|allow|j'accepte|accepter|ok)$|over 18|enter site)",
+            r"(^(accept|accept all|accept cookies|i agree|agree|continue|enter|yes|allow|j'accepte|accepter|tout accepter|ok)$|over 18|enter site)",
             re.IGNORECASE,
         )
         clicked = False
@@ -2059,40 +3565,241 @@ class BrowserCaptureProvider(BaseProvider):
             except Exception:
                 continue
 
-    async def _fill_login_form(self, page, username: str, password: str) -> None:
-        user_selectors = [
-            "input[type=email]",
-            'input[name*="user" i]',
-            'input[name*="login" i]',
-            'input[name*="email" i]',
-            "input[autocomplete=username]",
-            "input[type=text]",
-        ]
-        pass_selectors = [
-            "input[type=password]",
-            'input[name*="pass" i]',
-            "input[autocomplete=current-password]",
-        ]
-        for selector in user_selectors:
-            try:
-                field = page.locator(selector).first
-                if await field.count():
-                    await field.fill(username, timeout=1500)
-                    break
-            except Exception:
-                pass
-        for selector in pass_selectors:
-            try:
-                field = page.locator(selector).first
-                if await field.count():
-                    await field.fill(password, timeout=1500)
-                    break
-            except Exception:
-                pass
+    async def _visible_page_text(self, page) -> str:
         try:
-            await page.locator("button[type=submit], input[type=submit]").first.click(timeout=1500)
+            return await page.locator("body").inner_text(timeout=3000)
         except Exception:
+            return ""
+
+    async def _stripchat_page_current_user(self, page) -> bool:
+        try:
+            return bool(await page.evaluate(
+                """
+                () => {
+                    const candidates = [];
+                    try {
+                        const state = window.getState && window.getState();
+                        candidates.push(state && state.userSession && state.userSession.currentUser);
+                    } catch {}
+                    try {
+                        candidates.push(window.__PRELOADED_STATE__ &&
+                            window.__PRELOADED_STATE__.userSession &&
+                            window.__PRELOADED_STATE__.userSession.currentUser);
+                    } catch {}
+                    try {
+                        if (window.StripChat && typeof window.StripChat.getCurrentUser === 'function') {
+                            candidates.push(window.StripChat.getCurrentUser());
+                        }
+                    } catch {}
+                    return candidates.some((user) => user && (user.id || user.username || user.login));
+                }
+                """
+            ))
+        except Exception:
+            return False
+
+    async def _bongacams_page_has_account_shell(self, page) -> bool:
+        try:
+            return bool(await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.visibility === 'hidden' || style.display === 'none') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+                    if (Array.from(document.querySelectorAll('input[type="password"]')).some(visible)) {
+                        return false;
+                    }
+                    const accountText = /\\b(log\\s*out|logout|sign\\s*out|my\\s+account|account\\s+settings|my\\s+profile|tokens|credits)\\b/i;
+                    const loginText = /^(log\\s*in|login|sign\\s*in|signin)$/i;
+                    let sawAccount = false;
+                    for (const el of document.querySelectorAll('a, button, [role="button"]')) {
+                        if (!visible(el)) continue;
+                        const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim();
+                        const href = el.getAttribute('href') || '';
+                        if (loginText.test(text)) return false;
+                        if (accountText.test(`${text} ${href}`)) sawAccount = true;
+                    }
+                    return sawAccount;
+                }
+                """
+            ))
+        except Exception:
+            return False
+
+    async def _looks_logged_in(self, page, username: Optional[str] = None) -> bool:
+        for selector in (
+            "input[type=password]:visible",
+            'input[autocomplete="current-password"]:visible',
+            'input[name*="pass" i]:visible',
+        ):
             try:
-                await page.keyboard.press("Enter")
+                if await page.locator(selector).count():
+                    return False
             except Exception:
                 pass
+        if self.source_type == "stripchat" and await self._stripchat_page_current_user(page):
+            return True
+        if self.source_type == "bongacams" and await self._bongacams_page_has_account_shell(page):
+            return True
+        visible_text = await self._visible_page_text(page)
+        lower_text = visible_text.lower()
+        normalized_username = (username or "").strip().lower()
+        if normalized_username and normalized_username in lower_text:
+            return True
+        if re.search(r"\b(log\s*out|logout|sign\s*out|my\s+account|account\s+settings)\b", lower_text):
+            return True
+        if await self._has_visible_login_action(page):
+            return False
+        return self.source_type not in {
+            "bongacams",
+            "cams",
+            "camsoda",
+            "livejasmin",
+            "myfreecams",
+            "stripchat",
+            "xcams",
+        }
+
+    async def _has_visible_login_action(self, page) -> bool:
+        try:
+            return bool(await page.evaluate(
+                """
+                () => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.visibility === 'hidden' || style.display === 'none') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+                    const loginText = /^(log\\s*in|login|sign\\s*in|signin|join\\s+now|join\\s+for\\s+free)$/i;
+                    return Array.from(document.querySelectorAll('a, button, input[type="submit"], input[type="button"]'))
+                        .some((el) => {
+                            if (!visible(el) || el.disabled) return false;
+                            const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim();
+                            return loginText.test(text);
+                        });
+                }
+                """
+            ))
+        except Exception:
+            return False
+
+    async def _has_challenge_widget(self, page) -> bool:
+        try:
+            return bool(await page.evaluate(
+                """
+                () => {
+                    const selectors = [
+                        'iframe[src*="captcha" i]',
+                        'iframe[src*="turnstile" i]',
+                        'iframe[src*="challenge" i]',
+                        'input[name*="captcha" i]',
+                        'input[id*="captcha" i]',
+                        'input[name*="turnstile" i]',
+                        'input[id*="turnstile" i]',
+                        '[class*="captcha" i]',
+                        '[id*="captcha" i]',
+                        '[class*="turnstile" i]',
+                        '[id*="turnstile" i]'
+                    ];
+                    return selectors.some((selector) => document.querySelector(selector));
+                }
+                """
+            ))
+        except Exception:
+            return False
+
+    async def _fill_login_form(self, page, username: str, password: str) -> bool:
+        try:
+            submitted = await page.evaluate(
+                """
+                ({ username, password }) => {
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.visibility === 'hidden' || style.display === 'none') return false;
+                        return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+                    };
+                    const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    const setValue = (el, value) => {
+                        if (!el) return;
+                        valueSetter.call(el, value);
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    };
+                    const attrText = (el) => [
+                        el.name,
+                        el.id,
+                        el.placeholder,
+                        el.autocomplete,
+                        el.getAttribute('aria-label'),
+                    ].filter(Boolean).join(' ').toLowerCase();
+                    const scoreUserField = (el, passwordField) => {
+                        const type = (el.type || '').toLowerCase();
+                        if (el === passwordField || type === 'password' || type === 'hidden' ||
+                            type === 'submit' || type === 'button' || type === 'checkbox' ||
+                            type === 'radio' || type === 'search') {
+                            return -1000;
+                        }
+                        if (!visible(el) || el.disabled || el.readOnly) return -1000;
+                        const text = attrText(el);
+                        let score = 0;
+                        if (/user|login|email|account|member/.test(text)) score += 80;
+                        if (/search|model|find/.test(text)) score -= 120;
+                        if (type === 'email') score += 60;
+                        if (type === 'text' || !type) score += 10;
+                        const passRect = passwordField.getBoundingClientRect();
+                        const rect = el.getBoundingClientRect();
+                        if (rect.top <= passRect.top) score += 15;
+                        score -= Math.min(50, Math.abs(passRect.top - rect.top) / 20);
+                        return score;
+                    };
+                    const submitText = /^(log\\s*in|login|sign\\s*in|signin|connect|continue|submit)$/i;
+                    const passwordFields = Array.from(document.querySelectorAll('input[type="password"]'))
+                        .filter((el) => visible(el) && !el.disabled && !el.readOnly);
+                    for (const passwordField of passwordFields) {
+                        const root = passwordField.closest('form') || passwordField.closest('[role="dialog"]') || document;
+                        const fields = Array.from(root.querySelectorAll('input'))
+                            .map((el) => [scoreUserField(el, passwordField), el])
+                            .filter(([score]) => score > -1000)
+                            .sort((a, b) => b[0] - a[0]);
+                        const usernameField = fields.length ? fields[0][1] : null;
+                        if (!usernameField) continue;
+                        setValue(usernameField, username);
+                        setValue(passwordField, password);
+
+                        const submitCandidates = Array.from(root.querySelectorAll('button, input[type="submit"], a'))
+                            .filter((el) => visible(el) && !el.disabled);
+                        let submit = root.querySelector('button[type="submit"], input[type="submit"]');
+                        if (!submit || !visible(submit) || submit.disabled) {
+                            submit = submitCandidates.find((el) => {
+                                const text = (el.innerText || el.value || el.getAttribute('aria-label') || el.title || '').trim();
+                                return submitText.test(text);
+                            });
+                        }
+                        if (submit) {
+                            submit.click();
+                        } else {
+                            passwordField.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                            passwordField.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                """,
+                {"username": username, "password": password},
+            )
+            if submitted:
+                return True
+        except Exception:
+            pass
+
+        try:
+            await page.keyboard.press("Enter")
+            return True
+        except Exception:
+            return False
