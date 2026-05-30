@@ -1994,13 +1994,6 @@ button {
   color: var(--text-muted);
 }
 
-.following-sync-controls {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 0.5rem;
-}
-
 .following-provider-status-group {
   margin-top: 1rem;
 }
@@ -4429,19 +4422,6 @@ body.player-modal-open {
   margin-top: 0.3rem;
   color: var(--text-secondary);
   font-size: 0.8rem;
-}
-
-.media-profile-latest {
-  margin-top: 0.45rem;
-  min-height: 2.1rem;
-  color: var(--text-muted);
-  font-size: 0.75rem;
-  line-height: 1.35;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow-wrap: anywhere;
 }
 
 .media-profile-handle {

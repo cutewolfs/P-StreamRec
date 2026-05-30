@@ -143,22 +143,7 @@ function renderFollowing(models) {
   models = sortFollowingModels(models || []);
 
   if (models.length === 0) {
-    var emptySyncControls = renderFollowingSyncControls();
-    if (emptySyncControls) {
-      providerSections.style.display = 'block';
-      providerSections.innerHTML =
-        '<section class="following-provider-section following-global-section">' +
-          '<div class="following-provider-header">' +
-            '<div>' +
-              '<div class="following-provider-title"><h2>Provider sync</h2></div>' +
-              '<div class="following-provider-meta">Sync connected providers or keep local follows for providers without sync.</div>' +
-            '</div>' +
-            emptySyncControls +
-          '</div>' +
-        '</section>';
-    } else {
-      providerSections.style.display = 'none';
-    }
+    providerSections.style.display = 'none';
     emptyFollowing.style.display = 'flex';
     return;
   }
@@ -302,7 +287,6 @@ function renderGlobalFollowingSection(models) {
   var liveModels = models.filter(isLiveFollowingModel);
   var offlineModels = models.filter(function(model) { return !isLiveFollowingModel(model); });
   var meta = renderConnectedProviderMeta(models);
-  var syncControls = renderFollowingSyncControls();
   var body = renderProviderStatusGroup('Live online', liveModels, 'online') +
     renderProviderStatusGroup('Offline', offlineModels, 'offline');
 
@@ -315,7 +299,6 @@ function renderGlobalFollowingSection(models) {
         '</div>' +
         (meta ? '<div class="following-provider-meta following-provider-counters">' + meta + '</div>' : '') +
       '</div>' +
-      syncControls +
     '</div>' +
     body +
   '</section>';
@@ -331,19 +314,6 @@ function syncCapableFollowingProviders() {
 function providerCanStartSync(provider) {
   var status = provider.status || {};
   return status.isLoggedIn === true || status.hasSavedCredentials === true || status.hasSavedSessionData === true;
-}
-
-function renderFollowingSyncControls() {
-  var providers = syncCapableFollowingProviders();
-  if (!providers.length) return '';
-  return '<div class="following-sync-controls">' + providers.map(function(provider) {
-    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
-    var disabled = providerCanStartSync(provider) ? '' : ' disabled';
-    var title = disabled ? ' title="Connect this provider in Settings first"' : '';
-    return '<button type="button" class="btn btn-secondary btn-sm" data-sync-provider="' + escapeHtml(sourceType) + '"' + disabled + title + '>' +
-      'Sync ' + escapeHtml(providerLabel(sourceType)) +
-    '</button>';
-  }).join('') + '</div>';
 }
 
 function renderProviderSection(provider, models) {
@@ -658,11 +628,6 @@ async function refreshLiveThumbnails() {
 window.addEventListener('DOMContentLoaded', function() {
   // Refresh live thumbnails toutes les 30s
   setInterval(refreshLiveThumbnails, 30000);
-  document.addEventListener('click', function(event) {
-    var button = event.target.closest('[data-sync-provider]');
-    if (!button) return;
-    syncSingleProvider(button.getAttribute('data-sync-provider'), button, false);
-  });
 
   // Add animation keyframes
   var style = document.createElement('style');

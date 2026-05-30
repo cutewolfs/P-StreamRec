@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -25,6 +26,9 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.records_dir.mkdir(parents=True)
         self.video = self.records_dir / "clip.mp4"
         self.video.write_bytes(b"0123456789")
+        self.video_thumb = self.output_dir / "thumbnails" / "model" / "clip.jpg"
+        self.video_thumb.parent.mkdir(parents=True, exist_ok=True)
+        self.video_thumb.write_bytes(b"thumb")
         self.photo = self.records_dir / "photo.jpg"
         self.photo.write_bytes(b"\xff\xd8\xff\xe0photo")
         self.empty_dir = self.output_dir / "records" / "empty_model"
@@ -40,6 +44,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
             file_size=self.video.stat().st_size,
             recording_id="rec_clip",
             duration_seconds=12,
+            thumbnail_path=str(self.video_thumb),
             is_converted=True,
             media_kind="recording",
             created_at=int(old),
@@ -74,6 +79,35 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items["clip.mp4"]["duration"], 12)
         self.assertEqual(items["photo.jpg"]["type"], "image")
         self.assertEqual(items["photo.jpg"]["thumbnail"], items["photo.jpg"]["url"])
+
+    async def test_indexes_manual_video_with_duration_and_thumbnail(self):
+        manual = self.records_dir / "manual_import.mp4"
+        manual.write_bytes(b"manual video")
+        old = time.time() - 120
+        os.utime(manual, (old, old))
+        thumb = self.output_dir / "thumbnails" / "model" / "manual_import.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        thumb.write_bytes(b"thumb")
+
+        with (
+            patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=61)),
+            patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
+        ):
+            response = self.client.get("/api/media-library?kind=video&search=manual_import")
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+        self.assertEqual(item["filename"], "manual_import.mp4")
+        self.assertTrue(item["isImported"])
+        self.assertEqual(item["duration"], 61)
+        self.assertEqual(item["durationStr"], "1m01s")
+        self.assertEqual(item["thumbnail"], "/api/recording-thumbnail/model/manual_import.jpg")
+
+        recs = await app_main.db.get_recordings("model")
+        indexed = next(rec for rec in recs if rec["filename"] == "manual_import.mp4")
+        self.assertEqual(indexed["media_kind"], "import")
+        self.assertEqual(indexed["duration_seconds"], 61)
+        self.assertEqual(indexed["thumbnail_path"], str(thumb))
 
     async def test_filters_media_library(self):
         response = self.client.get("/api/media-library?kind=image&search=photo")

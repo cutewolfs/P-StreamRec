@@ -56,6 +56,19 @@ def _path_key(path_value: Optional[str]) -> Optional[str]:
         return str(path_value)
 
 
+def _file_exists(path_value: Optional[str]) -> bool:
+    if not path_value:
+        return False
+    try:
+        return Path(path_value).exists()
+    except Exception:
+        return False
+
+
+def _import_metadata_ready(rec: dict) -> bool:
+    return int(rec.get("duration_seconds") or 0) > 0 and _file_exists(rec.get("thumbnail_path"))
+
+
 async def _run_ffmpeg(cmd: list[str], timeout: int = 3600) -> tuple[bool, str]:
     try:
         process = await asyncio.create_subprocess_exec(
@@ -334,6 +347,7 @@ async def scan_media_imports(
                 and existing_source_mtime == source_mtime
                 and existing_size == stat.st_size
                 and (existing.get("playable_path") or existing.get("import_status") == "failed")
+                and _import_metadata_ready(existing)
             ):
                 result["skipped"] += 1
                 continue

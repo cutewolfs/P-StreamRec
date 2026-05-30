@@ -30,7 +30,7 @@ class FollowingStaticTests(unittest.TestCase):
         self.assertIn(".following-provider-counter", css)
         self.assertNotIn("sorted by viewers", js)
 
-    def test_following_header_has_provider_sync_without_legacy_global_header(self):
+    def test_following_header_has_no_provider_sync_buttons(self):
         html = (ROOT / "static" / "following.html").read_text()
         js = (ROOT / "static" / "following.js").read_text()
         css = (ROOT / "static" / "styles.css").read_text()
@@ -41,16 +41,19 @@ class FollowingStaticTests(unittest.TestCase):
             "syncBtn",
             "syncIcon",
             "Sync Now",
+            "Provider sync",
+            "data-sync-provider",
+            "renderFollowingSyncControls",
+            "following-sync-controls",
         ):
             self.assertNotIn(removed_text, html)
             self.assertNotIn(removed_text, js)
         self.assertNotIn("following_last_synced", js)
         self.assertNotIn("updateLastSynced", js)
-        self.assertIn("data-sync-provider", js)
         self.assertIn("can_sync_following", js)
         self.assertIn("function syncCapableFollowingProviders()", js)
         self.assertIn("function syncSingleProvider(sourceType, button, silent)", js)
-        self.assertIn(".following-sync-controls", css)
+        self.assertNotIn(".following-sync-controls", css)
         self.assertNotIn(".last-synced", css)
 
     def test_following_page_has_no_redundant_header_block(self):
@@ -60,7 +63,7 @@ class FollowingStaticTests(unittest.TestCase):
         self.assertNotIn('id="syncControls"', html)
         self.assertNotIn('id="loginBanner"', html)
         self.assertNotIn("<h1", html)
-        self.assertIn("renderFollowingSyncControls", js)
+        self.assertNotIn("renderFollowingSyncControls", js)
         self.assertIn("No follows saved yet.", html)
 
 

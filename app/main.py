@@ -30,13 +30,18 @@ from .logger import logger
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
-from .tasks.monitor import monitor_models_task
+from .tasks.monitor import monitor_models_task, get_video_duration
 from .tasks.convert import auto_convert_recordings_task
 from .tasks.media_imports import (
+    DEFAULT_MIN_AGE_SECONDS,
+    DIRECT_PLAYABLE_EXTENSIONS,
     MediaImportManager,
+    generate_import_thumbnail,
     media_imports_task,
     remove_import_record,
+    stable_import_recording_id,
     SUPPORTED_VIDEO_EXTENSIONS,
+    title_from_filename,
 )
 from .services.flaresolverr import FlareSolverrClient
 from .services.chaturbate_auth import ChaturbateAuthService
@@ -74,6 +79,7 @@ CHATURBATE_PASSWORD = os.getenv("CHATURBATE_PASSWORD", "")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191")
 RECORDING_RANGE_CHUNK_SIZE = int(os.getenv("RECORDING_RANGE_CHUNK_SIZE", str(8 * 1024 * 1024)))
 MEDIA_IMPORTS_ENABLED = os.getenv("PSTREAMREC_MEDIA_IMPORTS", "false").lower() in {"1", "true", "yes"}
+MEDIA_LIBRARY_METADATA_MIN_AGE_SECONDS = DEFAULT_MIN_AGE_SECONDS
 MEDIA_LIBRARY_VIDEO_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | {".ts"}
 MEDIA_LIBRARY_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
 MEDIA_LIBRARY_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac"}
@@ -593,6 +599,90 @@ def _recording_thumb_url(username: str, rec: Optional[dict], path: Path) -> Opti
     return None
 
 
+async def _ensure_media_library_video_metadata(
+    username: str,
+    relative_path: str,
+    media_path: Path,
+    rec: Optional[dict],
+    stat: os.stat_result,
+) -> Optional[dict]:
+    if _media_library_kind(media_path) != "video":
+        return rec
+    if time.time() - stat.st_mtime < MEDIA_LIBRARY_METADATA_MIN_AGE_SECONDS:
+        return rec
+
+    current = dict(rec or {})
+    duration_seconds = int(current.get("duration_seconds") or 0)
+    thumbnail_url = _recording_thumb_url(username, current, media_path)
+    if duration_seconds > 0 and thumbnail_url:
+        return rec
+
+    recording_id = current.get("recording_id") or stable_import_recording_id(username, relative_path)
+    media_kind = (current.get("media_kind") or "import").strip().lower() or "import"
+    if duration_seconds <= 0:
+        duration_seconds = await get_video_duration(media_path, FFMPEG_PATH)
+
+    thumbnail_path = current.get("thumbnail_path") if thumbnail_url else None
+    if not thumbnail_path:
+        thumbnail_path = await generate_import_thumbnail(
+            media_path,
+            OUTPUT_DIR,
+            username,
+            recording_id,
+            FFMPEG_PATH,
+        )
+
+    playable_path = current.get("playable_path")
+    playable_size = current.get("playable_size")
+    if not playable_path and media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS:
+        playable_path = str(media_path)
+        playable_size = stat.st_size
+
+    protected_from_retention = bool(current.get("protected_from_retention"))
+    if media_kind == "import":
+        protected_from_retention = True
+
+    await db.add_or_update_recording(
+        username=username,
+        filename=media_path.name,
+        file_path=str(media_path),
+        file_size=stat.st_size,
+        recording_id=recording_id,
+        duration_seconds=duration_seconds,
+        thumbnail_path=thumbnail_path,
+        mp4_path=current.get("mp4_path"),
+        mp4_size=current.get("mp4_size"),
+        is_converted=bool(current.get("is_converted") or playable_path),
+        media_kind=media_kind,
+        title=current.get("title") or title_from_filename(media_path.name),
+        import_status=current.get("import_status") or ("ready" if media_kind == "import" else None),
+        import_error=current.get("import_error"),
+        source_mtime=int(stat.st_mtime),
+        playable_path=playable_path,
+        playable_size=playable_size,
+        protected_from_retention=protected_from_retention,
+        created_at=int(current.get("created_at") or stat.st_mtime),
+    )
+
+    current.update({
+        "username": username,
+        "filename": media_path.name,
+        "file_path": str(media_path),
+        "file_size": stat.st_size,
+        "recording_id": recording_id,
+        "duration_seconds": duration_seconds,
+        "thumbnail_path": thumbnail_path or current.get("thumbnail_path"),
+        "media_kind": media_kind,
+        "title": current.get("title") or title_from_filename(media_path.name),
+        "source_mtime": int(stat.st_mtime),
+        "playable_path": playable_path,
+        "playable_size": playable_size,
+        "protected_from_retention": protected_from_retention,
+        "created_at": int(current.get("created_at") or stat.st_mtime),
+    })
+    return current
+
+
 def _media_library_stats(items: list[dict]) -> dict:
     stats = {
         "total": len(items),
@@ -662,6 +752,14 @@ async def _scan_media_library_items() -> list[dict]:
             rec = recordings_by_path.get(str(resolved))
             if rec is None and len(Path(relative_path).parts) == 1:
                 rec = recordings_by_filename.get(media_path.name)
+            if kind == "video":
+                rec = await _ensure_media_library_video_metadata(
+                    username,
+                    relative_path,
+                    media_path,
+                    rec,
+                    stat,
+                )
 
             url = _media_library_url(username, relative_path)
             thumbnail = url if kind == "image" else _recording_thumb_url(username, rec, media_path)

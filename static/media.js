@@ -183,14 +183,8 @@
       image = '<img src="' + escapeHtml(profile.thumbnail) + '" alt="' + escapeHtml(name) + '" loading="lazy" onerror="this.style.display=\'none\'; this.parentElement.classList.add(\'missing-thumb\');">';
     }
 
-    var latest = profile.latestTitle || 'No recent media';
-    var typeLabel = profile.latestType === 'image' ? 'Photo' : profile.latestType === 'audio' ? 'Audio' : 'Video';
     var countLabel = (profile.videos || 0) + ' videos';
     if (profile.images) countLabel += ' / ' + profile.images + ' photos';
-    if (!profile.total) {
-      latest = profile.folderExists ? 'Dossier vide' : 'Aucun fichier';
-      typeLabel = 'Profil';
-    }
 
     return '' +
       '<button class="media-profile-card' + (active ? ' active' : '') + '" type="button" data-profile="' + escapeHtml(profile.username) + '">' +
@@ -203,7 +197,6 @@
           '<div class="media-profile-name">' + escapeHtml(name) + '</div>' +
           (name !== profile.username ? '<div class="media-profile-handle">' + escapeHtml(profile.username) + '</div>' : '') +
           '<div class="media-profile-counts">' + escapeHtml(countLabel) + '</div>' +
-          '<div class="media-profile-latest">' + escapeHtml(typeLabel + ': ' + latest) + '</div>' +
         '</div>' +
       '</button>';
   }
