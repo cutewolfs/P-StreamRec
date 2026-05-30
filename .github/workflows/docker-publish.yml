@@ -1,4 +1,4 @@
-name: Fast checks / manual publish
+name: Fast checks / beta publish
 
 on:
   push:
@@ -34,7 +34,7 @@ jobs:
           sh -n docker/entrypoint.sh
 
   build-and-push:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'beta'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -100,7 +100,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: ${{ inputs.platforms }}
+          platforms: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
