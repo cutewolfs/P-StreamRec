@@ -117,6 +117,42 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["total"], 1)
         self.assertEqual(data["items"][0]["filename"], "photo.jpg")
 
+    async def test_marks_media_library_video_as_watched(self):
+        unwatched_before = self.client.get("/api/media-library?kind=video&watched=unwatched")
+        self.assertEqual(unwatched_before.status_code, 200)
+        self.assertEqual(unwatched_before.json()["total"], 1)
+
+        position = self.client.post(
+            "/api/playback-position/rec_clip",
+            json={"username": "model", "position": 11, "duration": 12},
+        )
+        self.assertEqual(position.status_code, 200)
+        self.assertTrue(position.json()["isWatched"])
+
+        response = self.client.get("/api/media-library?kind=video")
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+
+        self.assertEqual(item["recordingId"], "rec_clip")
+        self.assertEqual(item["playbackProgress"], 92)
+        self.assertTrue(item["isWatched"])
+        self.assertIsNotNone(item["watchedAt"])
+
+        unwatched_after = self.client.get("/api/media-library?kind=video&watched=unwatched")
+        self.assertEqual(unwatched_after.status_code, 200)
+        self.assertEqual(unwatched_after.json()["total"], 0)
+
+        watched_only = self.client.get("/api/media-library?kind=video&watched=watched")
+        self.assertEqual(watched_only.status_code, 200)
+        self.assertEqual(watched_only.json()["total"], 1)
+
+        replay = self.client.post(
+            "/api/playback-position/rec_clip",
+            json={"username": "model", "position": 1, "duration": 12},
+        )
+        self.assertEqual(replay.status_code, 200)
+        self.assertTrue(replay.json()["isWatched"])
+
     async def test_streams_media_files_securely(self):
         video = self.client.get(
             "/streams/library/model/clip.mp4",

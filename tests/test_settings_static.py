@@ -54,6 +54,27 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("if (caps.can_sync_following === true) {\n      providerBySource[sourceType]", js)
         self.assertIn("No local follows saved for this provider.", js)
 
+    def test_media_page_has_unwatched_video_filter(self):
+        html = (ROOT / "static" / "media.html").read_text()
+        header = (ROOT / "static" / "header.html").read_text()
+        js = (ROOT / "static" / "media.js").read_text()
+        css = (ROOT / "static" / "styles.css").read_text()
+
+        self.assertIn('data-page="media">Media</a>', header)
+        self.assertIn("<title>Media - P-StreamRec</title>", html)
+        self.assertIn("mediaUnwatchedOnlyToggle", html)
+        self.assertIn("Unwatched", html)
+        self.assertIn("unwatchedOnly", js)
+        self.assertIn("params.set('watched', 'unwatched')", js)
+        self.assertIn("toLocaleString('en-US'", js)
+        self.assertIn("Unwatched videos", js)
+        self.assertIn("Watched", js)
+        self.assertIn(".media-unwatched-toggle", css)
+        self.assertNotIn("M&eacute;dia", header)
+        self.assertNotIn("Non vues", html)
+        self.assertNotIn("Videos non vues", js)
+        self.assertNotIn("Deja vu", js)
+
     def test_provider_settings_has_account_controls_for_sync_capable_providers(self):
         js = (ROOT / "static" / "settings.js").read_text()
         css = (ROOT / "static" / "styles.css").read_text()

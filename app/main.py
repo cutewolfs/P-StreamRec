@@ -365,7 +365,7 @@ async def _serve_video_file_with_ranges(request: Request, file_path: Path, filen
 
     if not file_path.exists() or not file_path.is_file():
         logger.error("Fichier vidéo introuvable", path=str(file_path))
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     file_size = file_path.stat().st_size
     logger.file_operation("Lecture", str(file_path), size=file_size)
@@ -463,20 +463,20 @@ def _resolve_library_media_path(username: str, file_path: str) -> Path:
         or "\x00" in file_path
         or "\\" in file_path
     ):
-        raise HTTPException(status_code=400, detail="Chemin média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media path")
 
     relative = Path(file_path)
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
-        raise HTTPException(status_code=400, detail="Chemin média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media path")
 
     records_root = (OUTPUT_DIR / "records").resolve()
     profile_root = (records_root / username).resolve()
     candidate = (profile_root / relative).resolve()
 
     if not candidate.is_relative_to(profile_root) or not candidate.is_relative_to(records_root):
-        raise HTTPException(status_code=403, detail="Chemin média non autorisé")
+        raise HTTPException(status_code=403, detail="Media path is not allowed")
     if _media_library_kind(candidate) is None:
-        raise HTTPException(status_code=400, detail="Format média non supporté")
+        raise HTTPException(status_code=400, detail="Unsupported media format")
     return candidate
 
 
@@ -489,7 +489,7 @@ def _validate_media_profile_username(username: str) -> str:
         or "\\" in username
         or "\x00" in username
     ):
-        raise HTTPException(status_code=400, detail="Profil média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media profile")
     return username
 
 
@@ -498,7 +498,7 @@ def _media_profile_dir(username: str) -> Path:
     records_root = (OUTPUT_DIR / "records").resolve()
     profile_dir = (records_root / username).resolve()
     if not profile_dir.is_relative_to(records_root):
-        raise HTTPException(status_code=403, detail="Profil média non autorisé")
+        raise HTTPException(status_code=403, detail="Media profile is not allowed")
     return profile_dir
 
 
@@ -702,6 +702,81 @@ def _media_library_stats(items: list[dict]) -> dict:
     return stats
 
 
+def _normalize_watched_threshold(value, default: int = 90) -> int:
+    try:
+        threshold = int(value)
+    except (ValueError, TypeError):
+        threshold = default
+    return max(0, min(100, threshold))
+
+
+async def _get_watched_threshold() -> int:
+    raw = await db.get_setting("auto_delete_threshold")
+    return _normalize_watched_threshold(raw if raw is not None else 90)
+
+
+def _playback_progress(position_seconds: float, duration_seconds: float) -> int:
+    try:
+        position = float(position_seconds)
+        duration = float(duration_seconds)
+    except (ValueError, TypeError):
+        return 0
+    if duration <= 0 or position <= 0:
+        return 0
+    return max(0, min(100, round((position / duration) * 100)))
+
+
+def _is_playback_watched(
+    position_seconds: float,
+    duration_seconds: float,
+    watched_threshold: int,
+) -> bool:
+    try:
+        position = float(position_seconds)
+        duration = float(duration_seconds)
+    except (ValueError, TypeError):
+        return False
+    if duration <= 0 or position <= 0:
+        return False
+    return _playback_progress(position, duration) >= watched_threshold or position >= max(0, duration - 2)
+
+
+def _attach_media_playback_state(
+    item: dict,
+    playback_position: Optional[dict],
+    watched_threshold: int,
+) -> None:
+    if item.get("type") != "video":
+        item.update({
+            "playbackPosition": 0,
+            "playbackDuration": 0,
+            "playbackProgress": 0,
+            "watchedThreshold": watched_threshold,
+            "isWatched": False,
+            "watchedAt": None,
+        })
+        return
+
+    position = float((playback_position or {}).get("position_seconds") or 0)
+    duration = float(
+        (playback_position or {}).get("duration_seconds")
+        or item.get("duration")
+        or 0
+    )
+    progress = _playback_progress(position, duration)
+    stored_watched_at = (playback_position or {}).get("watched_at")
+    is_watched = bool(stored_watched_at) or _is_playback_watched(position, duration, watched_threshold)
+
+    item.update({
+        "playbackPosition": position,
+        "playbackDuration": duration,
+        "playbackProgress": progress,
+        "watchedThreshold": watched_threshold,
+        "isWatched": is_watched,
+        "watchedAt": stored_watched_at or ((playback_position or {}).get("updated_at") if is_watched else None),
+    })
+
+
 async def _scan_media_library_items() -> list[dict]:
     from .core.utils import format_bytes
 
@@ -815,7 +890,7 @@ async def serve_recording_protected(request: Request, username: str, filename: s
         or not filename.lower().endswith((".ts", ".mp4", ".webm"))
     ):
         logger.warning("Tentative d'accès fichier invalide", username=username, filename=filename)
-        raise HTTPException(status_code=400, detail="Nom de fichier invalide")
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
     active_sessions = _all_recording_statuses()
     for session in active_sessions:
@@ -826,7 +901,7 @@ async def serve_recording_protected(request: Request, username: str, filename: s
             logger.warning("Accès bloqué à enregistrement en cours", username=username, filename=filename)
             raise HTTPException(
                 status_code=403,
-                detail="Cet enregistrement est en cours. Regardez le live à la place.",
+                detail="This recording is in progress. Watch the live stream instead.",
             )
 
     # Servir le fichier
@@ -838,26 +913,26 @@ async def serve_recording_protected(request: Request, username: str, filename: s
 async def serve_imported_media(request: Request, recording_id: str, download: bool = False):
     """Sert un média importé via son ID stable, sans exposer de chemin disque."""
     if ".." in recording_id or "/" in recording_id:
-        raise HTTPException(status_code=400, detail="ID média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media ID")
 
     rec = await db.get_recording_by_id(recording_id)
     if not rec or rec.get("media_kind") != "import":
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     path_value = rec.get("file_path") if download else (rec.get("playable_path") or rec.get("file_path"))
     if not path_value:
-        raise HTTPException(status_code=404, detail="Fichier média introuvable")
+        raise HTTPException(status_code=404, detail="Media file not found")
 
     file_path = Path(path_value)
     output_root = OUTPUT_DIR.resolve()
     try:
         resolved = file_path.resolve()
         if not resolved.is_relative_to(output_root):
-            raise HTTPException(status_code=403, detail="Chemin média non autorisé")
+            raise HTTPException(status_code=403, detail="Media path is not allowed")
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=400, detail="Chemin média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media path")
 
     return await _serve_video_file_with_ranges(request, file_path, file_path.name)
 
@@ -867,7 +942,7 @@ async def serve_library_media(request: Request, username: str, file_path: str, d
     """Sert un fichier média présent dans /records/<profil>/ avec validation de chemin."""
     media_path = _resolve_library_media_path(username, file_path)
     if not media_path.exists() or not media_path.is_file():
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     kind = _media_library_kind(media_path)
     media_type = mimetypes.guess_type(media_path.name)[0] or (
@@ -3436,6 +3511,7 @@ async def get_media_library(
     kind: str = "all",
     search: str = "",
     sort: str = "newest",
+    watched: str = "all",
     limit: int = 1000,
     offset: int = 0,
 ):
@@ -3556,6 +3632,32 @@ async def get_media_library(
                 or query in item["relativePath"].lower()
             ]
 
+    watched_threshold = await _get_watched_threshold()
+    playback_positions = await db.get_all_playback_positions(username)
+    playback_by_recording_id = {
+        row.get("recording_id"): row
+        for row in playback_positions
+        if row.get("recording_id")
+    }
+    for item in filtered:
+        _attach_media_playback_state(
+            item,
+            playback_by_recording_id.get(item.get("recordingId")),
+            watched_threshold,
+        )
+
+    watched_filter = (watched or "all").strip().lower()
+    if watched_filter in {"unwatched", "not_watched", "unseen", "non_vue", "non_vues", "non-vue", "non-vues"}:
+        filtered = [
+            item for item in filtered
+            if item.get("type") == "video" and not item.get("isWatched")
+        ]
+    elif watched_filter in {"watched", "seen", "viewed", "vue", "vues"}:
+        filtered = [
+            item for item in filtered
+            if item.get("type") == "video" and item.get("isWatched")
+        ]
+
     sort_key = (sort or "newest").strip().lower()
     reverse = True
     if sort_key == "oldest":
@@ -3607,7 +3709,7 @@ async def get_media_profile(username: str):
     model = await db.get_model(username)
     recordings = await db.get_recordings(username)
     if not profile_dir.exists() and not profile and not model and not recordings:
-        raise HTTPException(status_code=404, detail="Profil introuvable")
+        raise HTTPException(status_code=404, detail="Profile not found")
     return await _media_profile_payload(username)
 
 
@@ -3621,7 +3723,7 @@ async def update_media_profile(username: str, body: dict):
     if requested_source not in _available_source_types():
         raise HTTPException(
             status_code=400,
-            detail=f"Source '{requested_source}' non disponible",
+            detail=f"Source '{requested_source}' is not available",
         )
 
     profile_data = {
@@ -3675,7 +3777,7 @@ def _assert_media_profile_not_active(username: str):
         if session.get("person") == username and session.get("running"):
             raise HTTPException(
                 status_code=403,
-                detail="Impossible de supprimer un profil en cours d'enregistrement.",
+                detail="Cannot delete a profile while it is recording.",
             )
 
 
@@ -3691,9 +3793,9 @@ async def delete_media_profile(username: str):
     recordings = await db.get_recordings(username)
     folder_exists = profile_dir.exists()
     if not folder_exists and not profile and not model and not recordings:
-        raise HTTPException(status_code=404, detail="Profil introuvable")
+        raise HTTPException(status_code=404, detail="Profile not found")
     if folder_exists and not profile_dir.is_dir():
-        raise HTTPException(status_code=400, detail="Le profil records n'est pas un dossier")
+        raise HTTPException(status_code=400, detail="The profile records path is not a folder")
 
     for rec in recordings:
         recording_id = rec.get("recording_id")
@@ -3771,12 +3873,12 @@ def _assert_media_not_active(username: str, media_path: Path):
         if active_key and target_key and active_key == target_key:
             raise HTTPException(
                 status_code=403,
-                detail="Impossible de supprimer un média en cours d'enregistrement.",
+                detail="Cannot delete media while it is recording.",
             )
         if record_path and Path(record_path).stem == media_path.stem:
             raise HTTPException(
                 status_code=403,
-                detail="Impossible de supprimer un média en cours d'enregistrement.",
+                detail="Cannot delete media while it is recording.",
             )
 
 
@@ -3790,10 +3892,10 @@ async def _delete_media_library_record(username: str, media_path: Path, relative
             delete_original=True,
         )
         if not deleted:
-            raise HTTPException(status_code=404, detail="Média introuvable")
+            raise HTTPException(status_code=404, detail="Media not found")
         return {
             "success": True,
-            "message": "Média supprimé",
+            "message": "Media deleted",
             "deletedFiles": [media_path.name],
             "removedRecord": True,
         }
@@ -3837,11 +3939,11 @@ async def _delete_media_library_record(username: str, media_path: Path, relative
             await db.delete_recording(username, rec.get("filename") or media_path.name)
 
     if not deleted_files and not removed_record:
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     return {
         "success": True,
-        "message": "Média supprimé",
+        "message": "Media deleted",
         "deletedFiles": deleted_files,
         "removedRecord": removed_record,
     }
@@ -3852,7 +3954,7 @@ async def delete_media_library_item(username: str, file_path: str):
     """Supprime un média depuis la bibliothèque locale records."""
     media_path = _resolve_library_media_path(username, file_path)
     if not media_path.exists() or not media_path.is_file():
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     _assert_media_not_active(username, media_path)
     result = await _delete_media_library_record(username, media_path, file_path)
@@ -4675,10 +4777,9 @@ async def get_recording_settings():
     show_ts_files = show_ts_val is not None and show_ts_val.lower() in {"1", "true", "yes"}
     auto_delete_watched = auto_delete_val is not None and auto_delete_val.lower() in {"1", "true", "yes"}
 
-    try:
-        auto_delete_threshold = int(auto_delete_threshold_val) if auto_delete_threshold_val is not None else 90
-    except (ValueError, TypeError):
-        auto_delete_threshold = 90
+    auto_delete_threshold = _normalize_watched_threshold(
+        auto_delete_threshold_val if auto_delete_threshold_val is not None else 90
+    )
 
     # Max recording resolution (0 = best available)
     max_res_val = await db.get_setting("max_resolution")
@@ -4871,7 +4972,7 @@ async def update_recording_settings(body: dict):
     if "auto_delete_watched" in body:
         await db.set_setting("auto_delete_watched", str(body["auto_delete_watched"]).lower())
     if "auto_delete_threshold" in body:
-        threshold = max(0, min(100, int(body["auto_delete_threshold"])))
+        threshold = _normalize_watched_threshold(body["auto_delete_threshold"])
         await db.set_setting("auto_delete_threshold", str(threshold))
     if "max_resolution" in body:
         try:
@@ -4996,21 +5097,56 @@ async def get_playback_position(recording_id: str):
     """Get saved playback position for a recording"""
     pos = await db.get_playback_position(recording_id)
     if pos:
+        watched_threshold = await _get_watched_threshold()
+        is_watched = bool(pos.get("watched_at")) or _is_playback_watched(
+            pos["position_seconds"],
+            pos["duration_seconds"],
+            watched_threshold,
+        )
         return {
             "recordingId": recording_id,
             "position": pos["position_seconds"],
             "duration": pos["duration_seconds"],
+            "progress": _playback_progress(pos["position_seconds"], pos["duration_seconds"]),
+            "watchedThreshold": watched_threshold,
+            "isWatched": is_watched,
+            "watchedAt": pos.get("watched_at") or (pos.get("updated_at") if is_watched else None),
         }
-    return {"recordingId": recording_id, "position": 0, "duration": 0}
+    return {
+        "recordingId": recording_id,
+        "position": 0,
+        "duration": 0,
+        "progress": 0,
+        "watchedThreshold": await _get_watched_threshold(),
+        "isWatched": False,
+        "watchedAt": None,
+    }
 
 
 @app.post("/api/playback-position/{recording_id}")
 async def save_playback_position(recording_id: str, body: dict):
     """Save playback position for a recording. Auto-delete if threshold reached."""
-    position = body.get("position", 0)
-    duration = body.get("duration", 0)
+    try:
+        position = float(body.get("position", 0) or 0)
+    except (ValueError, TypeError):
+        position = 0
+    try:
+        duration = float(body.get("duration", 0) or 0)
+    except (ValueError, TypeError):
+        duration = 0
     username = body.get("username", "")
-    await db.save_playback_position(recording_id, username, position, duration)
+    watched_threshold = await _get_watched_threshold()
+    playback_progress = _playback_progress(position, duration)
+    position_reached_watched_threshold = _is_playback_watched(position, duration, watched_threshold)
+    await db.save_playback_position(
+        recording_id,
+        username,
+        position,
+        duration,
+        mark_watched=position_reached_watched_threshold,
+    )
+    saved_position = await db.get_playback_position(recording_id)
+    is_watched = bool((saved_position or {}).get("watched_at")) or position_reached_watched_threshold
 
     # Check auto-delete
     should_delete = False
@@ -5027,16 +5163,17 @@ async def save_playback_position(recording_id: str, body: dict):
             and auto_delete_val
             and auto_delete_val.lower() in {"1", "true", "yes"}
         ):
-            threshold_val = await db.get_setting("auto_delete_threshold")
-            try:
-                threshold = int(threshold_val) if threshold_val else 90
-            except (ValueError, TypeError):
-                threshold = 90
-            completion_pct = (position / duration) * 100
-            if completion_pct >= threshold:
+            if position_reached_watched_threshold:
                 should_delete = True
 
-    return {"success": True, "autoDelete": should_delete}
+    return {
+        "success": True,
+        "autoDelete": should_delete,
+        "isWatched": is_watched,
+        "progress": playback_progress,
+        "watchedThreshold": watched_threshold,
+        "watchedAt": (saved_position or {}).get("watched_at"),
+    }
 
 
 # ============================================

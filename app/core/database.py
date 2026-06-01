@@ -170,6 +170,7 @@ class Database:
                     username TEXT NOT NULL,
                     position_seconds REAL DEFAULT 0,
                     duration_seconds REAL DEFAULT 0,
+                    watched_at INTEGER,
                     updated_at INTEGER
                 )
             """)
@@ -260,6 +261,7 @@ class Database:
             ("provider_sessions", "credential_username", "TEXT"),
             ("provider_sessions", "credential_password", "TEXT"),
             ("provider_sessions", "credentials_updated_at", "INTEGER"),
+            ("playback_positions", "watched_at", "INTEGER"),
         ]
         for table, column, ddl in migrations:
             try:
@@ -1398,21 +1400,31 @@ class Database:
         recording_id: str,
         username: str,
         position_seconds: float,
-        duration_seconds: float = 0
+        duration_seconds: float = 0,
+        mark_watched: bool = False,
     ):
         """Save playback position for a recording"""
         await self.initialize()
         now = int(datetime.now().timestamp())
+        watched_at = now if mark_watched else None
         async with self._connect() as db:
             await db.execute("""
-                INSERT INTO playback_positions (recording_id, username, position_seconds, duration_seconds, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO playback_positions (
+                    recording_id, username, position_seconds, duration_seconds, watched_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(recording_id) DO UPDATE SET
                     position_seconds = ?,
                     duration_seconds = ?,
+                    watched_at = CASE
+                        WHEN ? THEN COALESCE(playback_positions.watched_at, ?)
+                        ELSE playback_positions.watched_at
+                    END,
                     updated_at = ?
-            """, (recording_id, username, position_seconds, duration_seconds, now,
-                  position_seconds, duration_seconds, now))
+            """, (
+                recording_id, username, position_seconds, duration_seconds, watched_at, now,
+                position_seconds, duration_seconds, 1 if mark_watched else 0, watched_at, now,
+            ))
             await db.commit()
 
     async def get_all_playback_positions(self, username: Optional[str] = None) -> List[Dict[str, Any]]:

@@ -16,7 +16,9 @@
     pendingDelete: null,
     pendingProfileDelete: null,
     currentViewerItem: null,
-    profileSettings: null
+    profileSettings: null,
+    viewerSaveInterval: null,
+    unwatchedOnly: false
   };
 
   var searchTimer = null;
@@ -37,7 +39,7 @@
   function formatDate(timestamp) {
     if (!timestamp) return '-';
     try {
-      return new Date(timestamp * 1000).toLocaleString([], {
+      return new Date(timestamp * 1000).toLocaleString('en-US', {
         year: 'numeric',
         month: 'short',
         day: 'numeric',
@@ -53,6 +55,77 @@
     if (item.type === 'image') return 'Photo';
     if (item.type === 'audio') return 'Audio';
     return 'Video';
+  }
+
+  function numberOrZero(value) {
+    var num = Number(value);
+    return Number.isFinite(num) && num > 0 ? num : 0;
+  }
+
+  function mediaPlaybackDuration(item) {
+    return numberOrZero(item && item.playbackDuration) || numberOrZero(item && item.duration);
+  }
+
+  function mediaPlaybackProgress(item) {
+    if (!item || item.type !== 'video') return 0;
+    var explicitProgress = Number(item.playbackProgress);
+    if (Number.isFinite(explicitProgress) && explicitProgress > 0) {
+      return Math.max(0, Math.min(100, Math.round(explicitProgress)));
+    }
+    var duration = mediaPlaybackDuration(item);
+    var position = numberOrZero(item.playbackPosition);
+    if (!duration || !position) return 0;
+    return Math.max(0, Math.min(100, Math.round((position / duration) * 100)));
+  }
+
+  function mediaWatchedThreshold(item) {
+    var threshold = Number(item && item.watchedThreshold);
+    if (!Number.isFinite(threshold)) return 90;
+    return Math.max(0, Math.min(100, threshold));
+  }
+
+  function updateMediaPlaybackState(item, position, duration, data) {
+    if (!item || item.type !== 'video') return;
+    var savedDuration = numberOrZero(duration) || mediaPlaybackDuration(item);
+    var savedPosition = numberOrZero(position);
+    item.playbackPosition = savedPosition;
+    item.playbackDuration = savedDuration;
+
+    if (data && typeof data.progress === 'number') {
+      item.playbackProgress = data.progress;
+    } else if (savedDuration > 0 && savedPosition > 0) {
+      item.playbackProgress = Math.max(0, Math.min(100, Math.round((savedPosition / savedDuration) * 100)));
+    } else {
+      item.playbackProgress = 0;
+    }
+
+    if (data && typeof data.watchedThreshold === 'number') {
+      item.watchedThreshold = data.watchedThreshold;
+    }
+    if (data && data.watchedAt) {
+      item.watchedAt = data.watchedAt;
+    }
+    if (data && typeof data.isWatched === 'boolean') {
+      item.isWatched = data.isWatched;
+      return;
+    }
+
+    var threshold = mediaWatchedThreshold(item);
+    if (savedDuration > 0 && savedPosition > 0 && item.playbackProgress >= threshold) {
+      item.isWatched = true;
+      if (!item.watchedAt) item.watchedAt = Math.floor(Date.now() / 1000);
+    }
+  }
+
+  function refreshMediaCard(item) {
+    if (!item || !item.id) return;
+    var cards = document.querySelectorAll('.media-card');
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].dataset.mediaId === item.id) {
+        cards[i].outerHTML = renderCard(item);
+        return;
+      }
+    }
   }
 
   function itemById(id) {
@@ -93,9 +166,10 @@
 
   function buildQuery() {
     var params = new URLSearchParams();
-    params.set('kind', state.kind);
+    params.set('kind', state.unwatchedOnly ? 'video' : state.kind);
     params.set('sort', state.sort);
     params.set('limit', '1000');
+    if (state.unwatchedOnly) params.set('watched', 'unwatched');
     if (state.profile) params.set('username', state.profile);
     if (state.search) params.set('search', state.search);
     return params.toString();
@@ -164,7 +238,7 @@
 
     if (meta) {
       var count = state.profiles.length;
-      meta.textContent = count === 1 ? '1 profil' : count + ' profils';
+      meta.textContent = count === 1 ? '1 profile' : count + ' profiles';
     }
 
     if (!state.profiles.length) {
@@ -222,8 +296,8 @@
       parts.push(((profile && profile.videos) || 0) + ' videos');
       parts.push(((profile && profile.images) || 0) + ' photos');
       if (profile && profile.country) parts.push(profile.country);
-      if (profile && profile.recordQuality) parts.push('Qualite ' + profile.recordQuality);
-      if (profile && profile.retentionDays != null) parts.push(profile.retentionDays + ' jours');
+      if (profile && profile.recordQuality) parts.push('Quality ' + profile.recordQuality);
+      if (profile && profile.retentionDays != null) parts.push(profile.retentionDays + ' days');
       meta.textContent = parts.join(' / ');
     }
     detail.hidden = false;
@@ -240,7 +314,7 @@
     var meta = $('mediaResultMeta');
     var clearBtn = $('mediaClearProfileBtn');
     if (title) {
-      var base = state.kind === 'image' ? 'Photos recentes' : state.kind === 'all' ? 'Medias recents' : 'Videos recentes';
+      var base = state.unwatchedOnly ? 'Unwatched videos' : state.kind === 'image' ? 'Recent photos' : state.kind === 'all' ? 'Recent media' : 'Recent videos';
       title.textContent = state.profile ? base + ' / ' + profileLabel(profileByUsername(state.profile)) : base;
     }
     if (clearBtn) {
@@ -248,7 +322,9 @@
       clearBtn.textContent = state.profile ? 'All profiles' : 'All profiles';
     }
     if (meta) {
-      var label = state.items.length === 1 ? '1 media file' : state.items.length + ' media files';
+      var label = state.unwatchedOnly
+        ? (state.items.length === 1 ? '1 unwatched video' : state.items.length + ' unwatched videos')
+        : (state.items.length === 1 ? '1 media item' : state.items.length + ' media items');
       if (state.search) label += ' matching search';
       meta.textContent = label;
     }
@@ -260,7 +336,9 @@
     if (!grid) return;
 
     if (meta) {
-      var label = total === 1 ? '1 media file' : total + ' media files';
+      var label = state.unwatchedOnly
+        ? (total === 1 ? '1 unwatched video' : total + ' unwatched videos')
+        : (total === 1 ? '1 media item' : total + ' media items');
       if (state.profile) label += ' in ' + state.profile;
       if (state.search) label += ' matching search';
       meta.textContent = label;
@@ -280,6 +358,7 @@
       thumb = '<img src="' + escapeHtml(item.thumbnail) + '" alt="' + escapeHtml(item.title || item.filename) + '" loading="lazy" onerror="this.style.display=\'none\'; this.parentElement.classList.add(\'missing-thumb\');">';
     }
 
+    var progress = mediaPlaybackProgress(item);
     var marker = item.type === 'image' ? '&#128247;' : item.type === 'audio' ? '&#9835;' : '&#9654;';
     var badges = [
       '<span>' + formatType(item) + '</span>',
@@ -287,14 +366,20 @@
     ];
     if (item.isImported) badges.push('<span>Imported</span>');
     if (item.isRecording) badges.push('<span>Recording</span>');
+    if (item.isWatched) {
+      badges.push('<span class="watched">Watched</span>');
+    } else if (item.type === 'video' && progress > 0) {
+      badges.push('<span>' + progress + '% watched</span>');
+    }
     if (item.type === 'video' && !item.browserPlayable) badges.push('<span>Original</span>');
 
     return '' +
-      '<article class="media-card" role="button" tabindex="0" data-media-id="' + escapeHtml(item.id) + '">' +
+      '<article class="media-card' + (item.isWatched ? ' watched' : '') + '" role="button" tabindex="0" data-media-id="' + escapeHtml(item.id) + '">' +
         '<div class="media-card-thumb">' +
           thumb +
           '<div class="media-card-placeholder"><span aria-hidden="true">' + marker + '</span></div>' +
           (item.durationStr ? '<span class="media-duration">' + escapeHtml(item.durationStr) + '</span>' : '') +
+          (item.type === 'video' && progress > 0 ? '<div class="media-playback-progress" aria-hidden="true"><div style="width:' + progress + '%"></div></div>' : '') +
         '</div>' +
         '<div class="media-card-body">' +
           '<div class="media-card-title" title="' + escapeHtml(item.filename) + '">' + escapeHtml(item.title || item.filename) + '</div>' +
@@ -309,6 +394,110 @@
           '</div>' +
         '</div>' +
       '</article>';
+  }
+
+  function clearViewerSaveInterval() {
+    if (state.viewerSaveInterval) {
+      clearInterval(state.viewerSaveInterval);
+      state.viewerSaveInterval = null;
+    }
+  }
+
+  function videoPlaybackDuration(video, item) {
+    return numberOrZero(video && video.duration) || mediaPlaybackDuration(item);
+  }
+
+  function videoPlaybackPosition(video, duration) {
+    if (!video) return 0;
+    if (video.ended && duration > 0) return duration;
+    return numberOrZero(video.currentTime);
+  }
+
+  function saveMediaPlaybackPosition(video, item, options) {
+    options = options || {};
+    if (!video || !item || item.type !== 'video' || !item.recordingId) {
+      return Promise.resolve(null);
+    }
+
+    var duration = videoPlaybackDuration(video, item);
+    var position = videoPlaybackPosition(video, duration);
+    if (position <= 0 && !options.force) return Promise.resolve(null);
+
+    updateMediaPlaybackState(item, position, duration);
+    if (options.updateCard !== false) refreshMediaCard(item);
+
+    var now = Date.now();
+    if (!options.force && item._mediaPlaybackSavedAt && now - item._mediaPlaybackSavedAt < 10000) {
+      return Promise.resolve(null);
+    }
+    item._mediaPlaybackSavedAt = now;
+
+    return fetch('/api/playback-position/' + encodeURIComponent(item.recordingId), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        position: position,
+        duration: duration,
+        username: item.username || ''
+      })
+    }).then(function(res) {
+      if (!res.ok) return null;
+      return res.json().catch(function() { return null; });
+    }).then(function(data) {
+      if (data) {
+        updateMediaPlaybackState(item, position, duration, data);
+        if (options.updateCard !== false) refreshMediaCard(item);
+      }
+      return data;
+    }).catch(function() {
+      return null;
+    });
+  }
+
+  async function loadMediaPlaybackPosition(video, item) {
+    if (!video || !item || item.type !== 'video' || !item.recordingId) return;
+    var duration = videoPlaybackDuration(video, item);
+    try {
+      var res = await fetch('/api/playback-position/' + encodeURIComponent(item.recordingId), { cache: 'no-store' });
+      if (!res.ok) return;
+      var data = await res.json();
+      updateMediaPlaybackState(item, data.position, data.duration || duration, data);
+      refreshMediaCard(item);
+
+      var seekDuration = videoPlaybackDuration(video, item);
+      var position = numberOrZero(data.position);
+      if (!item.isWatched && position > 5 && seekDuration > 0 && position < seekDuration - 3) {
+        video.currentTime = position;
+      }
+    } catch (e) {}
+  }
+
+  function setupMediaVideoPlayback(video, item) {
+    if (!video || !item || item.type !== 'video' || !item.recordingId) return;
+
+    clearViewerSaveInterval();
+    video.addEventListener('loadedmetadata', function() {
+      loadMediaPlaybackPosition(video, item);
+    });
+    video.addEventListener('timeupdate', function() {
+      var previousProgress = mediaPlaybackProgress(item);
+      var duration = videoPlaybackDuration(video, item);
+      var position = videoPlaybackPosition(video, duration);
+      updateMediaPlaybackState(item, position, duration);
+      var nextProgress = mediaPlaybackProgress(item);
+      if (nextProgress > 0 && nextProgress !== previousProgress) refreshMediaCard(item);
+    });
+    video.addEventListener('pause', function() {
+      saveMediaPlaybackPosition(video, item, { force: true });
+    });
+    video.addEventListener('ended', function() {
+      saveMediaPlaybackPosition(video, item, { force: true });
+    });
+    state.viewerSaveInterval = setInterval(function() {
+      if (!video.paused && !video.ended) {
+        saveMediaPlaybackPosition(video, item);
+      }
+    }, 15000);
   }
 
   function openViewer(item) {
@@ -346,10 +535,11 @@
       mediaNode.autoplay = true;
       mediaNode.playsInline = true;
       stage.appendChild(mediaNode);
+      setupMediaVideoPlayback(mediaNode, item);
       if (!item.browserPlayable) {
         var note = document.createElement('div');
         note.className = 'media-viewer-note';
-        note.textContent = 'Format original. Le navigateur peut ne pas le lire directement.';
+        note.textContent = 'Original format. Your browser may not play it directly.';
         stage.appendChild(note);
       }
     }
@@ -365,6 +555,10 @@
     if (!viewer || !stage) return;
 
     var active = stage.querySelector('video, audio');
+    clearViewerSaveInterval();
+    if (active && active.tagName && active.tagName.toLowerCase() === 'video') {
+      saveMediaPlaybackPosition(active, state.currentViewerItem, { force: true });
+    }
     if (active) active.pause();
     stage.innerHTML = '';
     state.currentViewerItem = null;
@@ -400,7 +594,7 @@
     }
     if (confirm) {
       confirm.disabled = false;
-      confirm.textContent = 'Supprimer';
+      confirm.textContent = 'Delete';
     }
     if (modal) {
       modal.style.display = 'flex';
@@ -425,7 +619,7 @@
     var confirm = $('mediaDeleteConfirm');
     if (confirm) {
       confirm.disabled = true;
-      confirm.textContent = 'Suppression...';
+      confirm.textContent = 'Deleting...';
     }
 
     try {
@@ -439,14 +633,14 @@
         closeViewer();
       }
       closeDeleteConfirm();
-      showToast('Media supprime', 'success');
+      showToast('Media deleted', 'success');
       await loadMediaLibrary();
     } catch (e) {
       console.error('Error deleting media:', e);
       showToast(e.message || 'Delete failed', 'error');
       if (confirm) {
         confirm.disabled = false;
-        confirm.textContent = 'Supprimer';
+        confirm.textContent = 'Delete';
       }
     }
   }
@@ -543,7 +737,7 @@
     var save = $('mediaProfileSettingsSave');
     if (save) {
       save.disabled = true;
-      save.textContent = 'Enregistrement...';
+      save.textContent = 'Saving...';
     }
 
     var retention = parseInt(fieldValue('profileRetentionDays'), 10);
@@ -588,7 +782,7 @@
       if (!res.ok || data.success === false) {
         throw new Error(data.detail || data.message || 'Save failed');
       }
-      showToast('Parametres enregistres', 'success');
+      showToast('Settings saved', 'success');
       closeProfileSettings();
       await loadMediaLibrary();
     } catch (e) {
@@ -597,7 +791,7 @@
     } finally {
       if (save) {
         save.disabled = false;
-        save.textContent = 'Enregistrer';
+        save.textContent = 'Save';
       }
     }
   }
@@ -612,7 +806,7 @@
     if (target) target.textContent = profileLabel(profile) + ' / ' + profile.username;
     if (confirm) {
       confirm.disabled = false;
-      confirm.textContent = 'Supprimer le profil';
+      confirm.textContent = 'Delete profile';
     }
     if (modal) {
       modal.style.display = 'flex';
@@ -637,7 +831,7 @@
     var confirm = $('mediaProfileDeleteConfirm');
     if (confirm) {
       confirm.disabled = true;
-      confirm.textContent = 'Suppression...';
+      confirm.textContent = 'Deleting...';
     }
 
     try {
@@ -650,14 +844,14 @@
       closeProfileSettings();
       state.profile = '';
       state.profileSettings = null;
-      showToast('Profil supprime', 'success');
+      showToast('Profile deleted', 'success');
       await loadMediaLibrary();
     } catch (e) {
       console.error('Error deleting profile:', e);
       showToast(e.message || 'Delete failed', 'error');
       if (confirm) {
         confirm.disabled = false;
-        confirm.textContent = 'Supprimer le profil';
+        confirm.textContent = 'Delete profile';
       }
     }
   }
@@ -670,10 +864,18 @@
 
     var sort = $('mediaSortSelect');
     if (sort) sort.value = state.sort;
+
+    var unwatchedToggle = $('mediaUnwatchedOnlyToggle');
+    if (unwatchedToggle) {
+      unwatchedToggle.checked = !!state.unwatchedOnly;
+      var unwatchedLabel = unwatchedToggle.closest('.media-unwatched-toggle');
+      if (unwatchedLabel) unwatchedLabel.classList.toggle('active', !!state.unwatchedOnly);
+    }
   }
 
   function setKind(kind) {
     state.kind = kind || 'all';
+    if (state.kind !== 'video') state.unwatchedOnly = false;
     loadMediaLibrary();
   }
 
@@ -712,6 +914,15 @@
     if (sortSelect) {
       sortSelect.addEventListener('change', function() {
         state.sort = sortSelect.value;
+        loadMediaLibrary();
+      });
+    }
+
+    var unwatchedToggle = $('mediaUnwatchedOnlyToggle');
+    if (unwatchedToggle) {
+      unwatchedToggle.addEventListener('change', function() {
+        state.unwatchedOnly = !!unwatchedToggle.checked;
+        if (state.unwatchedOnly) state.kind = 'video';
         loadMediaLibrary();
       });
     }
