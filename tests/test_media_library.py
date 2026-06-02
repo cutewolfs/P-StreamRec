@@ -91,6 +91,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=61)),
+            patch.object(app_main, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
             patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
         ):
             response = self.client.get("/api/media-library?kind=video&search=manual_import")
@@ -102,12 +103,14 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["duration"], 61)
         self.assertEqual(item["durationStr"], "1m01s")
         self.assertEqual(item["thumbnail"], "/api/recording-thumbnail/model/manual_import.jpg")
+        self.assertEqual(item["createdAt"], 1704164645)
 
         recs = await app_main.db.get_recordings("model")
         indexed = next(rec for rec in recs if rec["filename"] == "manual_import.mp4")
         self.assertEqual(indexed["media_kind"], "import")
         self.assertEqual(indexed["duration_seconds"], 61)
         self.assertEqual(indexed["thumbnail_path"], str(thumb))
+        self.assertEqual(indexed["created_at"], 1704164645)
 
     async def test_filters_media_library(self):
         response = self.client.get("/api/media-library?kind=image&search=photo")

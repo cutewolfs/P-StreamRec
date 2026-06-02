@@ -801,7 +801,8 @@ class Database:
                     source_mtime = COALESCE(?, source_mtime),
                     playable_path = COALESCE(?, playable_path),
                     playable_size = COALESCE(?, playable_size),
-                    protected_from_retention = ?
+                    protected_from_retention = ?,
+                    created_at = COALESCE(?, created_at)
             """, (
                 username, recording_id, filename, file_path, file_size,
                 duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
@@ -809,7 +810,7 @@ class Database:
                 playable_path, playable_size, protected_value, created_at,
                 file_size, duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
                 media_kind, title, import_status, import_error, source_mtime,
-                playable_path, playable_size, protected_value
+                playable_path, playable_size, protected_value, created_at
             ))
             await db.commit()
     

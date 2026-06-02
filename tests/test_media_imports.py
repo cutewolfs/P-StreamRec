@@ -36,6 +36,7 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=123)),
+            patch.object(media_imports, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
             patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
         ):
             result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
@@ -54,6 +55,7 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec["playable_path"], str(source))
         self.assertTrue(bool(rec["protected_from_retention"]))
         self.assertEqual(rec["duration_seconds"], 123)
+        self.assertEqual(rec["created_at"], 1704164645)
 
     async def test_rescan_is_idempotent_and_removes_missing_sources(self):
         source = self.write_old_file("records/model/clip.mp4")
@@ -109,6 +111,42 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         rec = (await self.db.get_recordings("model"))[0]
         self.assertEqual(rec["duration_seconds"], 44)
         self.assertEqual(rec["thumbnail_path"], str(thumb))
+
+    async def test_rescan_repairs_existing_import_created_at_from_metadata(self):
+        source = self.write_old_file("records/model/clip.mp4")
+        thumb = self.output_dir / "thumbnails" / "model" / "import_test.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        thumb.write_bytes(b"thumb")
+        stat = source.stat()
+        old_created_at = int(stat.st_mtime)
+        metadata_created_at = 1704164645
+        await self.db.add_or_update_recording(
+            username="model",
+            filename="clip.mp4",
+            file_path=str(source),
+            file_size=stat.st_size,
+            recording_id="import_test",
+            duration_seconds=44,
+            thumbnail_path=str(thumb),
+            playable_path=str(source),
+            playable_size=stat.st_size,
+            media_kind="import",
+            import_status="ready",
+            source_mtime=int(stat.st_mtime),
+            protected_from_retention=True,
+            created_at=old_created_at,
+        )
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=44)),
+            patch.object(media_imports, "get_media_created_at", new=AsyncMock(return_value=metadata_created_at)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["updated"], 1)
+        rec = (await self.db.get_recordings("model"))[0]
+        self.assertEqual(rec["created_at"], metadata_created_at)
 
     async def test_scan_skips_recent_and_temp_files(self):
         recent = self.output_dir / "records/model/recent.mp4"

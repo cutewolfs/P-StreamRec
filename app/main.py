@@ -30,7 +30,7 @@ from .logger import logger
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
-from .tasks.monitor import monitor_models_task, get_video_duration
+from .tasks.monitor import get_media_created_at, get_video_duration, monitor_models_task
 from .tasks.convert import auto_convert_recordings_task
 from .tasks.media_imports import (
     DEFAULT_MIN_AGE_SECONDS,
@@ -614,7 +614,16 @@ async def _ensure_media_library_video_metadata(
     current = dict(rec or {})
     duration_seconds = int(current.get("duration_seconds") or 0)
     thumbnail_url = _recording_thumb_url(username, current, media_path)
-    if duration_seconds > 0 and thumbnail_url:
+    source_mtime = int(stat.st_mtime)
+    current_created_at = int(current.get("created_at") or 0)
+    created_at = current_created_at or source_mtime
+    if current_created_at in {0, source_mtime}:
+        created_at = await get_media_created_at(
+            media_path,
+            FFMPEG_PATH,
+            fallback_timestamp=source_mtime,
+        )
+    if duration_seconds > 0 and thumbnail_url and current_created_at == created_at:
         return rec
 
     recording_id = current.get("recording_id") or stable_import_recording_id(username, relative_path)
@@ -657,11 +666,11 @@ async def _ensure_media_library_video_metadata(
         title=current.get("title") or title_from_filename(media_path.name),
         import_status=current.get("import_status") or ("ready" if media_kind == "import" else None),
         import_error=current.get("import_error"),
-        source_mtime=int(stat.st_mtime),
+        source_mtime=source_mtime,
         playable_path=playable_path,
         playable_size=playable_size,
         protected_from_retention=protected_from_retention,
-        created_at=int(current.get("created_at") or stat.st_mtime),
+        created_at=created_at,
     )
 
     current.update({
@@ -674,11 +683,11 @@ async def _ensure_media_library_video_metadata(
         "thumbnail_path": thumbnail_path or current.get("thumbnail_path"),
         "media_kind": media_kind,
         "title": current.get("title") or title_from_filename(media_path.name),
-        "source_mtime": int(stat.st_mtime),
+        "source_mtime": source_mtime,
         "playable_path": playable_path,
         "playable_size": playable_size,
         "protected_from_retention": protected_from_retention,
-        "created_at": int(current.get("created_at") or stat.st_mtime),
+        "created_at": created_at,
     })
     return current
 
@@ -1567,7 +1576,7 @@ async def _index_browser_capture_recording(session) -> None:
     if not record_path.exists() or not record_path.is_file():
         return
     try:
-        from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+        from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
 
         await _remux_browser_recording(record_path)
         file_size = record_path.stat().st_size
@@ -1576,6 +1585,7 @@ async def _index_browser_capture_recording(session) -> None:
             duration_seconds = max(0, int(time.time() - getattr(session, "start_time", time.time())))
         if duration_seconds < MIN_RECORDING_SECONDS and file_size < MIN_RECORDING_BYTES:
             return
+        fallback_created_at = int(getattr(session, "start_time", None) or record_path.stat().st_mtime)
         thumbnail_path = await generate_recording_thumbnail(
             record_path,
             OUTPUT_DIR,
@@ -1590,6 +1600,11 @@ async def _index_browser_capture_recording(session) -> None:
             recording_id=f"{session.person}_{record_path.stem}",
             duration_seconds=duration_seconds,
             thumbnail_path=thumbnail_path,
+            created_at=await get_media_created_at(
+                record_path,
+                FFMPEG_PATH,
+                fallback_timestamp=fallback_created_at,
+            ),
         )
     except Exception as exc:
         logger.warning(
@@ -1613,7 +1628,7 @@ async def _index_ffmpeg_recording(session) -> None:
         return
 
     try:
-        from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+        from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
 
         for record_path in paths:
             if not record_path.exists() or not record_path.is_file():
@@ -1632,6 +1647,7 @@ async def _index_ffmpeg_recording(session) -> None:
                     file_size=file_size,
                 )
                 continue
+            fallback_created_at = int(getattr(session, "start_time", None) or record_path.stat().st_mtime)
             thumbnail_path = await generate_recording_thumbnail(
                 record_path,
                 OUTPUT_DIR,
@@ -1647,6 +1663,11 @@ async def _index_ffmpeg_recording(session) -> None:
                 duration_seconds=duration_seconds,
                 thumbnail_path=thumbnail_path,
                 is_converted=False,
+                created_at=await get_media_created_at(
+                    record_path,
+                    FFMPEG_PATH,
+                    fallback_timestamp=fallback_created_at,
+                ),
             )
             logger.info(
                 "Recording FFmpeg indexée",
@@ -5238,8 +5259,6 @@ async def get_recordings_by_model(show_ts: bool = False):
 @app.post("/api/recordings/recalculate-durations")
 async def recalculate_all_durations():
     """Recalcule les durées de tous les enregistrements"""
-    from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
-    
     logger.info("API: Demande de recalcul des durées", endpoint="/api/recordings/recalculate-durations")
     
     try:
@@ -5257,7 +5276,7 @@ async def recalculate_all_durations():
 
 async def _recalculate_durations_task():
     """Tâche de recalcul des durées en arrière-plan"""
-    from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+    from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
     
     logger.background_task("recalculate-durations", "Démarrage du recalcul")
     
@@ -5308,7 +5327,12 @@ async def _recalculate_durations_task():
                                 file_path=str(ts_file),
                                 file_size=ts_file.stat().st_size,
                                 duration_seconds=duration,
-                                thumbnail_path=thumbnail_path
+                                thumbnail_path=thumbnail_path,
+                                created_at=await get_media_created_at(
+                                    ts_file,
+                                    FFMPEG_PATH,
+                                    fallback_timestamp=int(ts_file.stat().st_mtime),
+                                ),
                             )
                             
                             total_updated += 1
