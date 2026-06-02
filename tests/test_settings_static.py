@@ -15,6 +15,16 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("settingsApiPill", html)
         self.assertNotIn("settingsApiDot", html)
 
+    def test_recording_settings_exposes_check_interval_control(self):
+        html = (ROOT / "static" / "settings.html").read_text()
+        js = (ROOT / "static" / "settings.js").read_text()
+
+        self.assertIn('id="checkIntervalInput"', html)
+        self.assertIn("check_interval_seconds", html)
+        self.assertIn("function normalizeCheckIntervalSeconds", js)
+        self.assertIn("function setCheckIntervalInput", js)
+        self.assertIn("data.check_interval_seconds", js)
+
     def test_tests_center_covers_local_diagnostics(self):
         js = (ROOT / "static" / "settings.js").read_text()
         test_ids = set(re.findall(r"id: '([^']+)'", js))

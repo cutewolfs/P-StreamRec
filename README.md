@@ -119,6 +119,7 @@ PSTREAMREC_IMAGE=p-streamrec:local HOST_PORT=2727 docker compose up -d --force-r
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |
 | `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
+| `AUTO_RECORD_INTERVAL` | `120` | Default seconds between background live-status checks; can be overridden in Settings |
 | `RECORD_SEGMENT_DURATION_MINUTES` | `0` | Optional recording split interval: `0`, `30`, `60`, or `90` minutes |
 | `RECORD_SEGMENT_SIZE_MB` | `0` | Optional maximum TS segment size in MB; `0` disables size-based splitting |
 | `CHATURBATE_USERNAME` | — | Chaturbate login (optional, enables Following + better quality) |

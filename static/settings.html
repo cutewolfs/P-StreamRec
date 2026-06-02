@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js?v=12"></script>
+  <script defer src="/static/settings.js?v=13"></script>
   <style>
     /* --- Processes tab --- */
     .proc-count-badge {
@@ -309,8 +309,23 @@
                 <span class="settings-row-value" id="ffmpegPath" style="font-family: monospace; font-size: 0.85rem;">-</span>
               </div>
               <div class="settings-row">
-                <span class="settings-row-label">Check Interval</span>
-                <span class="settings-row-value" id="checkInterval">-</span>
+                <div>
+                  <span class="settings-row-label">Check Interval</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">How often tracked sources are checked for live status. Higher values reduce provider requests.</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end;">
+                  <input
+                    type="number"
+                    id="checkIntervalInput"
+                    min="30"
+                    max="3600"
+                    step="30"
+                    value="120"
+                    onchange="updateRecordingSetting('check_interval_seconds', normalizeCheckIntervalSeconds(this.value))"
+                    style="width: 7rem; padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;"
+                  />
+                  <span style="font-size: 0.9rem; color: var(--text-secondary);">seconds</span>
+                </div>
               </div>
               <div class="settings-row">
                 <div>

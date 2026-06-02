@@ -30,7 +30,14 @@ from .logger import logger
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
-from .tasks.monitor import get_media_created_at, get_video_duration, monitor_models_task
+from .tasks.monitor import (
+    CHECK_INTERVAL_SETTING_KEY,
+    get_check_interval_seconds,
+    get_media_created_at,
+    get_video_duration,
+    monitor_models_task,
+    normalize_check_interval_seconds,
+)
 from .tasks.convert import auto_convert_recordings_task
 from .tasks.media_imports import (
     DEFAULT_MIN_AGE_SECONDS,
@@ -1917,12 +1924,13 @@ async def favicon():
 async def get_version():
     """Retourne les informations de version et configuration"""
     version = os.environ.get("APP_VERSION", "dev")
-    from app.core.config import AUTO_RECORD_INTERVAL
+    check_interval = await get_check_interval_seconds(db)
     return {
         "version": version,
         "output_dir": str(OUTPUT_DIR),
         "ffmpeg_path": FFMPEG_PATH,
-        "check_interval": AUTO_RECORD_INTERVAL,
+        "check_interval": check_interval,
+        "check_interval_seconds": check_interval,
     }
 
 
@@ -4824,6 +4832,7 @@ async def get_recording_settings():
     default_retention_days = await _get_default_retention_days()
     segment_duration_minutes = await _get_segment_duration_minutes()
     segment_size_mb = await _get_segment_size_mb()
+    check_interval_seconds = await get_check_interval_seconds(db)
 
     return {
         "auto_convert": auto_convert,
@@ -4836,6 +4845,8 @@ async def get_recording_settings():
         "default_retention_days": default_retention_days,
         "segment_duration_minutes": segment_duration_minutes,
         "segment_size_mb": segment_size_mb,
+        "check_interval": check_interval_seconds,
+        "check_interval_seconds": check_interval_seconds,
     }
 
 
@@ -5032,6 +5043,14 @@ async def update_recording_settings(body: dict):
     if "segment_size_mb" in body:
         segment_size_mb = _normalize_segment_size_mb(body["segment_size_mb"])
         await db.set_setting("segment_size_mb", str(segment_size_mb))
+    if "check_interval_seconds" in body or "check_interval" in body:
+        try:
+            check_interval_seconds = normalize_check_interval_seconds(
+                body.get("check_interval_seconds", body.get("check_interval"))
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        await db.set_setting(CHECK_INTERVAL_SETTING_KEY, str(check_interval_seconds))
     if body.get("apply_default_retention_to_models"):
         if default_retention_days is None:
             default_retention_days = await _get_default_retention_days()

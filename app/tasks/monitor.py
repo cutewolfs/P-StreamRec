@@ -17,14 +17,51 @@ if TYPE_CHECKING:
     from ..core.database import Database
 
 from ..logger import logger
-from ..core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS, OUTPUT_DIR
+from ..core.config import (
+    AUTO_RECORD_INTERVAL,
+    MIN_RECORDING_BYTES,
+    MIN_RECORDING_SECONDS,
+    OUTPUT_DIR,
+)
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 
 # Intervalle de vérification (en secondes)
-MONITOR_INTERVAL = 60  # Vérifie toutes les 60 secondes
+CHECK_INTERVAL_SETTING_KEY = "check_interval_seconds"
+MIN_CHECK_INTERVAL_SECONDS = 30
+MAX_CHECK_INTERVAL_SECONDS = 3600
+MONITOR_INTERVAL = AUTO_RECORD_INTERVAL
 THUMBNAIL_UPDATE_INTERVAL = 300  # Miniature offline: toutes les 5 minutes
 THUMBNAIL_UPDATE_INTERVAL_LIVE = 60  # Miniature live: toutes les 60s pour refléter l'activité
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
+
+
+def normalize_check_interval_seconds(value, default: int = MONITOR_INTERVAL) -> int:
+    try:
+        interval = int(value)
+    except (ValueError, TypeError):
+        interval = default
+
+    if interval < MIN_CHECK_INTERVAL_SECONDS:
+        raise ValueError(f"check interval must be at least {MIN_CHECK_INTERVAL_SECONDS} seconds")
+    if interval > MAX_CHECK_INTERVAL_SECONDS:
+        raise ValueError(f"check interval must be at most {MAX_CHECK_INTERVAL_SECONDS} seconds")
+    return interval
+
+
+async def get_check_interval_seconds(db: 'Database') -> int:
+    raw = await db.get_setting(CHECK_INTERVAL_SETTING_KEY)
+    try:
+        return normalize_check_interval_seconds(
+            raw if raw is not None else AUTO_RECORD_INTERVAL
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Intervalle de monitoring invalide, fallback env",
+            task="monitor",
+            value=raw,
+            error=str(exc),
+        )
+        return normalize_check_interval_seconds(AUTO_RECORD_INTERVAL)
 
 async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> bool:
     """Check if a model is live using the Chaturbate thumbnail CDN.
@@ -722,13 +759,25 @@ async def monitor_models_task(
 
     await db.initialize()
 
+    async def sleep_until_next_check():
+        try:
+            interval = await get_check_interval_seconds(db)
+        except Exception as exc:
+            logger.warning(
+                "Impossible de lire l'intervalle de monitoring",
+                task="monitor",
+                error=str(exc),
+            )
+            interval = MONITOR_INTERVAL
+        await asyncio.sleep(interval)
+
     async with aiohttp_client_session() as session:
         while True:
             try:
                 models = await db.get_all_models()
 
                 if not models:
-                    await asyncio.sleep(MONITOR_INTERVAL)
+                    await sleep_until_next_check()
                     continue
 
                 logger.debug("Vérification des modèles", count=len(models))
@@ -860,10 +909,10 @@ async def monitor_models_task(
                         continue
                 
                 # Attendre avant la prochaine vérification
-                await asyncio.sleep(MONITOR_INTERVAL)
+                await sleep_until_next_check()
             
             except Exception as e:
                 logger.error("Erreur dans monitor task",
                            error=str(e),
                            exc_info=True)
-                await asyncio.sleep(60)
+                await sleep_until_next_check()

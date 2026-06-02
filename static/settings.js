@@ -447,7 +447,9 @@ async function loadAppInfo() {
         var config = data.config || data;
         if (config.output_dir) setText('outputDir', config.output_dir);
         if (config.ffmpeg_path) setText('ffmpegPath', config.ffmpeg_path);
-        if (config.check_interval) setText('checkInterval', config.check_interval + 's');
+        if (config.check_interval_seconds || config.check_interval) {
+          setCheckIntervalInput(config.check_interval_seconds || config.check_interval);
+        }
       }
     }
   } catch (e) {
@@ -475,6 +477,17 @@ function normalizeSegmentSizeMb(value) {
   return Math.max(0, parsed);
 }
 
+function normalizeCheckIntervalSeconds(value) {
+  var parsed = parseInt(value, 10);
+  if (isNaN(parsed)) parsed = 120;
+  return Math.max(30, Math.min(3600, parsed));
+}
+
+function setCheckIntervalInput(value) {
+  var input = document.getElementById('checkIntervalInput');
+  if (input) input.value = normalizeCheckIntervalSeconds(value);
+}
+
 async function loadRecordingSettings() {
   try {
     var res = await fetch('/api/settings/recording');
@@ -490,6 +503,7 @@ async function loadRecordingSettings() {
       var defaultRetentionInput = document.getElementById('defaultRetentionInput');
       var segmentDurationSelect = document.getElementById('segmentDurationSelect');
       var segmentSizeInput = document.getElementById('segmentSizeInput');
+      var checkIntervalInput = document.getElementById('checkIntervalInput');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
       if (keepTsToggle) keepTsToggle.checked = !!data.keep_ts;
@@ -520,6 +534,9 @@ async function loadRecordingSettings() {
       if (segmentSizeInput) {
         segmentSizeInput.value = normalizeSegmentSizeMb(data.segment_size_mb);
       }
+      if (checkIntervalInput) {
+        setCheckIntervalInput(data.check_interval_seconds || data.check_interval);
+      }
     }
   } catch (e) {
     console.error('Error loading recording settings:', e);
@@ -535,6 +552,7 @@ async function updateRecordingSetting(key, value) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
+    var data = await res.json().catch(function() { return {}; });
     if (res.ok) {
       showNotification('Setting updated', 'success');
       if (key === 'default_retention_days') {
@@ -545,13 +563,16 @@ async function updateRecordingSetting(key, value) {
         var segmentSizeInput = document.getElementById('segmentSizeInput');
         if (segmentSizeInput) segmentSizeInput.value = normalizeSegmentSizeMb(value);
       }
+      if (key === 'check_interval_seconds') {
+        setCheckIntervalInput(data.check_interval_seconds || data.check_interval || value);
+      }
       // Toggle threshold row visibility when auto_delete_watched changes
       if (key === 'auto_delete_watched') {
         var thresholdRow = document.getElementById('autoDeleteThresholdRow');
         if (thresholdRow) thresholdRow.style.display = value ? 'flex' : 'none';
       }
     } else {
-      showNotification('Failed to update setting', 'error');
+      showNotification(data.detail || 'Failed to update setting', 'error');
       loadRecordingSettings();
     }
   } catch (e) {
@@ -1086,11 +1107,13 @@ var testDefinitions = [
       var data = await fetchJsonNoCache('/api/settings/recording');
       assertTest(typeof data.auto_convert === 'boolean', 'auto_convert setting missing');
       assertTest(typeof data.keep_ts === 'boolean', 'keep_ts setting missing');
+      assertTest(typeof data.check_interval_seconds === 'number', 'check_interval_seconds setting missing');
       var maxRes = data.max_resolution ? data.max_resolution + 'p max' : 'best max';
       var defaultRes = data.default_resolution ? data.default_resolution + 'p default' : 'best default';
+      var interval = data.check_interval_seconds + 's checks';
       var duration = data.segment_duration_minutes ? data.segment_duration_minutes + 'm parts' : 'duration off';
       var size = data.segment_size_mb ? data.segment_size_mb + 'MB parts' : 'size off';
-      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + defaultRes + ' - ' + maxRes + ' - ' + duration + ' - ' + size);
+      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + interval + ' - ' + defaultRes + ' - ' + maxRes + ' - ' + duration + ' - ' + size);
     }
   },
   {
