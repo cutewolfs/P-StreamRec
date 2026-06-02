@@ -195,12 +195,13 @@ class HlsProxyTests(unittest.TestCase):
             source_type="livejasmin",
         )
 
-        url, headers = main._ffmpeg_stream_input(stream)
+        url, headers, source_url = main._ffmpeg_stream_input(stream)
 
         self.assertTrue(url.startswith("http://127.0.0.1:"))
         self.assertIn("/api/proxy/hls/", url)
         self.assertTrue(url.endswith(".m3u8"))
         self.assertIsNone(headers)
+        self.assertEqual("https://cdn.example.test/live/token", source_url)
 
     def test_ffmpeg_input_uses_local_proxy_for_regular_hls(self):
         stream = main.ResolvedStream(
@@ -209,11 +210,12 @@ class HlsProxyTests(unittest.TestCase):
             source_type="cams",
         )
 
-        url, headers = main._ffmpeg_stream_input(stream)
+        url, headers, source_url = main._ffmpeg_stream_input(stream)
 
         self.assertTrue(url.startswith("http://127.0.0.1:"))
         self.assertIn("/api/proxy/hls/", url)
         self.assertIsNone(headers)
+        self.assertEqual("https://cdn.example.test/live/master.m3u8", source_url)
 
     def test_ffmpeg_input_uses_local_proxy_for_chaturbate_hls(self):
         stream = main.ResolvedStream(
@@ -222,11 +224,12 @@ class HlsProxyTests(unittest.TestCase):
             source_type="chaturbate",
         )
 
-        url, headers = main._ffmpeg_stream_input(stream)
+        url, headers, source_url = main._ffmpeg_stream_input(stream)
 
         self.assertTrue(url.startswith("http://127.0.0.1:"))
         self.assertIn("/api/proxy/hls/", url)
         self.assertIsNone(headers)
+        self.assertEqual("https://edge.mmcdn.com/live/llhls.m3u8", source_url)
 
     def test_watch_stream_payload_proxies_hls_by_default(self):
         stream = main.ResolvedStream(

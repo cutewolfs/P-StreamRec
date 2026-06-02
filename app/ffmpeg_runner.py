@@ -125,6 +125,7 @@ def _build_ffmpeg_command(
     tee_spec: str,
     max_height: Optional[int] = None,
     input_headers: Optional[Dict[str, str]] = None,
+    source_url: Optional[str] = None,
 ) -> List[str]:
     cmd = [
         ffmpeg_path,
@@ -165,9 +166,14 @@ def _build_ffmpeg_command(
     cmd.extend(_hls_input_args(input_url, input_headers))
 
     # For Chaturbate LL-HLS master playlists, the master URL contains both
-    # video variants and a separate audio rendition group. Passing only a
-    # video-only chunk URL strips audio.
-    is_llhls = 'llhls.m3u8' in input_url
+    # video variants and a separate audio rendition group. The FFmpeg transport
+    # URL may be the local HLS proxy, so use the original upstream URL for this
+    # detection when available.
+    stream_identity_url = source_url or input_url
+    is_llhls = (
+        'llhls.m3u8' in stream_identity_url.lower()
+        and _is_chaturbate_hls_url(stream_identity_url)
+    )
     if is_llhls:
         v_idx = _llhls_video_stream_index(max_height)
         map_args = ["-map", f"0:v:{v_idx}", "-map", "0:a:0"]
@@ -195,9 +201,11 @@ class FFmpegSession:
         segment_duration_seconds: int = 0,
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
+        source_url: Optional[str] = None,
     ):
         self.id = session_id
         self.input_url = input_url
+        self.source_url = source_url or input_url
         self.input_headers = dict(input_headers or {})
         self.sessions_dir = sessions_dir
         self.records_dir_for_person = records_dir_for_person
@@ -537,6 +545,7 @@ class FFmpegManager:
         segment_duration_seconds: int = 0,
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
+        source_url: Optional[str] = None,
     ) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
@@ -570,6 +579,7 @@ class FFmpegManager:
                 segment_duration_seconds=segment_duration_seconds,
                 segment_size_bytes=segment_size_bytes,
                 input_headers=input_headers,
+                source_url=source_url,
             )
 
             # Build tee spec: one branch to stdout (pipe:1) as MPEG-TS, one for HLS playback
@@ -590,6 +600,7 @@ class FFmpegManager:
                 tee_spec,
                 max_height=max_height,
                 input_headers=sess.input_headers,
+                source_url=sess.source_url,
             )
 
             safe_cmd = _redact_ffmpeg_command(cmd)

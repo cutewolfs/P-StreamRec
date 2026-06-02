@@ -2,8 +2,8 @@
 Tâche de conversion automatique des enregistrements TS -> MP4
 """
 import asyncio
+import json
 import time
-import subprocess
 from pathlib import Path
 from typing import Optional
 from ..logger import logger
@@ -13,6 +13,59 @@ from .monitor import get_media_created_at, get_video_duration
 # Nombre maximal de tentatives de conversion avant skip automatique
 MAX_CONVERSION_ATTEMPTS = 3
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
+
+
+def _select_best_video_stream_map(probe_data: dict) -> str:
+    """Return an FFmpeg -map value for the highest-quality video stream."""
+    candidates = []
+    for stream in probe_data.get("streams") or []:
+        try:
+            index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            height = int(stream.get("height") or stream.get("coded_height") or 0)
+        except (TypeError, ValueError):
+            height = 0
+        try:
+            width = int(stream.get("width") or stream.get("coded_width") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        try:
+            bitrate = int(stream.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        candidates.append((height, width, bitrate, -index, index))
+
+    if not candidates:
+        return "0:v:0"
+    return f"0:{sorted(candidates, reverse=True)[0][-1]}"
+
+
+async def _best_video_stream_map(ts_path: Path, ffmpeg_path: str = "ffmpeg") -> str:
+    ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-select_streams", "v",
+        "-show_entries", "stream=index,width,height,coded_width,coded_height,bit_rate",
+        "-of", "json",
+        str(ts_path),
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode == 0 and stdout:
+            return _select_best_video_stream_map(json.loads(stdout.decode("utf-8")))
+        error_msg = stderr.decode("utf-8", errors="replace") if stderr else ""
+        logger.debug("ffprobe video stream selection failed", ts_file=str(ts_path), error=error_msg[:300])
+    except Exception as e:
+        logger.debug("ffprobe video stream selection unavailable", ts_file=str(ts_path), error=str(e))
+    return "0:v:0"
 
 
 async def convert_ts_to_mp4(
@@ -38,6 +91,8 @@ async def convert_ts_to_mp4(
                ts_file=ts_path.name,
                mp4_file=mp4_path.name)
 
+    video_map = await _best_video_stream_map(ts_path, ffmpeg_path)
+
     # Remux only: the HLS source is already H.264+AAC, so copying codecs
     # produces a valid MP4 almost instantly with near-zero CPU usage. Keep a
     # conventional video-then-audio stream order for broad player compatibility.
@@ -47,7 +102,7 @@ async def convert_ts_to_mp4(
         "-nostdin", "-hide_banner", "-loglevel", "error",
         "-fflags", "+genpts+igndts",
         "-i", str(ts_path),
-        "-map", "0:v:0",
+        "-map", video_map,
         "-map", "0:a:0?",
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",

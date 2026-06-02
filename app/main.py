@@ -1532,11 +1532,11 @@ def _local_proxy_url_for_ffmpeg(url: str) -> str:
     return url
 
 
-def _ffmpeg_stream_input(stream: ResolvedStream) -> tuple[str, Optional[dict[str, str]]]:
+def _ffmpeg_stream_input(stream: ResolvedStream) -> tuple[str, Optional[dict[str, str]], str]:
     proxied_url = _proxied_stream_url(stream)
     if proxied_url != stream.url:
-        return _local_proxy_url_for_ffmpeg(proxied_url), None
-    return stream.url, stream.headers
+        return _local_proxy_url_for_ffmpeg(proxied_url), None, stream.url
+    return stream.url, stream.headers, stream.url
 
 
 def _start_browser_capture(
@@ -2682,6 +2682,7 @@ async def api_start(body: StartBody):
 
     m3u8_url: Optional[str] = None
     stream_headers: Optional[dict[str, str]] = None
+    source_url: Optional[str] = None
     person: Optional[str] = (body.person or "").strip() or None
     record_quality = body.record_quality or body.recordQuality
     if not record_quality and model_settings:
@@ -2704,6 +2705,7 @@ async def api_start(body: StartBody):
     if stype == "m3u8" or direct_media_url:
         logger.info("URL M3U8 directe détectée", url=target[:80])
         m3u8_url = target
+        source_url = target
     else:
         effective_source = stype
         available_sources = _available_source_types()
@@ -2763,7 +2765,7 @@ async def api_start(body: StartBody):
         logger.subsection(f"Résolution via source '{effective_source}'")
         try:
             resolved = await _resolve_stream(effective_source, target, max_height)
-            m3u8_url, stream_headers = _ffmpeg_stream_input(resolved)
+            m3u8_url, stream_headers, source_url = _ffmpeg_stream_input(resolved)
             if not m3u8_url:
                 raise HTTPException(
                     status_code=400,
@@ -2794,6 +2796,7 @@ async def api_start(body: StartBody):
 
     person = slugify(person)
     logger.info("Identifiant slugifié", person=person, display_name=body.name)
+    source_url = source_url or m3u8_url
 
     segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
     logger.subsection("Démarrage Session FFmpeg")
@@ -2806,6 +2809,7 @@ async def api_start(body: StartBody):
             segment_duration_seconds=segment_duration_seconds,
             segment_size_bytes=segment_size_bytes,
             input_headers=stream_headers,
+            source_url=source_url,
         )
         duration_ms = (time.time() - start_time) * 1000
         logger.success("Session créée avec succès", 
@@ -5477,7 +5481,7 @@ async def auto_record_task():
                                 resolved = await _resolve_stream(
                                     source_type, username, max_height
                                 )
-                                hls_source, stream_headers = _ffmpeg_stream_input(resolved)
+                                hls_source, stream_headers, source_url = _ffmpeg_stream_input(resolved)
                             except Exception as e:
                                 logger.debug(
                                     "Auto-record resolve échec",
@@ -5500,6 +5504,7 @@ async def auto_record_task():
                                     segment_duration_seconds=segment_duration_seconds,
                                     segment_size_bytes=segment_size_bytes,
                                     input_headers=stream_headers,
+                                    source_url=source_url,
                                 )
 
                                 if sess:
