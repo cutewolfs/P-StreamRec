@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js?v=6"></script>
+  <script defer src="/static/settings.js?v=13"></script>
   <style>
     /* --- Processes tab --- */
     .proc-count-badge {
@@ -133,7 +133,7 @@
     }
     .test-row {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: 1rem;
       padding: 0.9rem 1rem;
       border-bottom: 1px solid var(--border);
@@ -150,6 +150,11 @@
       font-size: 0.8rem;
       line-height: 1.4;
       margin-top: 0.2rem;
+    }
+    .test-run-btn {
+      padding: 0.4rem 0.75rem;
+      font-size: 0.78rem;
+      white-space: nowrap;
     }
     .btn-danger {
       background: #b91c1c; color: white; border: none;
@@ -169,16 +174,7 @@
   <div class="container settings-page">
     <section class="settings-page-header" aria-labelledby="settingsTitle">
       <div class="settings-page-title">
-        <span class="settings-page-kicker">P-StreamRec</span>
         <h1 id="settingsTitle">Settings</h1>
-      </div>
-      <div class="settings-page-actions" aria-label="Settings status">
-        <span class="settings-page-pill" title="API status">
-          <span class="settings-page-dot" id="settingsApiDot"></span>
-          <span>API</span>
-          <strong id="settingsApiPill">Connected</strong>
-        </span>
-        <button class="settings-page-icon-btn" onclick="loadSystemStats()" title="Refresh statistics" aria-label="Refresh statistics">&#8635;</button>
       </div>
     </section>
 
@@ -231,7 +227,7 @@
           <div class="settings-section">
             <div class="settings-section-header">
               <span class="icon">&#128279;</span>
-              <h3>Provider Connections</h3>
+              <h3>Providers</h3>
             </div>
             <div class="settings-section-body">
               <div id="providersList" class="provider-list">
@@ -313,8 +309,23 @@
                 <span class="settings-row-value" id="ffmpegPath" style="font-family: monospace; font-size: 0.85rem;">-</span>
               </div>
               <div class="settings-row">
-                <span class="settings-row-label">Check Interval</span>
-                <span class="settings-row-value" id="checkInterval">-</span>
+                <div>
+                  <span class="settings-row-label">Check Interval</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">How often tracked sources are checked for live status. Higher values reduce provider requests.</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end;">
+                  <input
+                    type="number"
+                    id="checkIntervalInput"
+                    min="30"
+                    max="3600"
+                    step="30"
+                    value="120"
+                    onchange="updateRecordingSetting('check_interval_seconds', normalizeCheckIntervalSeconds(this.value))"
+                    style="width: 7rem; padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-size: 0.9rem;"
+                  />
+                  <span style="font-size: 0.9rem; color: var(--text-secondary);">seconds</span>
+                </div>
               </div>
               <div class="settings-row">
                 <div>

@@ -41,6 +41,27 @@ function providerLabel(sourceType) {
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
+function fallbackThumbnailUrl(username, sourceType) {
+  var source = (sourceType || 'chaturbate').toLowerCase();
+  if (source === 'chaturbate') {
+    return 'https://roomimg.stream.highwebmedia.com/ri/' + encodeURIComponent(username || '') + '.jpg';
+  }
+  var label = providerLabel(source) || 'Live';
+  var title = username || label;
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="220" viewBox="0 0 320 220">' +
+    '<rect fill="#151a24" width="320" height="220"/>' +
+    '<rect fill="#2b3342" x="28" y="28" width="264" height="164" rx="8"/>' +
+    '<text x="50%" y="46%" dominant-baseline="middle" text-anchor="middle" fill="#f8fafc" font-family="system-ui, -apple-system, sans-serif" font-size="20" font-weight="700">' + escapeHtml(label) + '</text>' +
+    '<text x="50%" y="60%" dominant-baseline="middle" text-anchor="middle" fill="#cbd5e1" font-family="system-ui, -apple-system, sans-serif" font-size="15">' + escapeHtml(title) + '</text>' +
+    '</svg>';
+  return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+}
+
+function thumbnailUrlForModel(model, sourceType) {
+  var thumbnail = String(model.thumbnail || '').trim();
+  return thumbnail || fallbackThumbnailUrl(model.username, sourceType);
+}
+
 async function loadFollowedSet() {
   try {
     var res = await fetch('/api/following');
@@ -197,7 +218,9 @@ function renderGrid(models, providerStatuses) {
   }
 
   grid.innerHTML = models.map(function(model) {
-    var thumbUrl = model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + model.username + '.jpg');
+    var cardSource = (model.source_type || model.platform || 'chaturbate');
+    var thumbUrl = thumbnailUrlForModel(model, cardSource);
+    var fallbackThumbUrl = fallbackThumbnailUrl(model.username, cardSource);
     var viewerText = '<span class="discover-viewers">&#128065; ' + Number(model.viewers || 0).toLocaleString() + '</span>';
     var ageText = model.age ? ('<span class="discover-age">' + model.age + '</span>') : '';
     var tagsHtml = '';
@@ -208,9 +231,10 @@ function renderGrid(models, providerStatuses) {
       }).join('') + '</div>';
     }
 
-    var cardSource = (model.source_type || model.platform || 'chaturbate');
     var streamAvailable = model.stream_available !== false;
-    var canFollow = model.can_follow !== false && (!providerCapsBySource[cardSource] || providerCapsBySource[cardSource].can_follow !== false);
+    var cardCaps = providerCapsBySource[cardSource] || {};
+    var localFollowAvailable = cardCaps.can_stream !== false || cardCaps.can_record === true;
+    var canFollow = model.can_follow !== false && (cardCaps.can_follow !== false || localFollowAvailable);
     var isFollowed = followedSet.has(sourceKey(model.username, cardSource));
     var heartBtn = canFollow ? '<button class="discover-follow-heart ' + (isFollowed ? 'is-followed' : '') + '" ' +
       'title="' + (isFollowed ? 'Unfollow' : 'Follow') + ' ' + escapeHtml(model.username) + '" ' +
@@ -221,10 +245,10 @@ function renderGrid(models, providerStatuses) {
       ? ' onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')"'
       : ' title="Live playback is not available for this provider yet"';
 
-    return '<div class="' + cardClass + '" data-username="' + escapeHtml(model.username) + '"' + cardAction + '>' +
+    return '<div class="' + cardClass + '" data-username="' + escapeHtml(model.username) + '" data-source="' + escapeHtml(cardSource) + '"' + cardAction + '>' +
       '<div class="discover-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
-          'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(model.username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
+          'onerror="this.onerror=null;this.src=\'' + escapeHtml(fallbackThumbUrl) + '\'" loading="lazy" />' +
         viewerText +
         ageText +
         renderPlatformBadge(model.source_type || model.platform || 'chaturbate') +
@@ -472,8 +496,9 @@ async function refreshLiveThumbnails() {
       if (!card) return;
       var img = card.querySelector('img');
       if (!img) return;
-      var newThumb = model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + model.username + '.jpg');
-      if (img.src !== newThumb) img.src = newThumb;
+      var cardSource = card.getAttribute('data-source') || model.source_type || model.platform || currentSource || 'chaturbate';
+      var newThumb = thumbnailUrlForModel(model, cardSource);
+      if (img.getAttribute('src') !== newThumb) img.src = newThumb;
     });
   } catch (e) {
     // Silencieux: on réessaiera au prochain tick

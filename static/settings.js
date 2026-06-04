@@ -50,107 +50,7 @@ var logsOffset = 0;
 var statsRefreshInterval = null;
 
 // ============================================
-// CAM4 session management (cookie-based)
-// ============================================
-async function checkCam4Status() {
-  var statusEl = document.getElementById('cam4Status');
-  var usernameRow = document.getElementById('cam4UsernameRow');
-  var usernameEl = document.getElementById('cam4Username');
-  var loginForm = document.getElementById('cam4LoginForm');
-  var loggedInActions = document.getElementById('cam4LoggedInActions');
-  if (!statusEl) return;
-
-  try {
-    var res = await fetch('/api/cam4/status');
-    if (res.ok) {
-      var data = await res.json();
-      if (data.isLoggedIn) {
-        statusEl.className = 'status-indicator connected';
-        statusEl.textContent = 'Connected';
-        if (usernameRow) usernameRow.style.display = data.username ? 'flex' : 'none';
-        if (usernameEl) usernameEl.textContent = data.username || 'Session active';
-        if (loginForm) loginForm.style.display = 'none';
-        if (loggedInActions) loggedInActions.style.display = 'block';
-      } else {
-        statusEl.className = 'status-indicator disconnected';
-        statusEl.textContent = 'Not Connected';
-        if (usernameRow) usernameRow.style.display = 'none';
-        if (loginForm) loginForm.style.display = 'block';
-        if (loggedInActions) loggedInActions.style.display = 'none';
-      }
-    } else {
-      statusEl.className = 'status-indicator unknown';
-      statusEl.textContent = 'Unavailable';
-    }
-  } catch (e) {
-    console.error('Error checking CAM4 status:', e);
-    statusEl.className = 'status-indicator unknown';
-    statusEl.textContent = 'Unavailable';
-  }
-}
-
-async function loginCam4(event) {
-  event.preventDefault();
-  var username = document.getElementById('cam4User').value.trim();
-  var password = document.getElementById('cam4Pass').value;
-  var btn = document.getElementById('cam4LoginBtn');
-  if (!username || !password) {
-    showNotification('Please enter both username and password', 'error');
-    return;
-  }
-  if (btn) { btn.disabled = true; btn.textContent = 'Logging in...'; }
-  try {
-    var res = await fetch('/api/cam4/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username, password: password })
-    });
-    var data = await res.json().catch(function(){ return {}; });
-    if (res.ok && data.success) {
-      showNotification('CAM4 login successful', 'success');
-      document.getElementById('cam4Pass').value = '';
-      await checkCam4Status();
-    } else {
-      showNotification('Login failed: ' + (data.detail || data.error || 'unknown error'), 'error');
-    }
-  } catch (e) {
-    showNotification('Network error: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Log In'; }
-  }
-}
-
-async function logoutCam4() {
-  if (!confirm('Disconnect CAM4 account?')) return;
-  try {
-    var res = await fetch('/api/cam4/logout', { method: 'POST' });
-    if (res.ok) {
-      showNotification('CAM4 session cleared', 'success');
-      await checkCam4Status();
-    } else {
-      showNotification('Failed to disconnect', 'error');
-    }
-  } catch (e) {
-    showNotification('Network error: ' + e.message, 'error');
-  }
-}
-
-async function syncCam4Following() {
-  try {
-    var res = await fetch('/api/cam4/following/sync', { method: 'POST' });
-    var data = await res.json();
-    if (res.ok) {
-      showNotification(data.message || ('Synced ' + data.synced + ' favorites'), 'success');
-    } else {
-      showNotification('Sync failed: ' + (data.detail || 'unknown'), 'error');
-    }
-  } catch (e) {
-    showNotification('Network error: ' + e.message, 'error');
-  }
-}
-
-// ============================================
-// Generic provider sessions
+// Provider capabilities
 // ============================================
 
 async function loadProviders() {
@@ -170,6 +70,7 @@ async function loadProviders() {
 function renderProviders(providers) {
   var list = document.getElementById('providersList');
   if (!list) return;
+  providers = providers || [];
   if (!providers.length) {
     list.innerHTML = '<div class="proc-empty">No providers configured.</div>';
     return;
@@ -177,73 +78,258 @@ function renderProviders(providers) {
 
   list.innerHTML = providers.map(function(provider) {
     var source = provider.sourceType;
-    var status = provider.status || {};
     var caps = provider.capabilities || {};
-    var connected = !!status.isLoggedIn;
-    var statusClass = connected ? 'connected' : 'disconnected';
-    var statusText = connected ? 'Connected' : 'Not Connected';
-    var username = status.username ? '<div class="provider-muted">' + escapeHtml(status.username) + '</div>' : '';
-    var usernamePlaceholder = 'Username';
-    var passwordPlaceholder = 'Password';
-    var loginForm = caps.can_login && !connected
-      ? '<form class="provider-login" onsubmit="loginProvider(event, \'' + escapeHtml(source) + '\')">' +
-          '<input type="text" id="provider-user-' + escapeHtml(source) + '" placeholder="' + usernamePlaceholder + '" autocomplete="username" />' +
-          '<input type="password" id="provider-pass-' + escapeHtml(source) + '" placeholder="' + passwordPlaceholder + '" autocomplete="current-password" />' +
-          '<button type="submit" class="btn-primary">Connect</button>' +
-        '</form>'
-      : '';
-    var actions = '';
-    if (connected) {
-      if (caps.can_sync_following) {
-        actions += '<button class="btn-primary" onclick="syncProviderFollowing(\'' + escapeHtml(source) + '\')">Sync</button>';
-      }
-      actions += '<button class="btn-secondary" onclick="logoutProvider(\'' + escapeHtml(source) + '\')">Disconnect</button>';
-    } else if (!caps.can_login) {
-      actions = '<span class="provider-muted">Public stream resolver only</span>';
-    }
-    var features = [];
-    if (caps.uses_ytdlp) features.push('yt-dlp');
-    if (caps.uses_browser) features.push('browser');
-    if (caps.can_follow) features.push('follow');
-    if (caps.can_discover) features.push('discover');
+    var status = provider.status || {};
+    var supportsAccount = caps.can_login === true;
+    var connected = supportsAccount && status.isLoggedIn === true;
+    var capabilities = providerCapabilityChecks(caps);
+    var accountControls = supportsAccount ? providerAccountControls(source, status, caps) : '';
+    var statusClass = supportsAccount ? providerStatusClass(status) : 'available';
+    var statusText = supportsAccount ? providerStatusText(status) : 'Local';
 
     return '<div class="provider-card">' +
       '<div class="provider-card-main">' +
         '<div>' +
           '<div class="provider-title">' + escapeHtml(provider.displayName || source) + '</div>' +
-          username +
-          '<div class="provider-muted">' + escapeHtml(features.join(' / ') || 'public live + record') + '</div>' +
+          '<div class="provider-muted">' + escapeHtml(providerAvailabilityText(caps)) + '</div>' +
         '</div>' +
-        '<span class="status-indicator ' + statusClass + '">' + statusText + '</span>' +
+        '<span class="status-indicator ' + statusClass + '">' + escapeHtml(statusText) + '</span>' +
       '</div>' +
-      loginForm +
-      (actions ? '<div class="provider-actions">' + actions + '</div>' : '') +
+      '<div class="provider-capability-list">' + capabilities.join('') + '</div>' +
+      accountControls +
     '</div>';
   }).join('');
 }
 
+function providerStatusClass(status) {
+  if (status.isLoggedIn) return 'connected';
+  if (status.hasSavedCredentials || status.hasSavedSessionData || status.hasCookies || status.hasLocalStorage) return 'unknown';
+  if (status.lastError) return 'disconnected';
+  return 'disconnected';
+}
+
+function providerStatusText(status) {
+  if (status.isLoggedIn) return 'Connected';
+  if (providerStatusNeedsSessionImport(status)) return 'Session Required';
+  if (providerStatusLoginFailed(status)) return 'Login Failed';
+  if (status.hasSavedCredentials) return 'Credentials Saved';
+  if (status.hasSavedSessionData || status.hasCookies || status.hasLocalStorage) return 'Session Saved';
+  return 'Not Connected';
+}
+
+function providerAvailabilityText(caps) {
+  if (caps.can_login && caps.can_sync_following) return 'Live, recording, remote sync and follow';
+  if (caps.can_discover && caps.can_record && caps.can_follow) return 'Live, recording and local follows';
+  if (caps.can_discover && caps.can_record) return 'Live and recording';
+  if (caps.can_discover) return 'Live discovery';
+  if (caps.can_record) return 'Recording';
+  return 'Registered provider';
+}
+
+function providerCapabilityChecks(caps) {
+  return [
+    providerCapabilityCheck('Discover', !!caps.can_discover),
+    providerCapabilityCheck('Record', !!caps.can_record),
+    providerCapabilityCheck('Follow / Unfollow', !!caps.can_follow),
+    providerCapabilityCheck('Sync', !!caps.can_sync_following)
+  ];
+}
+
+function providerCapabilityCheck(label, enabled) {
+  return '<label class="provider-capability ' + (enabled ? 'is-enabled' : 'is-disabled') + '">' +
+    '<span class="provider-capability-icon" aria-hidden="true">' + (enabled ? '&#10003;' : '&#10005;') + '</span>' +
+    '<span>' + escapeHtml(label) + '</span>' +
+  '</label>';
+}
+
+function providerAccountControls(source, status, caps) {
+  var connected = status.isLoggedIn === true;
+  var savedCredentials = status.hasSavedCredentials === true;
+  var canSync = connected && caps.can_sync_following === true;
+  var username = status.username ? '<div class="provider-muted">Connected as ' + escapeHtml(status.username) + '</div>' : '';
+  var savedMessage = providerSavedCredentialsMessage(status);
+  var error = providerStatusError(status);
+  var loginForm = '';
+  if (!connected) {
+    loginForm =
+      '<form class="provider-login" onsubmit="loginProvider(event, \'' + escapeHtml(source) + '\')">' +
+        '<input name="username" type="text" autocomplete="username" placeholder="Username" value="' + escapeHtml(status.username || '') + '">' +
+        '<input name="password" type="password" autocomplete="current-password" placeholder="Password">' +
+        '<button type="submit" class="btn btn-primary btn-sm">Connect</button>' +
+      '</form>';
+  }
+  var reconnect = (!connected && savedCredentials)
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="reconnectProvider(\'' + escapeHtml(source) + '\')">Reconnect</button>'
+    : '';
+  var sync = canSync
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="syncProviderFollowing(\'' + escapeHtml(source) + '\')">Sync follows</button>'
+    : '';
+  var importSession = !connected
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="toggleProviderSessionImport(\'' + escapeHtml(source) + '\')">Import Session</button>'
+    : '';
+  var logout = connected
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="logoutProvider(\'' + escapeHtml(source) + '\')">Disconnect</button>'
+    : '';
+
+  return '<div class="provider-account">' +
+    username +
+    (savedMessage ? '<div class="provider-muted">' + escapeHtml(savedMessage) + '</div>' : '') +
+    (error ? '<div class="provider-error">' + escapeHtml(error) + '</div>' : '') +
+    loginForm +
+    '<div class="provider-actions">' + reconnect + importSession + sync + logout + '</div>' +
+    '<div class="provider-session-import" id="providerSessionImport-' + escapeHtml(source) + '" hidden>' +
+      '<div class="provider-muted">Import a verified browser session if automatic login was blocked.</div>' +
+      '<input id="providerSessionUsername-' + escapeHtml(source) + '" type="text" placeholder="Username (optional)">' +
+      '<textarea id="providerCookieHeader-' + escapeHtml(source) + '" rows="2" placeholder="Cookie header, for example sessionid=..."></textarea>' +
+      '<textarea id="providerStorageState-' + escapeHtml(source) + '" rows="4" placeholder="Playwright storageState JSON (optional)"></textarea>' +
+      '<input id="providerUserAgent-' + escapeHtml(source) + '" type="text" placeholder="User-Agent (optional)">' +
+      '<button type="button" class="btn btn-primary btn-sm" onclick="importProviderSession(\'' + escapeHtml(source) + '\')">Save Session</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function providerSavedCredentialsMessage(status) {
+  if (status.isLoggedIn) return '';
+  if (status.hasSavedCredentials) return 'Saved credentials are stored; reconnect to verify the session.';
+  if (status.hasSavedSessionData || status.hasCookies || status.hasLocalStorage) return 'Browser session data is saved but still needs verification.';
+  return '';
+}
+
+function providerStatusError(status) {
+  if (!status || !status.lastError) return '';
+  if (providerStatusNeedsSessionImport(status)) {
+    return 'Automatic login was blocked; import a verified browser session.';
+  }
+  return providerConnectionError(status.lastError);
+}
+
+function providerConnectionError(error) {
+  if (!error) return '';
+  var text = String(error);
+  if (/captcha|2fa|challenge|cloudflare|interaction/i.test(text)) {
+    return 'Automatic login was blocked; import a verified browser session.';
+  }
+  if (/invalid|incorrect|password|credential|login failed/i.test(text)) {
+    return 'Automatic account login failed. Check credentials.';
+  }
+  return text;
+}
+
+function providerStatusNeedsSessionImport(status) {
+  return !!(status && status.lastError && /captcha|2fa|challenge|cloudflare|interaction/i.test(String(status.lastError)));
+}
+
+function providerStatusLoginFailed(status) {
+  return !!(status && status.lastError && /invalid|incorrect|password|credential|login failed/i.test(String(status.lastError)));
+}
+
 async function loginProvider(event, source) {
   event.preventDefault();
-  var user = document.getElementById('provider-user-' + source);
-  var pass = document.getElementById('provider-pass-' + source);
-  var username = user ? user.value.trim() : '';
-  var password = pass ? pass.value : '';
-  if (!username || !password) {
-    showNotification('Please enter both username and password', 'error');
-    return;
+  var form = event.currentTarget;
+  var button = form.querySelector('button[type="submit"]');
+  var data = new FormData(form);
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Connecting...';
   }
   try {
     var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username, password: password })
+      body: JSON.stringify({
+        username: String(data.get('username') || '').trim(),
+        password: String(data.get('password') || '')
+      })
     });
-    var data = await res.json().catch(function(){ return {}; });
-    if (res.ok && data.success) {
-      showNotification('Provider connected', 'success');
-      await loadProviders();
+    var payload = await res.json().catch(function() { return {}; });
+    if (!res.ok || payload.success === false) {
+      showNotification(payload.detail || payload.error || 'Provider login failed', 'error');
     } else {
-      showNotification(data.detail || data.error || 'Login failed', 'error');
+      showNotification('Provider connected', 'success');
+      loadProviders();
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = 'Connect';
+    }
+  }
+}
+
+async function reconnectProvider(source) {
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})
+    });
+    var payload = await res.json().catch(function() { return {}; });
+    if (!res.ok || payload.success === false) {
+      showNotification(payload.detail || payload.error || 'Reconnect failed', 'error');
+    } else {
+      showNotification('Provider connected', 'success');
+      loadProviders();
+    }
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  }
+}
+
+function toggleProviderSessionImport(source) {
+  var panel = document.getElementById('providerSessionImport-' + source);
+  if (panel) panel.hidden = !panel.hidden;
+}
+
+function providerSessionPayload(source) {
+  var usernameEl = document.getElementById('providerSessionUsername-' + source);
+  var cookieEl = document.getElementById('providerCookieHeader-' + source);
+  var storageEl = document.getElementById('providerStorageState-' + source);
+  var userAgentEl = document.getElementById('providerUserAgent-' + source);
+  var payload = {
+    username: usernameEl ? usernameEl.value.trim() : '',
+    cookieHeader: cookieEl ? cookieEl.value.trim() : '',
+    userAgent: userAgentEl ? userAgentEl.value.trim() : ''
+  };
+  var storageText = storageEl ? storageEl.value.trim() : '';
+  if (storageText) {
+    try {
+      var parsed = JSON.parse(storageText);
+      if (parsed.cookies || parsed.origins) {
+        payload.storageState = parsed;
+      } else if (Array.isArray(parsed)) {
+        payload.localStorage = parsed;
+      } else {
+        payload.localStorage = [parsed];
+      }
+    } catch (e) {
+      throw new Error('Session JSON is invalid');
+    }
+  }
+  return payload;
+}
+
+async function importProviderSession(source) {
+  var payload;
+  try {
+    payload = providerSessionPayload(source);
+  } catch (e) {
+    showNotification(e.message, 'error');
+    return;
+  }
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok || data.success === false) {
+      showNotification(data.detail || data.error || 'Session import failed', 'error');
+    } else {
+      showNotification('Provider session imported', 'success');
+      loadProviders();
     }
   } catch (e) {
     showNotification('Connection error', 'error');
@@ -255,7 +341,7 @@ async function logoutProvider(source) {
     var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/logout', { method: 'POST' });
     if (res.ok) {
       showNotification('Provider disconnected', 'success');
-      await loadProviders();
+      loadProviders();
     } else {
       showNotification('Disconnect failed', 'error');
     }
@@ -267,130 +353,13 @@ async function logoutProvider(source) {
 async function syncProviderFollowing(source) {
   try {
     var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/following/sync', { method: 'POST' });
-    var data = await res.json().catch(function(){ return {}; });
-    if (res.ok) {
-      showNotification(data.message || 'Provider sync complete', 'success');
-    } else {
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
       showNotification(data.detail || 'Sync failed', 'error');
-    }
-  } catch (e) {
-    showNotification('Connection error', 'error');
-  }
-}
-
-// ============================================
-// Check Chaturbate login status
-// ============================================
-async function checkChaturbateStatus() {
-  var statusEl = document.getElementById('cbStatus');
-  var usernameRow = document.getElementById('cbUsernameRow');
-  var usernameEl = document.getElementById('cbUsername');
-  var loginForm = document.getElementById('cbLoginForm');
-  var loggedInActions = document.getElementById('cbLoggedInActions');
-
-  try {
-    var res = await fetch('/api/chaturbate/status');
-    if (res.ok) {
-      var data = await res.json();
-
-      if (data.isLoggedIn) {
-        statusEl.className = 'status-indicator connected';
-        statusEl.textContent = 'Connected';
-        usernameRow.style.display = 'flex';
-        usernameEl.textContent = data.username || 'Unknown';
-        loginForm.style.display = 'none';
-        loggedInActions.style.display = 'block';
-      } else {
-        statusEl.className = 'status-indicator disconnected';
-        statusEl.textContent = 'Not Connected';
-        usernameRow.style.display = 'none';
-        loginForm.style.display = 'block';
-        loggedInActions.style.display = 'none';
-      }
-    } else if (res.status === 404) {
-      statusEl.className = 'status-indicator unknown';
-      statusEl.textContent = 'Not Available';
-      loginForm.style.display = 'none';
-      loggedInActions.style.display = 'none';
     } else {
-      statusEl.className = 'status-indicator disconnected';
-      statusEl.textContent = 'Error';
-      loginForm.style.display = 'block';
-      loggedInActions.style.display = 'none';
+      showNotification(data.message || 'Following synced', 'success');
     }
   } catch (e) {
-    console.error('Error checking Chaturbate status:', e);
-    statusEl.className = 'status-indicator unknown';
-    statusEl.textContent = 'Unavailable';
-    loginForm.style.display = 'block';
-    loggedInActions.style.display = 'none';
-  }
-}
-
-// ============================================
-// Login to Chaturbate
-// ============================================
-async function loginChaturbate(event) {
-  event.preventDefault();
-
-  var username = document.getElementById('cbUser').value.trim();
-  var password = document.getElementById('cbPass').value;
-  var loginBtn = document.getElementById('cbLoginBtn');
-
-  if (!username || !password) {
-    showNotification('Please enter both username and password', 'error');
-    return;
-  }
-
-  loginBtn.disabled = true;
-  loginBtn.textContent = 'Logging in...';
-
-  try {
-    var res = await fetch('/api/chaturbate/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        username: username,
-        password: password
-      })
-    });
-
-    if (res.ok) {
-      var data = await res.json();
-      showNotification('Successfully connected to Chaturbate!', 'success');
-      document.getElementById('cbUser').value = '';
-      document.getElementById('cbPass').value = '';
-      await checkChaturbateStatus();
-    } else {
-      var err = {};
-      try { err = await res.json(); } catch (e2) {}
-      showNotification(err.detail || 'Login failed. Check your credentials.', 'error');
-    }
-  } catch (e) {
-    console.error('Error logging in:', e);
-    showNotification('Connection error', 'error');
-  } finally {
-    loginBtn.disabled = false;
-    loginBtn.textContent = 'Log In';
-  }
-}
-
-// ============================================
-// Logout from Chaturbate
-// ============================================
-async function logoutChaturbate() {
-  if (!confirm('Disconnect your Chaturbate account?')) return;
-
-  try {
-    var res = await fetch('/api/chaturbate/logout', { method: 'POST' });
-    if (res.ok) {
-      showNotification('Chaturbate account disconnected', 'success');
-      await checkChaturbateStatus();
-    } else {
-      showNotification('Failed to disconnect', 'error');
-    }
-  } catch (e) {
-    console.error('Error logging out:', e);
     showNotification('Connection error', 'error');
   }
 }
@@ -473,15 +442,14 @@ async function loadAppInfo() {
     if (res.ok) {
       var data = await res.json();
       setText('appVersionSetting', 'v' + (data.version || 'unknown'));
-      setText('settingsApiPill', 'Connected');
-      var apiDot = document.getElementById('settingsApiDot');
-      if (apiDot) apiDot.classList.remove('disconnected');
 
       if (data.output_dir || data.config) {
         var config = data.config || data;
         if (config.output_dir) setText('outputDir', config.output_dir);
         if (config.ffmpeg_path) setText('ffmpegPath', config.ffmpeg_path);
-        if (config.check_interval) setText('checkInterval', config.check_interval + 's');
+        if (config.check_interval_seconds || config.check_interval) {
+          setCheckIntervalInput(config.check_interval_seconds || config.check_interval);
+        }
       }
     }
   } catch (e) {
@@ -491,9 +459,6 @@ async function loadAppInfo() {
       statusEl.className = 'status-indicator disconnected';
       statusEl.textContent = 'Disconnected';
     }
-    setText('settingsApiPill', 'Disconnected');
-    var apiDot = document.getElementById('settingsApiDot');
-    if (apiDot) apiDot.classList.add('disconnected');
   }
 }
 
@@ -512,6 +477,17 @@ function normalizeSegmentSizeMb(value) {
   return Math.max(0, parsed);
 }
 
+function normalizeCheckIntervalSeconds(value) {
+  var parsed = parseInt(value, 10);
+  if (isNaN(parsed)) parsed = 120;
+  return Math.max(30, Math.min(3600, parsed));
+}
+
+function setCheckIntervalInput(value) {
+  var input = document.getElementById('checkIntervalInput');
+  if (input) input.value = normalizeCheckIntervalSeconds(value);
+}
+
 async function loadRecordingSettings() {
   try {
     var res = await fetch('/api/settings/recording');
@@ -528,6 +504,7 @@ async function loadRecordingSettings() {
       var segmentDurationSelect = document.getElementById('segmentDurationSelect');
       var segmentSizeInput = document.getElementById('segmentSizeInput');
       var filenameFormatSelect = document.getElementById('filenameFormatSelect');
+      var checkIntervalInput = document.getElementById('checkIntervalInput');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
       if (keepTsToggle) keepTsToggle.checked = !!data.keep_ts;
@@ -561,6 +538,9 @@ async function loadRecordingSettings() {
       if (filenameFormatSelect) {
         filenameFormatSelect.value = data.filename_format || 'timestamp';
       }
+      if (checkIntervalInput) {
+        setCheckIntervalInput(data.check_interval_seconds || data.check_interval);
+      }
     }
   } catch (e) {
     console.error('Error loading recording settings:', e);
@@ -576,6 +556,7 @@ async function updateRecordingSetting(key, value) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
+    var data = await res.json().catch(function() { return {}; });
     if (res.ok) {
       showNotification('Setting updated', 'success');
       if (key === 'default_retention_days') {
@@ -586,13 +567,16 @@ async function updateRecordingSetting(key, value) {
         var segmentSizeInput = document.getElementById('segmentSizeInput');
         if (segmentSizeInput) segmentSizeInput.value = normalizeSegmentSizeMb(value);
       }
+      if (key === 'check_interval_seconds') {
+        setCheckIntervalInput(data.check_interval_seconds || data.check_interval || value);
+      }
       // Toggle threshold row visibility when auto_delete_watched changes
       if (key === 'auto_delete_watched') {
         var thresholdRow = document.getElementById('autoDeleteThresholdRow');
         if (thresholdRow) thresholdRow.style.display = value ? 'flex' : 'none';
       }
     } else {
-      showNotification('Failed to update setting', 'error');
+      showNotification(data.detail || 'Failed to update setting', 'error');
       loadRecordingSettings();
     }
   } catch (e) {
@@ -995,15 +979,53 @@ function renderStats(data) {
 
 var testStates = {};
 
-function fetchJsonNoCache(url) {
-  return fetch(url, { cache: 'no-store' }).then(function(res) {
-    return res.json().catch(function() { return {}; }).then(function(data) {
-      if (!res.ok) {
-        throw new Error('HTTP ' + res.status);
-      }
-      return data;
-    });
+async function fetchJsonNoCache(url) {
+  var res = await fetch(url, {
+    cache: 'no-store',
+    headers: { 'Accept': 'application/json' }
   });
+  var text = await res.text();
+  var data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      if (res.ok) throw new Error('Invalid JSON from ' + url);
+    }
+  }
+  if (!res.ok) {
+    var detail = data && (data.detail || data.error || data.message);
+    throw new Error('HTTP ' + res.status + ' on ' + url + (detail ? ': ' + detail : ''));
+  }
+  return data;
+}
+
+async function fetchStatusNoCache(url) {
+  var res = await fetch(url, { cache: 'no-store' });
+  return { ok: res.ok, status: res.status, url: url };
+}
+
+function assertTest(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function testArray(value, label) {
+  assertTest(Array.isArray(value), label + ' must be an array');
+  return value;
+}
+
+function formatTestDuration(ms) {
+  if (!Number.isFinite(ms)) return '';
+  if (ms < 1000) return Math.round(ms) + 'ms';
+  return (ms / 1000).toFixed(1) + 's';
+}
+
+function withTestDuration(detail, startedAt) {
+  var elapsed = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() - startedAt
+    : NaN;
+  var duration = formatTestDuration(elapsed);
+  return duration ? (detail || '-') + ' - ' + duration : (detail || '-');
 }
 
 function testResult(state, detail) {
@@ -1016,7 +1038,58 @@ var testDefinitions = [
     name: 'API',
     run: async function() {
       var data = await fetchJsonNoCache('/api/version');
+      assertTest(data.version, 'Version is missing');
       return testResult('pass', 'v' + (data.version || 'unknown') + ' - ' + (data.output_dir || 'output dir unknown'));
+    }
+  },
+  {
+    id: 'routes',
+    name: 'App routes',
+    run: async function() {
+      var root = await fetchStatusNoCache('/');
+      var discover = await fetchStatusNoCache('/discover');
+      var settings = await fetchStatusNoCache('/settings');
+      var dashboard = await fetchStatusNoCache('/dashboard');
+      assertTest(root.status === 200, 'Root returned HTTP ' + root.status);
+      assertTest(discover.status === 200, 'Discover returned HTTP ' + discover.status);
+      assertTest(settings.status === 200, 'Settings returned HTTP ' + settings.status);
+      assertTest(dashboard.status === 404, 'Legacy dashboard route still exists');
+      return testResult('pass', 'Root, Discover and Settings OK - legacy dashboard removed');
+    }
+  },
+  {
+    id: 'providers',
+    name: 'Providers status',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/providers');
+      var providers = testArray(data.providers, 'providers');
+      var sourceTypes = providers.map(function(provider) { return provider.sourceType; });
+      var required = ['chaturbate', 'cam4', 'stripchat', 'bongacams', 'myfreecams', 'livejasmin', 'camsoda', 'cams', 'xcams'];
+      var removed = ['streamate', 'flirt4free'];
+      required.forEach(function(source) {
+        assertTest(sourceTypes.indexOf(source) !== -1, 'Missing provider ' + source);
+      });
+      removed.forEach(function(source) {
+        assertTest(sourceTypes.indexOf(source) === -1, 'Removed provider still registered: ' + source);
+      });
+      providers.forEach(function(provider) {
+        assertTest(provider.status && typeof provider.status === 'object', 'Missing status for ' + provider.sourceType);
+      });
+      var discoverable = providers.filter(function(provider) {
+        return provider.capabilities && provider.capabilities.can_discover;
+      }).length;
+      var localFollow = providers.filter(function(provider) {
+        return provider.capabilities && provider.capabilities.can_follow;
+      }).length;
+      var accountLogin = providers.filter(function(provider) {
+        return provider.capabilities && provider.capabilities.can_login;
+      }).length;
+      var remoteSync = providers.filter(function(provider) {
+        return provider.capabilities && provider.capabilities.can_sync_following;
+      }).length;
+      assertTest(accountLogin === 2, 'Chaturbate and CAM4 should expose account login');
+      assertTest(remoteSync === 2, 'Chaturbate and CAM4 should expose remote sync');
+      return testResult('pass', providers.length + ' providers - ' + discoverable + ' discoverable - ' + localFollow + ' follow - ' + remoteSync + ' sync');
     }
   },
   {
@@ -1026,6 +1099,8 @@ var testDefinitions = [
       var data = await fetchJsonNoCache('/api/system/stats');
       var disk = data.disk || {};
       var cpu = data.cpu || {};
+      assertTest(data.disk && typeof disk === 'object', 'Disk stats missing');
+      assertTest(data.cpu && typeof cpu === 'object', 'CPU stats missing');
       return testResult('pass', 'Disk ' + (disk.percent != null ? disk.percent + '%' : '-') + ' - CPU ' + (cpu.usage_percent != null ? cpu.usage_percent + '%' : '-'));
     }
   },
@@ -1034,11 +1109,28 @@ var testDefinitions = [
     name: 'Recording settings',
     run: async function() {
       var data = await fetchJsonNoCache('/api/settings/recording');
+      assertTest(typeof data.auto_convert === 'boolean', 'auto_convert setting missing');
+      assertTest(typeof data.keep_ts === 'boolean', 'keep_ts setting missing');
+      assertTest(typeof data.check_interval_seconds === 'number', 'check_interval_seconds setting missing');
       var maxRes = data.max_resolution ? data.max_resolution + 'p max' : 'best max';
       var defaultRes = data.default_resolution ? data.default_resolution + 'p default' : 'best default';
+      var interval = data.check_interval_seconds + 's checks';
       var duration = data.segment_duration_minutes ? data.segment_duration_minutes + 'm parts' : 'duration off';
       var size = data.segment_size_mb ? data.segment_size_mb + 'MB parts' : 'size off';
-      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + defaultRes + ' - ' + maxRes + ' - ' + duration + ' - ' + size);
+      return testResult('pass', 'Auto convert ' + (data.auto_convert ? 'on' : 'off') + ' - ' + interval + ' - ' + defaultRes + ' - ' + maxRes + ' - ' + duration + ' - ' + size);
+    }
+  },
+  {
+    id: 'following',
+    name: 'Following cache',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/following');
+      var models = testArray(data.models, 'models');
+      var onlineCount = Number(data.onlineCount || 0);
+      var offlineCount = Number(data.offlineCount || 0);
+      assertTest(onlineCount + offlineCount === models.length, 'Online/offline counts do not match model count');
+      assertTest(data.perSource && typeof data.perSource === 'object', 'Provider login map missing');
+      return testResult('pass', models.length + ' follows - ' + onlineCount + ' online - ' + Object.keys(data.perSource).length + ' provider sessions');
     }
   },
   {
@@ -1047,29 +1139,9 @@ var testDefinitions = [
     run: async function() {
       var data = await fetchJsonNoCache('/api/processes');
       var totals = data.totals || {};
+      assertTest(Array.isArray(data.processes), 'Process list missing');
+      assertTest(Number.isFinite(Number(totals.total || 0)), 'Process totals missing');
       return testResult('pass', (totals.active || 0) + ' active / ' + (totals.total || 0) + ' total');
-    }
-  },
-  {
-    id: 'chaturbate',
-    name: 'Chaturbate account',
-    run: async function() {
-      var data = await fetchJsonNoCache('/api/chaturbate/status');
-      if (data.isLoggedIn) {
-        return testResult('pass', 'Connected as ' + (data.username || 'saved session'));
-      }
-      return testResult('warn', 'Not connected');
-    }
-  },
-  {
-    id: 'cam4',
-    name: 'CAM4 account',
-    run: async function() {
-      var data = await fetchJsonNoCache('/api/cam4/status');
-      if (data.isLoggedIn) {
-        return testResult('pass', 'Connected as ' + (data.username || 'saved session'));
-      }
-      return testResult('warn', data.lastError || 'Not connected');
     }
   },
   {
@@ -1088,7 +1160,27 @@ var testDefinitions = [
     name: 'Recordings index',
     run: async function() {
       var data = await fetchJsonNoCache('/api/all-recordings?limit=1');
+      assertTest(Array.isArray(data.recordings), 'Recordings list missing');
       return testResult('pass', (data.total || 0) + ' recordings - ' + (data.totalSizeFormatted || '0 B'));
+    }
+  },
+  {
+    id: 'media-imports',
+    name: 'Media imports',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/media-imports/status');
+      assertTest(typeof data.enabled === 'boolean', 'Media import enabled flag missing');
+      assertTest(typeof data.running === 'boolean', 'Media import running flag missing');
+      return testResult('pass', data.enabled ? (data.running ? 'Enabled - scanning' : 'Enabled - idle') : 'Disabled');
+    }
+  },
+  {
+    id: 'blacklist',
+    name: 'Blacklist settings',
+    run: async function() {
+      var data = await fetchJsonNoCache('/api/settings/blacklisted-tags');
+      var tags = testArray(data.tags, 'tags');
+      return testResult('pass', tags.length + ' blocked tags');
     }
   }
 ];
@@ -1119,6 +1211,7 @@ function renderTestsList() {
         '<div class="test-detail" id="test-detail-' + test.id + '">' + escapeHtml(state.detail) + '</div>' +
       '</div>' +
       '<span class="status-indicator ' + testStatusClass(state.state) + '" id="test-status-' + test.id + '">' + testStatusText(state.state) + '</span>' +
+      '<button class="btn-secondary test-run-btn" id="test-run-' + test.id + '" onclick="runSingleTestById(\'' + test.id + '\')">Run</button>' +
     '</div>';
   }).join('');
 }
@@ -1128,12 +1221,17 @@ function setTestState(id, state, detail) {
 
   var statusEl = document.getElementById('test-status-' + id);
   var detailEl = document.getElementById('test-detail-' + id);
+  var runBtn = document.getElementById('test-run-' + id);
   if (statusEl) {
     statusEl.className = 'status-indicator ' + testStatusClass(state);
     statusEl.textContent = testStatusText(state);
   }
   if (detailEl) {
     detailEl.textContent = detail || '-';
+  }
+  if (runBtn) {
+    runBtn.disabled = state === 'running';
+    runBtn.textContent = state === 'running' ? 'Running' : 'Run';
   }
 }
 
@@ -1166,13 +1264,20 @@ function updateTestsSummary() {
 async function runSingleTest(test) {
   setTestState(test.id, 'running', 'Running...');
   updateTestsSummary();
+  var startedAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : NaN;
   try {
     var result = await test.run();
-    setTestState(test.id, result.state || 'pass', result.detail || '-');
+    setTestState(test.id, result.state || 'pass', withTestDuration(result.detail || '-', startedAt));
   } catch (e) {
-    setTestState(test.id, 'fail', e.message || 'Failed');
+    setTestState(test.id, 'fail', withTestDuration(e.message || 'Failed', startedAt));
   }
   updateTestsSummary();
+}
+
+async function runSingleTestById(id) {
+  var test = testDefinitions.find(function(item) { return item.id === id; });
+  if (!test) return;
+  await runSingleTest(test);
 }
 
 async function runAllTests() {
@@ -1188,9 +1293,9 @@ async function runAllTests() {
   });
   updateTestsSummary();
 
-  await Promise.all(testDefinitions.map(function(test) {
-    return runSingleTest(test);
-  }));
+  for (var i = 0; i < testDefinitions.length; i++) {
+    await runSingleTest(testDefinitions[i]);
+  }
 
   if (btn) {
     btn.disabled = false;

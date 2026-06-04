@@ -31,6 +31,7 @@ async def chaturbate_login(req: LoginRequest):
         raise HTTPException(status_code=503, detail="Auth service not initialized")
 
     result = await _auth_service.login(req.username, req.password)
+
     if not result.get("success"):
         raise HTTPException(status_code=401, detail=result.get("error", "Login failed"))
 
@@ -40,9 +41,14 @@ async def chaturbate_login(req: LoginRequest):
 @router.get("/status")
 async def chaturbate_status():
     """Get Chaturbate auth status"""
-    status = {}
     if _auth_service:
         status = _auth_service.get_status()
+    else:
+        status = {
+            "isLoggedIn": False,
+            "username": None,
+            "lastError": "Auth service not initialized",
+        }
 
     # Live check FlareSolverr (no cache) so UI reflects current state + error message
     if _flaresolverr:

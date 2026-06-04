@@ -23,7 +23,6 @@ from .recording_names import (
 _LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
 _TS_PACKET_SIZE = 188
 _CHATURBATE_HLS_HOST_SUFFIXES = ("chaturbate.com", "highwebmedia.com", "mmcdn.com")
-_STREAMATE_HLS_HOST_SUFFIXES = ("naiadsystems.com",)
 _CHATURBATE_HLS_HEADERS = (
     "Referer: https://chaturbate.com/\r\n"
     "Origin: https://chaturbate.com\r\n"
@@ -50,17 +49,6 @@ def _is_chaturbate_hls_url(input_url: str) -> bool:
     return any(
         hostname == suffix or hostname.endswith(f".{suffix}")
         for suffix in _CHATURBATE_HLS_HOST_SUFFIXES
-    )
-
-
-def _is_streamate_hls_url(input_url: str) -> bool:
-    try:
-        hostname = (urlparse(input_url).hostname or "").lower().rstrip(".")
-    except Exception:
-        return False
-    return any(
-        hostname == suffix or hostname.endswith(f".{suffix}")
-        for suffix in _STREAMATE_HLS_HOST_SUFFIXES
     )
 
 
@@ -149,10 +137,10 @@ def _build_ffmpeg_command(
         "-y",
     ]
 
-    if not (_is_streamate_hls_url(input_url) or _is_local_hls_proxy_url(input_url)):
-        # Options de reconnexion pour stabilité. Streamate/NaiadSystems HLS
-        # and the local HLS proxy serve short-lived playlists/segments;
-        # reconnecting at EOF can stall with an empty recording.
+    if not _is_local_hls_proxy_url(input_url):
+        # Options de reconnexion pour stabilité. The local HLS proxy serves
+        # short-lived playlists/segments; reconnecting at EOF can stall with
+        # an empty recording.
         cmd.extend([
             "-reconnect", "1",
             "-reconnect_at_eof", "1",
@@ -184,10 +172,11 @@ def _build_ffmpeg_command(
     stream_identity_url = source_url or input_url
 
     # For Chaturbate LL-HLS master playlists, the master URL contains both
-    # video variants and a separate audio rendition group. Passing only a
-    # video-only chunk URL strips audio.
+    # video variants and a separate audio rendition group. The FFmpeg transport
+    # URL may be the local HLS proxy, so use the original upstream URL for this
+    # detection when available.
     is_chaturbate_llhls = (
-        "llhls.m3u8" in stream_identity_url
+        "llhls.m3u8" in stream_identity_url.lower()
         and _is_chaturbate_hls_url(stream_identity_url)
     )
     if is_chaturbate_llhls:
@@ -706,6 +695,10 @@ class FFmpegManager:
                 raise
 
             return sess
+
+    def get_session(self, session_id: str) -> Optional[FFmpegSession]:
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def _finalize_session_locked(self, sess: FFmpegSession, join_timeout: float = 0.2):
         if sess.process:

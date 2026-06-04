@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 from ..logger import logger
 from ..core.config import AUTO_CONVERT, KEEP_TS, MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
+from .monitor import get_media_created_at, get_video_duration
 
 # Nombre maximal de tentatives de conversion avant skip automatique
 MAX_CONVERSION_ATTEMPTS = 3
@@ -28,8 +29,8 @@ def _video_stream_map_from_probe(probe_data: dict) -> str:
     ranked = sorted(
         enumerate(streams),
         key=lambda item: (
-            numeric(item[1].get("height")),
-            numeric(item[1].get("width")),
+            numeric(item[1].get("height") or item[1].get("coded_height")),
+            numeric(item[1].get("width") or item[1].get("coded_width")),
             numeric(item[1].get("bit_rate")),
         ),
         reverse=True,
@@ -37,35 +38,57 @@ def _video_stream_map_from_probe(probe_data: dict) -> str:
     return f"0:v:{ranked[0][0]}"
 
 
-async def _best_video_stream_map(ts_path: Path, ffmpeg_path: str) -> str:
+def _select_best_video_stream_map(probe_data: dict) -> str:
+    """Return an FFmpeg -map value for the highest-quality video stream."""
+    candidates = []
+    for stream in probe_data.get("streams") or []:
+        try:
+            index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            height = int(stream.get("height") or stream.get("coded_height") or 0)
+        except (TypeError, ValueError):
+            height = 0
+        try:
+            width = int(stream.get("width") or stream.get("coded_width") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        try:
+            bitrate = int(stream.get("bit_rate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        candidates.append((height, width, bitrate, -index, index))
+
+    if not candidates:
+        return "0:v:0"
+    return f"0:{sorted(candidates, reverse=True)[0][-1]}"
+
+
+async def _best_video_stream_map(ts_path: Path, ffmpeg_path: str = "ffmpeg") -> str:
     ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    cmd = [
+        ffprobe_path,
+        "-v", "error",
+        "-select_streams", "v",
+        "-show_entries", "stream=index,width,height,coded_width,coded_height,bit_rate",
+        "-of", "json",
+        str(ts_path),
+    ]
     try:
         process = await asyncio.create_subprocess_exec(
-            ffprobe_path,
-            "-v",
-            "error",
-            "-select_streams",
-            "v",
-            "-show_entries",
-            "stream=width,height,bit_rate",
-            "-of",
-            "json",
-            str(ts_path),
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
-        if process.returncode != 0:
-            logger.debug(
-                "ffprobe video stream selection failed",
-                ts_file=ts_path.name,
-                error=(stderr or b"").decode("utf-8", "replace")[:300],
-            )
-            return "0:v:0"
-        return _video_stream_map_from_probe(json.loads(stdout.decode("utf-8") or "{}"))
-    except Exception as exc:
-        logger.debug("ffprobe video stream selection unavailable", ts_file=ts_path.name, error=str(exc))
-        return "0:v:0"
+        if process.returncode == 0 and stdout:
+            return _select_best_video_stream_map(json.loads(stdout.decode("utf-8")))
+        error_msg = stderr.decode("utf-8", errors="replace") if stderr else ""
+        logger.debug("ffprobe video stream selection failed", ts_file=str(ts_path), error=error_msg[:300])
+    except Exception as e:
+        logger.debug("ffprobe video stream selection unavailable", ts_file=str(ts_path), error=str(e))
+    return "0:v:0"
 
 
 async def convert_ts_to_mp4(
@@ -202,7 +225,12 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                                 file_size=ts_file.stat().st_size,
                                 recording_id=recording_id,
                                 duration_seconds=0,
-                                is_converted=False
+                                is_converted=False,
+                                created_at=await get_media_created_at(
+                                    ts_file,
+                                    ffmpeg_path,
+                                    fallback_timestamp=int(ts_file.stat().st_mtime),
+                                ),
                             )
         logger.success("Scan initial terminé", task="auto-convert")
     except Exception as e:
@@ -266,6 +294,11 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
 
                         if existing and not existing.get('is_converted'):
                             # Mettre à jour la DB
+                            created_at = await get_media_created_at(
+                                ts_path,
+                                ffmpeg_path,
+                                fallback_timestamp=int(ts_path.stat().st_mtime),
+                            )
                             await db.add_or_update_recording(
                                 username=username,
                                 filename=ts_file.name,
@@ -276,7 +309,8 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                                 thumbnail_path=existing.get('thumbnail_path'),
                                 mp4_path=str(mp4_path),
                                 mp4_size=mp4_path.stat().st_size,
-                                is_converted=True
+                                is_converted=True,
+                                created_at=created_at,
                             )
                             logger.info("DB mise à jour pour MP4 existant",
                                       username=username,
@@ -309,7 +343,6 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                     ts_size = ts_path.stat().st_size
                     candidate_duration = int((existing or {}).get('duration_seconds') or 0)
                     if ts_size <= SHORT_RECORDING_PROBE_BYTES and candidate_duration == 0 and ts_size > 0:
-                        from .monitor import get_video_duration
                         candidate_duration = await get_video_duration(ts_path, ffmpeg_path)
 
                     is_short_fragment = (
@@ -347,8 +380,12 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                             # Calculate duration from TS file
                             duration = candidate_duration
                             if duration == 0:
-                                from .monitor import get_video_duration
                                 duration = await get_video_duration(ts_path, ffmpeg_path)
+                            created_at = await get_media_created_at(
+                                ts_path,
+                                ffmpeg_path,
+                                fallback_timestamp=int(ts_path.stat().st_mtime),
+                            )
                             await db.add_or_update_recording(
                                 username=username,
                                 filename=ts_file.name,
@@ -356,7 +393,8 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                                 file_size=ts_path.stat().st_size,
                                 recording_id=recording_id,
                                 duration_seconds=duration if duration > 0 else 0,
-                                is_converted=False
+                                is_converted=False,
+                                created_at=created_at,
                             )
                             logger.info("TS indexé (auto-convert désactivé)",
                                       username=username,
@@ -395,7 +433,6 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                             await db.reset_conversion_failure(recording_id)
 
                         # Recalculer la durée sur le fichier MP4 maintenant qu'il est stable
-                        from .monitor import get_video_duration
                         final_duration = await get_video_duration(mp4_path_result, ffmpeg_path)
 
                         # Utiliser la durée recalculée ou celle existante si le calcul échoue
@@ -408,6 +445,11 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                         else:
                             duration_to_use = existing.get('duration_seconds', 0) if existing else 0
 
+                        created_at = await get_media_created_at(
+                            ts_path,
+                            ffmpeg_path,
+                            fallback_timestamp=int(ts_path.stat().st_mtime) if ts_path.exists() else existing.get('created_at') if existing else None,
+                        )
                         await db.add_or_update_recording(
                             username=username,
                             filename=ts_file.name,
@@ -418,7 +460,8 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                             thumbnail_path=existing.get('thumbnail_path') if existing else None,
                             mp4_path=str(mp4_path_result),
                             mp4_size=mp4_size,
-                            is_converted=True
+                            is_converted=True,
+                            created_at=created_at,
                         )
 
                         # Only delete TS if keep_ts is disabled
@@ -447,9 +490,13 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                         # Tracker l'échec en DB pour éviter les retries infinis et informer l'UI
                         # S'assurer que l'enregistrement existe d'abord
                         if not existing:
-                            from .monitor import get_video_duration
                             duration = await get_video_duration(ts_path, ffmpeg_path)
                             recording_id = f"{username}_{ts_file.stem}"
+                            created_at = await get_media_created_at(
+                                ts_path,
+                                ffmpeg_path,
+                                fallback_timestamp=int(ts_path.stat().st_mtime),
+                            )
                             await db.add_or_update_recording(
                                 username=username,
                                 filename=ts_file.name,
@@ -457,7 +504,8 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                                 file_size=ts_path.stat().st_size,
                                 recording_id=recording_id,
                                 duration_seconds=duration if duration > 0 else 0,
-                                is_converted=False
+                                is_converted=False,
+                                created_at=created_at,
                             )
                         error_msg = f"FFmpeg conversion failed (attempt {attempts + 1}/{MAX_CONVERSION_ATTEMPTS})"
                         await db.mark_conversion_failed(username, ts_file.name, error_msg)

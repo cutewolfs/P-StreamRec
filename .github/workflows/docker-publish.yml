@@ -1,14 +1,42 @@
-name: Build, Push & Release
+name: Fast checks / beta publish
 
 on:
   push:
     branches:
       - main
       - beta
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: Docker platforms to publish
+        required: true
+        default: linux/amd64,linux/arm64
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-push:
+  quick-checks:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fast syntax checks
+        run: |
+          python3 -m compileall -q app tests
+          sh -n docker/entrypoint.sh
+
+  build-and-push:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'beta'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
       packages: write
@@ -17,7 +45,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Compute version (YEAR.WEEK.N)
         id: version
@@ -72,7 +100,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ github.event_name == 'workflow_dispatch' && inputs.platforms || 'linux/amd64,linux/arm64' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |

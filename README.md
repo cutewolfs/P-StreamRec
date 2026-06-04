@@ -33,8 +33,6 @@
 | MyFreeCams | ✅ | ✅ | ✅ | Local |
 | LiveJasmin | ✅ | ✅ | ✅ | Local |
 | CamSoda | ✅ | ✅ | ✅ | Local |
-| Streamate | ✅ | ✅ | ✅ | Local |
-| Flirt4Free | ✅ | ✅ | ✅ | Local |
 | Cams.com | ✅ | ✅ | ✅ | Local |
 | Xcams | ✅ | ✅ | ✅ | Local |
 
@@ -72,7 +70,7 @@ services:
     restart: unless-stopped
 
   p-streamrec:
-    image: ghcr.io/raccommode/p-streamrec:latest
+    image: ${PSTREAMREC_IMAGE:-ghcr.io/raccommode/p-streamrec:latest}
     depends_on:
       - flaresolverr
     environment:
@@ -96,12 +94,21 @@ docker run -d --name p-streamrec \
 
 **Access:** `http://localhost:8080`
 
+For local image testing without changing the default image:
+
+```bash
+docker build -t p-streamrec:local .
+PSTREAMREC_IMAGE=p-streamrec:local HOST_PORT=2727 docker compose up -d --force-recreate
+```
+
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OUTPUT_DIR` | `/data` | Recordings folder |
 | `PORT` | `8080` | Web interface port |
+| `HOST_PORT` | `8080` | Host port used by Docker Compose |
+| `PSTREAMREC_IMAGE` | `ghcr.io/raccommode/p-streamrec:latest` | Docker Compose image override for local builds |
 | `FFMPEG_PATH` | `ffmpeg` | Path to FFmpeg |
 | `RECORDING_RANGE_CHUNK_SIZE` | `8388608` | Max bytes returned for open-ended replay Range requests |
 | `CB_RESOLVER_ENABLED` | `true` | Enable Chaturbate support |
@@ -112,6 +119,7 @@ docker run -d --name p-streamrec \
 | `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
 | `PASSWORD` | — | Password to protect the interface (optional) |
 | `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
+| `AUTO_RECORD_INTERVAL` | `120` | Default seconds between background live-status checks; can be overridden in Settings |
 | `RECORD_SEGMENT_DURATION_MINUTES` | `0` | Optional recording split interval: `0`, `30`, `60`, or `90` minutes |
 | `RECORD_SEGMENT_SIZE_MB` | `0` | Optional maximum TS segment size in MB; `0` disables size-based splitting |
 | `CHATURBATE_USERNAME` | — | Chaturbate login (optional, enables Following + better quality) |

@@ -60,6 +60,8 @@ def create_provider_registry(
         domains,
         login_templates=None,
         discover_templates=None,
+        can_login=False,
+        can_remote_follow=None,
         can_stream=True,
         can_record=True,
     ):
@@ -72,6 +74,8 @@ def create_provider_registry(
             browser_root=browser_root,
             login_templates=login_templates,
             discover_templates=discover_templates,
+            can_login=can_login,
+            can_remote_follow=can_remote_follow,
             can_stream=can_stream,
             can_record=can_record,
         )
@@ -83,6 +87,8 @@ def create_provider_registry(
         ("stripchat.com",),
         ("https://stripchat.com/login", "https://stripchat.com/{username}"),
         ("https://stripchat.com/", "https://stripchat.com/girls", "https://stripchat.com/search/{query}"),
+        can_login=False,
+        can_remote_follow=True,
     )
     registry.register(
         YtDlpProvider(
@@ -146,28 +152,8 @@ def create_provider_registry(
         "LiveJasmin",
         ("https://www.livejasmin.com/en/girls/{username}", "https://www.livejasmin.com/en/chat/{username}"),
         ("livejasmin.com",),
-        ("https://www.livejasmin.com/en/login", "https://www.livejasmin.com/en/girls/{username}"),
+        ("https://www.livejasmin.com/en/auth/login", "https://www.livejasmin.com/en/girls/{username}"),
         ("https://www.livejasmin.com/en/girls", "https://www.livejasmin.com/en/search?query={query}"),
-    ))
-    registry.register(browser(
-        "streamate",
-        "Streamate",
-        ("https://streamate.com/cam/{username}",),
-        ("streamate.com",),
-        ("https://streamate.com/member/login", "https://streamate.com/cam/{username}"),
-        ("https://streamate.com/cam", "https://streamate.com/search?query={query}"),
-    ))
-    registry.register(browser(
-        "flirt4free",
-        "Flirt4Free",
-        (
-            "https://www.flirt4free.com/search?q={username}",
-            "https://www.flirt4free.com/models/{username}.html",
-            "https://www.flirt4free.com/{username}",
-        ),
-        ("flirt4free.com",),
-        ("https://www.flirt4free.com/login", "https://www.flirt4free.com/search?q={username}"),
-        ("https://www.flirt4free.com/live/girls/", "https://www.flirt4free.com/search?q={query}"),
     ))
     registry.register(browser(
         "cams",

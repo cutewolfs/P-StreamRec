@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.browser_recorder import (
+    BrowserCaptureManager,
     BrowserCaptureSession,
     BrowserWebSocketMP4CaptureSession,
     _decode_base64_payload,
@@ -131,6 +132,27 @@ class BrowserCaptureSessionTests(unittest.TestCase):
                 )
 
         self.assertEqual("model_20260527-123456_abc123.webm", session.record_filename)
+
+    def test_manager_uses_provider_profile_and_session_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = object()
+            manager = BrowserCaptureManager(str(root), session_store=store)
+
+            original_start = BrowserCaptureSession.start
+            try:
+                BrowserCaptureSession.start = lambda self: None
+                session = manager.start_session(
+                    source_type="xcams",
+                    page_url="https://www.xcams.com/chat/model",
+                    person="model",
+                    record=False,
+                )
+            finally:
+                BrowserCaptureSession.start = original_start
+
+            self.assertEqual(root / "provider-browser", session.browser_root)
+            self.assertIs(store, session.session_store)
 
 
 if __name__ == "__main__":

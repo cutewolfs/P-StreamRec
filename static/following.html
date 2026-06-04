@@ -9,58 +9,18 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/following.js?v=4"></script>
+  <script defer src="/static/following.js?v=10"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
 
   <div class="container">
-    <!-- Login banner (shown when no provider account is connected) -->
-    <div class="login-banner" id="loginBanner" style="display: none;">
-      <h2>Connect a Provider Account</h2>
-      <p>Log in to a supported provider account to sync your followed models and manage them from P-StreamRec.</p>
-      <a href="/settings" class="btn-primary">Go to Settings</a>
-    </div>
-
-    <!-- Sync controls -->
-    <div id="syncControls" style="display: none;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
-        <div>
-          <h1 style="font-size: 1.75rem; font-weight: 700; color: var(--text-primary); margin-bottom: 0.25rem;">Following</h1>
-          <p class="last-synced" id="lastSynced">Not synced yet</p>
-        </div>
-        <button class="sync-btn" id="syncBtn" onclick="syncFollowing()">
-          <span id="syncIcon">&#8635;</span> Sync Now
-        </button>
-      </div>
-    </div>
-
-    <!-- Online section -->
-    <div id="onlineSection" style="display: none;">
-      <div class="section-header">
-        <h2 class="section-title">
-          <span style="color: var(--success);">&#9679;</span> Online Now
-          <span class="count" id="onlineCount">0</span>
-        </h2>
-      </div>
-      <div class="following-grid" id="onlineGrid"></div>
-    </div>
-
-    <!-- Offline section -->
-    <div id="offlineSection" style="display: none; margin-top: 2.5rem;">
-      <div class="section-header">
-        <h2 class="section-title">
-          <span style="color: var(--text-muted);">&#9679;</span> Offline
-          <span class="count" id="offlineCount">0</span>
-        </h2>
-      </div>
-      <div class="following-grid" id="offlineGrid"></div>
-    </div>
+    <div id="providerSections" class="following-provider-list" style="display: none;"></div>
 
     <!-- Empty state -->
     <div class="empty-message" id="emptyFollowing" style="display: none;">
       <div class="icon">&#128100;</div>
-      <p>No followed models found. Try syncing your account.</p>
+      <p>No follows saved yet. Connect Chaturbate or CAM4 to sync, or use local follows on other providers.</p>
     </div>
 
     <!-- Loading state -->

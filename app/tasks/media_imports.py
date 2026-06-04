@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..logger import logger
-from .monitor import get_video_duration
+from .monitor import get_media_created_at, get_video_duration
 
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi"}
@@ -54,6 +54,19 @@ def _path_key(path_value: Optional[str]) -> Optional[str]:
         return str(Path(path_value).resolve())
     except Exception:
         return str(path_value)
+
+
+def _file_exists(path_value: Optional[str]) -> bool:
+    if not path_value:
+        return False
+    try:
+        return Path(path_value).exists()
+    except Exception:
+        return False
+
+
+def _import_metadata_ready(rec: dict) -> bool:
+    return int(rec.get("duration_seconds") or 0) > 0 and _file_exists(rec.get("thumbnail_path"))
 
 
 async def _run_ffmpeg(cmd: list[str], timeout: int = 3600) -> tuple[bool, str]:
@@ -329,11 +342,28 @@ async def scan_media_imports(
             source_mtime = int(stat.st_mtime)
             existing_source_mtime = int((existing or {}).get("source_mtime") or 0)
             existing_size = int((existing or {}).get("file_size") or 0)
+            existing_created_at = int((existing or {}).get("created_at") or 0)
+            should_probe_created_at = (
+                not is_existing_import
+                or existing_source_mtime != source_mtime
+                or existing_size != stat.st_size
+                or existing_created_at in {0, source_mtime}
+                or not _import_metadata_ready(existing or {})
+            )
+            created_at = existing_created_at or source_mtime
+            if should_probe_created_at:
+                created_at = await get_media_created_at(
+                    source_path,
+                    ffmpeg_path,
+                    fallback_timestamp=source_mtime,
+                )
             if (
                 is_existing_import
                 and existing_source_mtime == source_mtime
                 and existing_size == stat.st_size
+                and existing_created_at == created_at
                 and (existing.get("playable_path") or existing.get("import_status") == "failed")
+                and _import_metadata_ready(existing)
             ):
                 result["skipped"] += 1
                 continue
@@ -401,7 +431,7 @@ async def scan_media_imports(
                 playable_path=str(playable_path) if playable_path else None,
                 playable_size=playable_size,
                 protected_from_retention=True,
-                created_at=source_mtime,
+                created_at=created_at,
             )
 
             if is_existing_import:

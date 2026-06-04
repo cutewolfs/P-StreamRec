@@ -39,9 +39,9 @@ class ChaturbateAuthService:
     async def initialize(self):
         """Load saved auth state from DB"""
         auth_state = await self.db.get_auth_state()
-        if auth_state and auth_state.get("is_logged_in"):
-            self._is_logged_in = True
+        if auth_state:
             self._username = auth_state.get("username")
+            self._last_error = auth_state.get("last_error")
             if auth_state.get("session_cookies"):
                 try:
                     self._cookies = json.loads(auth_state["session_cookies"])
@@ -57,8 +57,24 @@ class ChaturbateAuthService:
                     pass
 
             if self._cookies:
-                logger.info("Restored Chaturbate session from DB",
-                           username=self._username)
+                self._is_logged_in = False
+                if bool(auth_state.get("is_logged_in")):
+                    self._is_logged_in = await self._validate_session()
+                if self._is_logged_in:
+                    logger.info("Restored verified Chaturbate session from DB",
+                               username=self._username)
+                elif auth_state.get("is_logged_in"):
+                    self._last_error = "Session expired, please re-login"
+                    await self.db.save_auth_state(
+                        username=self._username or "",
+                        password_hash=auth_state.get("password_hash") or "",
+                        is_logged_in=False,
+                        session_cookies=json.dumps(self._cookies),
+                        cf_clearance=self._cookies.get("cf_clearance"),
+                        csrf_token=self._cookies.get("csrftoken"),
+                        last_login_at=auth_state.get("last_login_at"),
+                        last_error=self._last_error,
+                    )
 
         # Apply legacy cookie env vars as fallback
         if not self._cookies:
@@ -68,6 +84,9 @@ class ChaturbateAuthService:
                 self._cookies["sessionid"] = CHATURBATE_SESSIONID
             if self._cookies:
                 logger.info("Using legacy cookie env vars as fallback")
+                self._is_logged_in = await self._validate_session()
+                if not self._is_logged_in:
+                    self._last_error = "Legacy Chaturbate cookies are not verified"
 
     async def login(self, username: str, password: str) -> Dict[str, Any]:
         """
@@ -317,16 +336,27 @@ class ChaturbateAuthService:
         return None
 
     async def _validate_session(self) -> bool:
-        """Test if session is still valid by checking /followed-cams/"""
+        """Test if session is still valid with Chaturbate's authenticated APIs."""
         if not self._cookies.get("sessionid"):
             return False
 
         try:
             headers = {
                 "User-Agent": self._user_agent,
+                "Accept": "application/json, text/html",
                 "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
             }
             async with aiohttp_client_session() as session:
+                async with session.get(
+                    "https://chaturbate.com/api/ts/chatmessages/pm_users/?offset=0",
+                    headers=headers,
+                    allow_redirects=False,
+                    ssl=False,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                    **aiohttp_request_kwargs(),
+                ) as resp:
+                    if resp.status == 200:
+                        return True
                 async with session.get(
                     "https://chaturbate.com/followed-cams/",
                     headers=headers,
@@ -335,7 +365,6 @@ class ChaturbateAuthService:
                     timeout=aiohttp.ClientTimeout(total=10),
                     **aiohttp_request_kwargs(),
                 ) as resp:
-                    # 200 = valid session, 302 to login = expired
                     return resp.status == 200
         except Exception as e:
             logger.debug("Session validation error", error=str(e))

@@ -1,12 +1,14 @@
 import re
+import mimetypes
 from pathlib import Path
-from typing import Optional, Tuple
-from urllib.parse import quote, urljoin, urlparse
+from typing import Any, Optional, Tuple
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 import os
 import asyncio
 import aiohttp
 import json
 import queue
+import shutil
 import subprocess
 import sys
 import time
@@ -28,13 +30,25 @@ from .logger import logger
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
-from .tasks.monitor import monitor_models_task
+from .tasks.monitor import (
+    CHECK_INTERVAL_SETTING_KEY,
+    get_check_interval_seconds,
+    get_media_created_at,
+    get_video_duration,
+    monitor_models_task,
+    normalize_check_interval_seconds,
+)
 from .tasks.convert import auto_convert_recordings_task
 from .tasks.media_imports import (
+    DEFAULT_MIN_AGE_SECONDS,
+    DIRECT_PLAYABLE_EXTENSIONS,
     MediaImportManager,
+    generate_import_thumbnail,
     media_imports_task,
     remove_import_record,
+    stable_import_recording_id,
     SUPPORTED_VIDEO_EXTENSIONS,
+    title_from_filename,
 )
 from .recording_names import (
     ALLOWED_FILENAME_FORMATS,
@@ -57,6 +71,7 @@ from .providers import (
     ResolvedStream,
     create_provider_registry,
 )
+from .providers.sessions import ProviderSessionStore
 from .api import auth as auth_router
 from .api import cam4 as cam4_router
 from .api import discover as discover_router
@@ -76,6 +91,31 @@ CHATURBATE_PASSWORD = os.getenv("CHATURBATE_PASSWORD", "")
 FLARESOLVERR_URL = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191")
 RECORDING_RANGE_CHUNK_SIZE = int(os.getenv("RECORDING_RANGE_CHUNK_SIZE", str(8 * 1024 * 1024)))
 MEDIA_IMPORTS_ENABLED = os.getenv("PSTREAMREC_MEDIA_IMPORTS", "false").lower() in {"1", "true", "yes"}
+MEDIA_LIBRARY_METADATA_MIN_AGE_SECONDS = DEFAULT_MIN_AGE_SECONDS
+MEDIA_LIBRARY_VIDEO_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | {".ts"}
+MEDIA_LIBRARY_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif"}
+MEDIA_LIBRARY_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".ogg", ".wav", ".flac"}
+MEDIA_LIBRARY_EXTENSIONS = (
+    MEDIA_LIBRARY_VIDEO_EXTENSIONS
+    | MEDIA_LIBRARY_IMAGE_EXTENSIONS
+    | MEDIA_LIBRARY_AUDIO_EXTENSIONS
+)
+MEDIA_LIBRARY_BROWSER_PLAYABLE_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm"}
+MEDIA_LIBRARY_TEMP_SUFFIXES = (
+    ".tmp",
+    ".part",
+    ".partial",
+    ".download",
+    ".crdownload",
+)
+IVS_PLAYER_ASSET_BASE_URL = "https://player.live-video.net/1.4.1"
+IVS_PLAYER_ASSETS = {
+    "amazon-ivs-player.min.js": "application/javascript",
+    "amazon-ivs-worker.min.js": "application/javascript",
+    "amazon-ivs-wasmworker.min.js": "application/javascript",
+    "amazon-ivs-wasmworker.min.wasm": "application/wasm",
+}
+_IVS_PLAYER_ASSET_CACHE: dict[str, dict[str, object]] = {}
 
 # Docker constants
 DOCKER_SOCKET = '/var/run/docker.sock'
@@ -266,7 +306,7 @@ app.include_router(following_router.router)
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
     response = await call_next(request)
-    no_cache_paths = {"/", "/discover", "/following", "/recordings", "/settings", "/wiki"}
+    no_cache_paths = {"/", "/discover", "/following", "/recordings", "/media", "/settings", "/wiki"}
     if request.url.path.startswith("/static/") or request.url.path in no_cache_paths:
         response.headers["Cache-Control"] = "no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
@@ -337,7 +377,7 @@ async def _serve_video_file_with_ranges(request: Request, file_path: Path, filen
 
     if not file_path.exists() or not file_path.is_file():
         logger.error("Fichier vidéo introuvable", path=str(file_path))
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     file_size = file_path.stat().st_size
     logger.file_operation("Lecture", str(file_path), size=file_size)
@@ -394,6 +434,468 @@ async def _serve_video_file_with_ranges(request: Request, file_path: Path, filen
     return FileResponse(str(file_path), media_type=media_type, headers=base_headers)
 
 
+def _media_library_kind(path: Path) -> Optional[str]:
+    ext = path.suffix.lower()
+    if ext in MEDIA_LIBRARY_IMAGE_EXTENSIONS:
+        return "image"
+    if ext in MEDIA_LIBRARY_VIDEO_EXTENSIONS:
+        return "video"
+    if ext in MEDIA_LIBRARY_AUDIO_EXTENSIONS:
+        return "audio"
+    return None
+
+
+def _is_media_library_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    name = path.name
+    if name.startswith(".") or any(name.endswith(suffix) for suffix in MEDIA_LIBRARY_TEMP_SUFFIXES):
+        return False
+    if any(part.startswith(".") for part in path.parts):
+        return False
+    return _media_library_kind(path) is not None
+
+
+def _quote_url_path(path_value: str) -> str:
+    return "/".join(quote(part, safe="") for part in Path(path_value).parts)
+
+
+def _content_disposition(filename: str, disposition: str = "inline") -> str:
+    fallback = re.sub(r'[^A-Za-z0-9._ -]+', "_", filename).strip() or "media"
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename)}'
+
+
+def _resolve_library_media_path(username: str, file_path: str) -> Path:
+    if (
+        not username
+        or ".." in username
+        or "/" in username
+        or "\\" in username
+        or "\x00" in username
+        or "\x00" in file_path
+        or "\\" in file_path
+    ):
+        raise HTTPException(status_code=400, detail="Invalid media path")
+
+    relative = Path(file_path)
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise HTTPException(status_code=400, detail="Invalid media path")
+
+    records_root = (OUTPUT_DIR / "records").resolve()
+    profile_root = (records_root / username).resolve()
+    candidate = (profile_root / relative).resolve()
+
+    if not candidate.is_relative_to(profile_root) or not candidate.is_relative_to(records_root):
+        raise HTTPException(status_code=403, detail="Media path is not allowed")
+    if _media_library_kind(candidate) is None:
+        raise HTTPException(status_code=400, detail="Unsupported media format")
+    return candidate
+
+
+def _validate_media_profile_username(username: str) -> str:
+    username = (username or "").strip()
+    if (
+        not username
+        or username in {".", ".."}
+        or "/" in username
+        or "\\" in username
+        or "\x00" in username
+    ):
+        raise HTTPException(status_code=400, detail="Invalid media profile")
+    return username
+
+
+def _media_profile_dir(username: str) -> Path:
+    username = _validate_media_profile_username(username)
+    records_root = (OUTPUT_DIR / "records").resolve()
+    profile_dir = (records_root / username).resolve()
+    if not profile_dir.is_relative_to(records_root):
+        raise HTTPException(status_code=403, detail="Media profile is not allowed")
+    return profile_dir
+
+
+def _list_media_profile_folders() -> set[str]:
+    records_root = OUTPUT_DIR / "records"
+    if not records_root.exists():
+        return set()
+
+    profiles: set[str] = set()
+    for child in records_root.iterdir():
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        try:
+            _validate_media_profile_username(child.name)
+        except HTTPException:
+            continue
+        profiles.add(child.name)
+    return profiles
+
+
+def _media_library_url(username: str, relative_path: str, download: bool = False) -> str:
+    url = f"/streams/library/{quote(username, safe='')}/{_quote_url_path(relative_path)}"
+    if download:
+        return f"{url}?download=1"
+    return url
+
+
+def _model_for_media_profile(username: str, models: list[dict]) -> Optional[dict]:
+    selected = None
+    for model in models:
+        if model.get("username") != username:
+            continue
+        if selected is None:
+            selected = model
+        if (model.get("source_type") or model.get("sourceType")) == "chaturbate":
+            return model
+    return selected
+
+
+def _media_profile_formatted(profile: Optional[dict]) -> dict:
+    profile = profile or {}
+    return {
+        "displayName": profile.get("display_name") or "",
+        "firstName": profile.get("first_name") or "",
+        "lastName": profile.get("last_name") or "",
+        "age": profile.get("age"),
+        "address": profile.get("address") or "",
+        "city": profile.get("city") or "",
+        "region": profile.get("region") or "",
+        "postalCode": profile.get("postal_code") or "",
+        "country": profile.get("country") or "",
+        "aliases": profile.get("aliases") or "",
+        "tags": profile.get("tags") or "",
+        "notes": profile.get("notes") or "",
+        "socialUrls": profile.get("social_urls") or [],
+        "streamUrls": profile.get("stream_urls") or [],
+        "profileUrls": profile.get("profile_urls") or [],
+    }
+
+
+async def _media_profile_payload(username: str) -> dict:
+    username = _validate_media_profile_username(username)
+    profile_dir = _media_profile_dir(username)
+    profile = await db.get_media_profile(username)
+    model = await db.get_model(username)
+    source_type = await _infer_source_type(username, model) if model else "chaturbate"
+    default_quality = await _get_default_record_quality()
+    default_retention = await _get_default_retention_days()
+
+    return {
+        "username": username,
+        "folderExists": profile_dir.exists() and profile_dir.is_dir(),
+        "deleteUrl": f"/api/media-profiles/{quote(username, safe='')}",
+        **_media_profile_formatted(profile),
+        "sourceType": source_type,
+        "source_type": source_type,
+        "autoRecord": bool(model.get("auto_record", False)) if model else False,
+        "recordQuality": (model or {}).get("record_quality") or default_quality,
+        "retentionDays": (model or {}).get("retention_days", default_retention),
+    }
+
+
+def _media_library_placeholder_title(filename: str) -> str:
+    title = Path(filename).stem.replace("_", " ").replace("-", " ").strip()
+    return re.sub(r"\s+", " ", title) or filename
+
+
+def _recording_thumb_url(username: str, rec: Optional[dict], path: Path) -> Optional[str]:
+    thumb_value = (rec or {}).get("thumbnail_path")
+    if thumb_value:
+        thumb_path = Path(thumb_value)
+        if thumb_path.exists():
+            return f"/api/recording-thumbnail/{quote(username, safe='')}/{quote(thumb_path.name, safe='')}"
+
+    generated = OUTPUT_DIR / "thumbnails" / username / f"{path.stem}.jpg"
+    if generated.exists():
+        return f"/api/recording-thumbnail/{quote(username, safe='')}/{quote(generated.name, safe='')}"
+    return None
+
+
+async def _ensure_media_library_video_metadata(
+    username: str,
+    relative_path: str,
+    media_path: Path,
+    rec: Optional[dict],
+    stat: os.stat_result,
+) -> Optional[dict]:
+    if _media_library_kind(media_path) != "video":
+        return rec
+    if time.time() - stat.st_mtime < MEDIA_LIBRARY_METADATA_MIN_AGE_SECONDS:
+        return rec
+
+    current = dict(rec or {})
+    duration_seconds = int(current.get("duration_seconds") or 0)
+    thumbnail_url = _recording_thumb_url(username, current, media_path)
+    source_mtime = int(stat.st_mtime)
+    current_created_at = int(current.get("created_at") or 0)
+    created_at = current_created_at or source_mtime
+    if current_created_at in {0, source_mtime}:
+        created_at = await get_media_created_at(
+            media_path,
+            FFMPEG_PATH,
+            fallback_timestamp=source_mtime,
+        )
+    if duration_seconds > 0 and thumbnail_url and current_created_at == created_at:
+        return rec
+
+    recording_id = current.get("recording_id") or stable_import_recording_id(username, relative_path)
+    media_kind = (current.get("media_kind") or "import").strip().lower() or "import"
+    if duration_seconds <= 0:
+        duration_seconds = await get_video_duration(media_path, FFMPEG_PATH)
+
+    thumbnail_path = current.get("thumbnail_path") if thumbnail_url else None
+    if not thumbnail_path:
+        thumbnail_path = await generate_import_thumbnail(
+            media_path,
+            OUTPUT_DIR,
+            username,
+            recording_id,
+            FFMPEG_PATH,
+        )
+
+    playable_path = current.get("playable_path")
+    playable_size = current.get("playable_size")
+    if not playable_path and media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS:
+        playable_path = str(media_path)
+        playable_size = stat.st_size
+
+    protected_from_retention = bool(current.get("protected_from_retention"))
+    if media_kind == "import":
+        protected_from_retention = True
+
+    await db.add_or_update_recording(
+        username=username,
+        filename=media_path.name,
+        file_path=str(media_path),
+        file_size=stat.st_size,
+        recording_id=recording_id,
+        duration_seconds=duration_seconds,
+        thumbnail_path=thumbnail_path,
+        mp4_path=current.get("mp4_path"),
+        mp4_size=current.get("mp4_size"),
+        is_converted=bool(current.get("is_converted") or playable_path),
+        media_kind=media_kind,
+        title=current.get("title") or title_from_filename(media_path.name),
+        import_status=current.get("import_status") or ("ready" if media_kind == "import" else None),
+        import_error=current.get("import_error"),
+        source_mtime=source_mtime,
+        playable_path=playable_path,
+        playable_size=playable_size,
+        protected_from_retention=protected_from_retention,
+        created_at=created_at,
+    )
+
+    current.update({
+        "username": username,
+        "filename": media_path.name,
+        "file_path": str(media_path),
+        "file_size": stat.st_size,
+        "recording_id": recording_id,
+        "duration_seconds": duration_seconds,
+        "thumbnail_path": thumbnail_path or current.get("thumbnail_path"),
+        "media_kind": media_kind,
+        "title": current.get("title") or title_from_filename(media_path.name),
+        "source_mtime": source_mtime,
+        "playable_path": playable_path,
+        "playable_size": playable_size,
+        "protected_from_retention": protected_from_retention,
+        "created_at": created_at,
+    })
+    return current
+
+
+def _media_library_stats(items: list[dict]) -> dict:
+    stats = {
+        "total": len(items),
+        "videos": 0,
+        "images": 0,
+        "audio": 0,
+        "totalSize": 0,
+    }
+    for item in items:
+        stats["totalSize"] += int(item.get("size") or 0)
+        if item.get("type") == "video":
+            stats["videos"] += 1
+        elif item.get("type") == "image":
+            stats["images"] += 1
+        elif item.get("type") == "audio":
+            stats["audio"] += 1
+    return stats
+
+
+def _normalize_watched_threshold(value, default: int = 90) -> int:
+    try:
+        threshold = int(value)
+    except (ValueError, TypeError):
+        threshold = default
+    return max(0, min(100, threshold))
+
+
+async def _get_watched_threshold() -> int:
+    raw = await db.get_setting("auto_delete_threshold")
+    return _normalize_watched_threshold(raw if raw is not None else 90)
+
+
+def _playback_progress(position_seconds: float, duration_seconds: float) -> int:
+    try:
+        position = float(position_seconds)
+        duration = float(duration_seconds)
+    except (ValueError, TypeError):
+        return 0
+    if duration <= 0 or position <= 0:
+        return 0
+    return max(0, min(100, round((position / duration) * 100)))
+
+
+def _is_playback_watched(
+    position_seconds: float,
+    duration_seconds: float,
+    watched_threshold: int,
+) -> bool:
+    try:
+        position = float(position_seconds)
+        duration = float(duration_seconds)
+    except (ValueError, TypeError):
+        return False
+    if duration <= 0 or position <= 0:
+        return False
+    return _playback_progress(position, duration) >= watched_threshold or position >= max(0, duration - 2)
+
+
+def _attach_media_playback_state(
+    item: dict,
+    playback_position: Optional[dict],
+    watched_threshold: int,
+) -> None:
+    if item.get("type") != "video":
+        item.update({
+            "playbackPosition": 0,
+            "playbackDuration": 0,
+            "playbackProgress": 0,
+            "watchedThreshold": watched_threshold,
+            "isWatched": False,
+            "watchedAt": None,
+        })
+        return
+
+    position = float((playback_position or {}).get("position_seconds") or 0)
+    duration = float(
+        (playback_position or {}).get("duration_seconds")
+        or item.get("duration")
+        or 0
+    )
+    progress = _playback_progress(position, duration)
+    stored_watched_at = (playback_position or {}).get("watched_at")
+    is_watched = bool(stored_watched_at) or _is_playback_watched(position, duration, watched_threshold)
+
+    item.update({
+        "playbackPosition": position,
+        "playbackDuration": duration,
+        "playbackProgress": progress,
+        "watchedThreshold": watched_threshold,
+        "isWatched": is_watched,
+        "watchedAt": stored_watched_at or ((playback_position or {}).get("updated_at") if is_watched else None),
+    })
+
+
+async def _scan_media_library_items() -> list[dict]:
+    from .core.utils import format_bytes
+
+    records_root = OUTPUT_DIR / "records"
+    if not records_root.exists():
+        return []
+
+    items: list[dict] = []
+    for profile_dir in sorted(records_root.iterdir(), key=lambda p: p.name.lower()):
+        if not profile_dir.is_dir() or profile_dir.name.startswith("."):
+            continue
+
+        username = profile_dir.name
+        profile_root = profile_dir.resolve()
+        recordings = await db.get_recordings(username)
+        recordings_by_path: dict[str, dict] = {}
+        recordings_by_filename: dict[str, dict] = {}
+
+        for rec in recordings:
+            filename = rec.get("filename")
+            if filename:
+                recordings_by_filename.setdefault(filename, rec)
+            for key in ("file_path", "mp4_path", "playable_path"):
+                value = rec.get(key)
+                if not value:
+                    continue
+                try:
+                    recordings_by_path.setdefault(str(Path(value).resolve()), rec)
+                except Exception:
+                    continue
+
+        for media_path in profile_dir.rglob("*"):
+            if not _is_media_library_file(media_path):
+                continue
+            try:
+                resolved = media_path.resolve()
+                if not resolved.is_relative_to(profile_root):
+                    continue
+                stat = media_path.stat()
+                relative_path = media_path.relative_to(profile_dir).as_posix()
+            except Exception:
+                continue
+
+            kind = _media_library_kind(media_path)
+            if not kind:
+                continue
+
+            rec = recordings_by_path.get(str(resolved))
+            if rec is None and len(Path(relative_path).parts) == 1:
+                rec = recordings_by_filename.get(media_path.name)
+            if kind == "video":
+                rec = await _ensure_media_library_video_metadata(
+                    username,
+                    relative_path,
+                    media_path,
+                    rec,
+                    stat,
+                )
+
+            url = _media_library_url(username, relative_path)
+            thumbnail = url if kind == "image" else _recording_thumb_url(username, rec, media_path)
+            created_at = int((rec or {}).get("created_at") or stat.st_mtime)
+            duration_seconds = int((rec or {}).get("duration_seconds") or 0)
+            recording_id = (rec or {}).get("recording_id")
+            item_id_seed = f"{username}\0{relative_path}"
+            item_id = hashlib.sha256(item_id_seed.encode("utf-8")).hexdigest()[:16]
+
+            items.append({
+                "id": item_id,
+                "recordingId": recording_id,
+                "username": username,
+                "filename": media_path.name,
+                "relativePath": relative_path,
+                "title": (rec or {}).get("title") or _media_library_placeholder_title(media_path.name),
+                "type": kind,
+                "extension": media_path.suffix.lower().lstrip("."),
+                "mimeType": mimetypes.guess_type(media_path.name)[0] or (
+                    _recording_media_type(media_path.name) if kind == "video" else "application/octet-stream"
+                ),
+                "size": stat.st_size,
+                "sizeFormatted": format_bytes(stat.st_size),
+                "createdAt": created_at,
+                "modifiedAt": int(stat.st_mtime),
+                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "duration": duration_seconds,
+                "durationStr": _format_duration_label(duration_seconds) if duration_seconds else "",
+                "url": url,
+                "downloadUrl": _media_library_url(username, relative_path, download=True),
+                "deleteUrl": f"/api/media-library/{quote(username, safe='')}/{_quote_url_path(relative_path)}",
+                "thumbnail": thumbnail,
+                "browserPlayable": kind != "video" or media_path.suffix.lower() in MEDIA_LIBRARY_BROWSER_PLAYABLE_VIDEO_EXTENSIONS,
+                "isImported": bool(rec and rec.get("media_kind") == "import"),
+                "isRecording": bool(rec and (rec.get("media_kind") or "recording") != "import"),
+            })
+
+    return items
+
+
 # Route protégée pour les enregistrements
 @app.api_route("/streams/records/{username}/{filename}", methods=["GET", "HEAD"])
 async def serve_recording_protected(request: Request, username: str, filename: str):
@@ -409,7 +911,7 @@ async def serve_recording_protected(request: Request, username: str, filename: s
         or not filename.lower().endswith((".ts", ".mp4", ".webm"))
     ):
         logger.warning("Tentative d'accès fichier invalide", username=username, filename=filename)
-        raise HTTPException(status_code=400, detail="Nom de fichier invalide")
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
     active_sessions = _all_recording_statuses()
     for session in active_sessions:
@@ -420,7 +922,7 @@ async def serve_recording_protected(request: Request, username: str, filename: s
             logger.warning("Accès bloqué à enregistrement en cours", username=username, filename=filename)
             raise HTTPException(
                 status_code=403,
-                detail="Cet enregistrement est en cours. Regardez le live à la place.",
+                detail="This recording is in progress. Watch the live stream instead.",
             )
 
     # Servir le fichier
@@ -432,28 +934,63 @@ async def serve_recording_protected(request: Request, username: str, filename: s
 async def serve_imported_media(request: Request, recording_id: str, download: bool = False):
     """Sert un média importé via son ID stable, sans exposer de chemin disque."""
     if ".." in recording_id or "/" in recording_id:
-        raise HTTPException(status_code=400, detail="ID média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media ID")
 
     rec = await db.get_recording_by_id(recording_id)
     if not rec or rec.get("media_kind") != "import":
-        raise HTTPException(status_code=404, detail="Média introuvable")
+        raise HTTPException(status_code=404, detail="Media not found")
 
     path_value = rec.get("file_path") if download else (rec.get("playable_path") or rec.get("file_path"))
     if not path_value:
-        raise HTTPException(status_code=404, detail="Fichier média introuvable")
+        raise HTTPException(status_code=404, detail="Media file not found")
 
     file_path = Path(path_value)
     output_root = OUTPUT_DIR.resolve()
     try:
         resolved = file_path.resolve()
         if not resolved.is_relative_to(output_root):
-            raise HTTPException(status_code=403, detail="Chemin média non autorisé")
+            raise HTTPException(status_code=403, detail="Media path is not allowed")
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(status_code=400, detail="Chemin média invalide")
+        raise HTTPException(status_code=400, detail="Invalid media path")
 
     return await _serve_video_file_with_ranges(request, file_path, file_path.name)
+
+
+@app.api_route("/streams/library/{username}/{file_path:path}", methods=["GET", "HEAD"])
+async def serve_library_media(request: Request, username: str, file_path: str, download: bool = False):
+    """Sert un fichier média présent dans /records/<profil>/ avec validation de chemin."""
+    media_path = _resolve_library_media_path(username, file_path)
+    if not media_path.exists() or not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    kind = _media_library_kind(media_path)
+    media_type = mimetypes.guess_type(media_path.name)[0] or (
+        _recording_media_type(media_path.name) if kind == "video" else "application/octet-stream"
+    )
+
+    if download:
+        return FileResponse(
+            str(media_path),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": _content_disposition(media_path.name, "attachment"),
+                "Cache-Control": "private, max-age=0",
+            },
+        )
+
+    if kind == "video":
+        return await _serve_video_file_with_ranges(request, media_path, media_path.name)
+
+    return FileResponse(
+        str(media_path),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": _content_disposition(media_path.name),
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
 
 # Mount pour les sessions HLS live uniquement
 app.mount("/streams/sessions", StaticFiles(directory=str(OUTPUT_DIR / "sessions")), name="streams_sessions")
@@ -499,6 +1036,7 @@ async def serve_browser_live_stream(session_id: str, filename: str):
 # Database SQLite
 DB_FILE = OUTPUT_DIR / "streamrec.db"
 db = Database(DB_FILE)
+browser_capture_manager.session_store = ProviderSessionStore(db)
 media_import_manager: Optional[MediaImportManager] = None
 
 # Chaturbate API (initialized at startup)
@@ -514,6 +1052,8 @@ SOURCE_TYPES = provider_registry.source_types()
 _HLS_PROXY_CACHE: dict[str, dict] = {}
 _HLS_PROXY_REVERSE: dict[tuple, str] = {}
 _HLS_PROXY_TTL_SECONDS = int(os.getenv("PSTREAMREC_HLS_PROXY_TTL_SECONDS", "900"))
+_HLS_MOUFLON_PSCH_RE = re.compile(r"^#EXT-X-MOUFLON:PSCH:([^:]+):(.+)$", re.IGNORECASE)
+_HLS_MOUFLON_URI_RE = re.compile(r"^#EXT-X-MOUFLON:URI:(https?://.+)$", re.IGNORECASE)
 
 
 def _parse_auto_record_users_env(raw_value: Optional[str]) -> Tuple[list[str], int]:
@@ -589,11 +1129,14 @@ async def _import_auto_record_users_from_env() -> dict[str, int]:
     }
 
 
+_SOURCE_TYPE_ALIASES = {}
+
+
 def _normalize_source_type(source_type: Optional[str]) -> Optional[str]:
     value = (source_type or "").strip().lower()
     if not value or value == "auto":
         return None
-    return value
+    return _SOURCE_TYPE_ALIASES.get(value, value)
 
 
 def _available_source_types() -> set[str]:
@@ -653,6 +1196,10 @@ _BROWSER_CAPTURE_SOURCES = {"livejasmin", "xcams"}
 
 def _supports_browser_capture(source_type: str) -> bool:
     return (source_type or "").strip().lower() in _BROWSER_CAPTURE_SOURCES
+
+
+async def _ensure_browser_capture_session(source_type: str) -> None:
+    return
 
 
 def _provider_error_detail(source_type: str, target: str, exc: Exception) -> str:
@@ -721,6 +1268,16 @@ def _hls_proxy_path_suffix(url: str) -> str:
     if re.fullmatch(r"\.[a-z0-9]{1,8}", suffix or ""):
         return suffix
     return ""
+
+
+def _url_with_missing_query_params(url: str, params: dict[str, str]) -> str:
+    parsed = urlparse(url or "")
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    existing = {key for key, _ in pairs}
+    for key, value in params.items():
+        if key not in existing and value:
+            pairs.append((key, value))
+    return urlunparse(parsed._replace(query=urlencode(pairs)))
 
 
 def _register_hls_proxy_url(
@@ -862,8 +1419,17 @@ def _rewrite_hls_playlist(
     def proxy_url(raw_uri: str) -> str:
         return _register_hls_proxy_url(urljoin(base_url, raw_uri), headers=headers)
 
+    def proxy_absolute_url(url: str) -> str:
+        return _register_hls_proxy_url(url, headers=headers)
+
     media_sequence_written = False
     pending_program_date_time: Optional[str] = None
+    pending_mouflon_uri: Optional[str] = None
+    pending_variant = False
+    skip_mouflon_full_segment = False
+    variant_index = 0
+    mouflon_keys: list[tuple[str, str]] = []
+    has_mouflon_parts = "#EXT-X-MOUFLON:URI:" in (text or "") and "#EXT-X-PART:" in (text or "")
     rewritten = []
     for line in (text or "").splitlines():
         stripped = line.strip()
@@ -872,21 +1438,49 @@ def _rewrite_hls_playlist(
             continue
         if stripped.startswith("#"):
             upper = stripped.upper()
-            # Hls.js can chase LL-HLS parts/preload hints faster than a
-            # server-side proxy can refresh provider tokens. Keep the stable
-            # full segments and rewrite the playlist as ordinary live HLS.
+            psch_match = _HLS_MOUFLON_PSCH_RE.match(stripped)
+            if psch_match:
+                mouflon_keys.append((psch_match.group(1).strip(), psch_match.group(2).strip()))
+                rewritten.append(line)
+                continue
+            uri_match = _HLS_MOUFLON_URI_RE.match(stripped)
+            if uri_match:
+                pending_mouflon_uri = uri_match.group(1).strip()
+                continue
+            # Hls.js can chase generic LL-HLS parts/preload hints faster than
+            # a server-side proxy can refresh provider tokens. Stripchat's
+            # Mouflon playlists are different: the full media.mp4 placeholders
+            # 404, while the part URLs in the preceding Mouflon tags are valid.
             if (
                 upper.startswith("#EXT-X-SERVER-CONTROL:")
                 or upper.startswith("#EXT-X-PART-INF:")
-                or upper.startswith("#EXT-X-PART:")
-                or upper.startswith("#EXT-X-PRELOAD-HINT:")
                 or upper.startswith("#EXT-X-RENDITION-REPORT:")
             ):
+                continue
+            if upper.startswith("#EXT-X-PART:"):
+                if has_mouflon_parts and pending_mouflon_uri:
+                    duration_match = re.search(r"DURATION=([0-9.]+)", stripped, re.IGNORECASE)
+                    rewritten.append(f"#EXTINF:{duration_match.group(1) if duration_match else '0.5'},")
+                    rewritten.append(proxy_absolute_url(pending_mouflon_uri))
+                pending_mouflon_uri = None
+                continue
+            if upper.startswith("#EXT-X-PRELOAD-HINT:"):
+                pending_mouflon_uri = None
+                continue
+            if upper.startswith("#EXT-X-MOUFLON:EXT-REF:"):
+                continue
+            if upper.startswith("#EXT-X-STREAM-INF:"):
+                pending_variant = True
+                rewritten.append(line)
                 continue
             if upper.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
                 pending_program_date_time = line
                 continue
             if upper.startswith("#EXTINF:"):
+                if has_mouflon_parts:
+                    skip_mouflon_full_segment = True
+                    pending_program_date_time = None
+                    continue
                 if pending_program_date_time:
                     rewritten.append(pending_program_date_time)
                     pending_program_date_time = None
@@ -907,7 +1501,23 @@ def _rewrite_hls_playlist(
                 )
             rewritten.append(line)
             continue
-        rewritten.append(proxy_url(stripped))
+        raw_uri = pending_mouflon_uri or stripped
+        pending_mouflon_uri = None
+        if skip_mouflon_full_segment:
+            skip_mouflon_full_segment = False
+            continue
+        absolute_url = urljoin(base_url, raw_uri)
+        if pending_variant:
+            query_keys = {key for key, _ in parse_qsl(urlparse(absolute_url).query, keep_blank_values=True)}
+            if mouflon_keys and "pkey" not in query_keys:
+                version, pkey = mouflon_keys[min(variant_index, len(mouflon_keys) - 1)]
+                absolute_url = _url_with_missing_query_params(
+                    absolute_url,
+                    {"playlistType": "lowLatency", "psch": version, "pkey": pkey},
+                )
+            variant_index += 1
+            pending_variant = False
+        rewritten.append(proxy_absolute_url(absolute_url))
     if live_sequence is not None and not media_sequence_written:
         insert_at = 1 if rewritten and rewritten[0].strip() == "#EXTM3U" else 0
         rewritten.insert(insert_at, f"#EXT-X-MEDIA-SEQUENCE:{live_sequence}")
@@ -921,6 +1531,10 @@ def _proxied_stream_url(stream: ResolvedStream) -> str:
     if ".m3u8" in lower or ".mpd" in lower:
         return _register_hls_proxy_url(stream.url, headers=stream.headers)
     return stream.url
+
+
+def _watch_stream_payload(stream: ResolvedStream) -> dict:
+    return {"streamUrl": _proxied_stream_url(stream)}
 
 
 def _local_proxy_url_for_ffmpeg(url: str) -> str:
@@ -976,7 +1590,7 @@ async def _index_browser_capture_recording(session) -> None:
     if not record_path.exists() or not record_path.is_file():
         return
     try:
-        from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+        from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
 
         await _remux_browser_recording(record_path)
         file_size = record_path.stat().st_size
@@ -985,6 +1599,7 @@ async def _index_browser_capture_recording(session) -> None:
             duration_seconds = max(0, int(time.time() - getattr(session, "start_time", time.time())))
         if duration_seconds < MIN_RECORDING_SECONDS and file_size < MIN_RECORDING_BYTES:
             return
+        fallback_created_at = int(getattr(session, "start_time", None) or record_path.stat().st_mtime)
         thumbnail_path = await generate_recording_thumbnail(
             record_path,
             OUTPUT_DIR,
@@ -999,12 +1614,88 @@ async def _index_browser_capture_recording(session) -> None:
             recording_id=f"{session.person}_{record_path.stem}",
             duration_seconds=duration_seconds,
             thumbnail_path=thumbnail_path,
+            created_at=await get_media_created_at(
+                record_path,
+                FFMPEG_PATH,
+                fallback_timestamp=fallback_created_at,
+            ),
         )
     except Exception as exc:
         logger.warning(
             "Indexation browser recording échouée",
             session_id=session.id,
             person=session.person,
+            error=str(exc),
+        )
+
+
+async def _index_ffmpeg_recording(session) -> None:
+    paths = []
+    try:
+        paths = [Path(path) for path in session._recording_paths_for_cleanup()]
+    except Exception:
+        record_path = getattr(session, "record_path", None)
+        if record_path:
+            paths = [Path(record_path)]
+
+    if not paths:
+        return
+
+    try:
+        from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
+
+        for record_path in paths:
+            if not record_path.exists() or not record_path.is_file():
+                continue
+            file_size = record_path.stat().st_size
+            duration_seconds = await get_video_duration(record_path, FFMPEG_PATH)
+            if not duration_seconds:
+                duration_seconds = max(0, int(time.time() - getattr(session, "start_time", time.time())))
+            if duration_seconds < MIN_RECORDING_SECONDS and file_size < MIN_RECORDING_BYTES:
+                logger.info(
+                    "Recording trop court, indexation ignorée",
+                    session_id=session.id,
+                    person=session.person,
+                    file=record_path.name,
+                    duration_seconds=duration_seconds,
+                    file_size=file_size,
+                )
+                continue
+            fallback_created_at = int(getattr(session, "start_time", None) or record_path.stat().st_mtime)
+            thumbnail_path = await generate_recording_thumbnail(
+                record_path,
+                OUTPUT_DIR,
+                session.person,
+                FFMPEG_PATH,
+            )
+            await db.add_or_update_recording(
+                username=session.person,
+                filename=record_path.name,
+                file_path=str(record_path),
+                file_size=file_size,
+                recording_id=f"{session.person}_{record_path.stem}",
+                duration_seconds=duration_seconds,
+                thumbnail_path=thumbnail_path,
+                is_converted=False,
+                created_at=await get_media_created_at(
+                    record_path,
+                    FFMPEG_PATH,
+                    fallback_timestamp=fallback_created_at,
+                ),
+            )
+            logger.info(
+                "Recording FFmpeg indexée",
+                session_id=session.id,
+                person=session.person,
+                file=record_path.name,
+                duration_seconds=duration_seconds,
+                file_size=file_size,
+            )
+    except Exception as exc:
+        logger.warning(
+            "Indexation recording FFmpeg échouée",
+            session_id=getattr(session, "id", None),
+            person=getattr(session, "person", None),
             error=str(exc),
         )
 
@@ -1099,8 +1790,21 @@ class StartBody(BaseModel):
 
 
 class ProviderLoginBody(BaseModel):
-    username: str
-    password: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+
+
+class ProviderSessionBody(BaseModel):
+    username: Optional[str] = None
+    cookies: Optional[Any] = None
+    cookieHeader: Optional[str] = None
+    localStorage: Optional[Any] = None
+    origins: Optional[Any] = None
+    storageState: Optional[dict[str, Any]] = None
+    userAgent: Optional[str] = None
+    user_agent: Optional[str] = None
+    xBc: Optional[str] = None
+    xbc: Optional[str] = None
 
 
 class ModelVolumeBody(BaseModel):
@@ -1138,6 +1842,12 @@ async def recordings_page():
     return FileResponse(str(STATIC_DIR / "recordings.html"))
 
 
+@app.get("/media")
+async def media_page():
+    """Media page - file library for recordings folders"""
+    return FileResponse(str(STATIC_DIR / "media.html"))
+
+
 @app.get("/settings")
 async def settings_page():
     """Settings page"""
@@ -1154,12 +1864,6 @@ async def wiki_page():
 async def watch_page(username: str):
     """Watch page - view live stream or recording for a model"""
     return FileResponse(str(STATIC_DIR / "watch.html"))
-
-
-@app.get("/dashboard")
-async def dashboard_page():
-    """Legacy dashboard (old index.html)"""
-    return FileResponse(str(STATIC_DIR / "index.html"))
 
 
 @app.get("/login")
@@ -1227,12 +1931,13 @@ async def favicon():
 async def get_version():
     """Retourne les informations de version et configuration"""
     version = os.environ.get("APP_VERSION", "dev")
-    from app.core.config import AUTO_RECORD_INTERVAL
+    check_interval = await get_check_interval_seconds(db)
     return {
         "version": version,
         "output_dir": str(OUTPUT_DIR),
         "ffmpeg_path": FFMPEG_PATH,
-        "check_interval": AUTO_RECORD_INTERVAL,
+        "check_interval": check_interval,
+        "check_interval_seconds": check_interval,
     }
 
 
@@ -1429,6 +2134,45 @@ async def model_page():
     return FileResponse(str(STATIC_DIR / "model.html"))
 
 
+@app.api_route("/vendor/{asset_name}", methods=["GET", "HEAD"])
+async def amazon_ivs_player_asset(asset_name: str, request: Request):
+    media_type = IVS_PLAYER_ASSETS.get(asset_name)
+    if not media_type:
+        raise HTTPException(status_code=404, detail="Unknown vendor asset")
+
+    now = time.time()
+    cached = _IVS_PLAYER_ASSET_CACHE.get(asset_name) or {}
+    cached_body = cached.get("body")
+    cached_at = float(cached.get("cached_at") or 0)
+    cache_headers = {"Cache-Control": "public, max-age=86400"}
+    if isinstance(cached_body, bytes) and now - cached_at < 86400:
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type=media_type, headers=cache_headers)
+        return Response(content=cached_body, media_type=media_type, headers=cache_headers)
+
+    try:
+        async with aiohttp_client_session(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.get(
+                f"{IVS_PLAYER_ASSET_BASE_URL}/{asset_name}",
+                headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                if resp.status >= 400:
+                    raise HTTPException(status_code=502, detail="IVS player asset unavailable")
+                body = await resp.read()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Erreur chargement asset IVS", asset=asset_name, error=str(exc), exc_info=True)
+        raise HTTPException(status_code=502, detail="IVS player asset unavailable")
+
+    _IVS_PLAYER_ASSET_CACHE[asset_name] = {"body": body, "cached_at": now}
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type=media_type, headers=cache_headers)
+    return Response(content=body, media_type=media_type, headers=cache_headers)
+
+
 @app.api_route("/api/proxy/hls/{token_path:path}", methods=["GET", "HEAD"])
 async def hls_proxy(token_path: str, request: Request):
     token = (token_path or "").split("/", 1)[0].split(".", 1)[0]
@@ -1504,23 +2248,120 @@ async def _provider_login_state(source_type: str) -> dict:
     except Exception:
         return {"isLoggedIn": False, "username": None, "lastError": "Unknown provider"}
 
+    if not getattr(getattr(provider, "capabilities", None), "can_login", False):
+        return {
+            "isLoggedIn": False,
+            "username": None,
+            "lastError": None,
+            "lastLoginAt": None,
+            "hasCookies": False,
+            "hasLocalStorage": False,
+            "hasSession": False,
+            "hasSavedSessionData": False,
+            "hasSavedCredentials": False,
+            "accountDisabled": True,
+        }
+
     auth = getattr(provider, "auth", None)
     if auth is not None:
         try:
-            return auth.get_status()
+            status = auth.get_status()
+            row = await db.get_provider_session(source_type)
+            has_saved_credentials = bool(row and row.get("credential_username") and row.get("credential_password"))
+            has_local_storage = _stored_json_has_items(row.get("local_storage") if row else None)
+            has_saved_session_data = bool(status.get("hasCookies") or has_local_storage)
+            is_logged_in = bool(status.get("isLoggedIn"))
+            status["hasSavedCredentials"] = has_saved_credentials
+            status["credentialsUpdatedAt"] = row.get("credentials_updated_at") if has_saved_credentials else None
+            status["hasLocalStorage"] = has_local_storage
+            status["hasSavedSessionData"] = has_saved_session_data
+            status["hasSession"] = bool(is_logged_in and (status.get("hasCookies") or has_local_storage or is_logged_in))
+            if not is_logged_in:
+                status["lastLoginAt"] = None
+            if not status.get("username") and row:
+                status["username"] = row.get("credential_username")
+            return status
         except Exception:
             pass
 
     row = await db.get_provider_session(source_type)
     if not row:
-        return {"isLoggedIn": False, "username": None, "lastError": None, "hasCookies": False}
+        return {
+            "isLoggedIn": False,
+            "username": None,
+            "lastError": None,
+            "hasCookies": False,
+            "hasLocalStorage": False,
+            "hasSession": False,
+            "hasSavedSessionData": False,
+            "hasSavedCredentials": False,
+        }
+    has_saved_credentials = bool(row.get("credential_username") and row.get("credential_password"))
+    has_cookies = _stored_json_has_items(row.get("session_cookies"))
+    has_local_storage = _stored_json_has_items(row.get("local_storage"))
+    has_saved_session_data = bool(has_cookies or has_local_storage)
+    is_logged_in = bool(row.get("is_logged_in")) and bool(has_cookies or has_local_storage)
     return {
-        "isLoggedIn": bool(row.get("is_logged_in")),
-        "username": row.get("username"),
+        "isLoggedIn": is_logged_in,
+        "username": row.get("username") or row.get("credential_username"),
         "lastError": row.get("last_error"),
-        "lastLoginAt": row.get("last_login_at"),
-        "hasCookies": bool(row.get("session_cookies")),
+        "lastLoginAt": row.get("last_login_at") if is_logged_in else None,
+        "hasCookies": has_cookies,
+        "hasLocalStorage": has_local_storage,
+        "hasSession": is_logged_in,
+        "hasSavedSessionData": has_saved_session_data,
+        "hasSavedCredentials": has_saved_credentials,
+        "credentialsUpdatedAt": row.get("credentials_updated_at") if has_saved_credentials else None,
     }
+
+
+def _stored_json_has_items(raw_value: object) -> bool:
+    if not raw_value:
+        return False
+    try:
+        parsed = json.loads(raw_value) if isinstance(raw_value, str) else raw_value
+    except Exception:
+        return False
+    if isinstance(parsed, list):
+        return any(bool(item) for item in parsed)
+    if isinstance(parsed, dict):
+        return bool(parsed)
+    return False
+
+async def _saved_provider_credentials(source_type: str) -> Optional[tuple[str, str]]:
+    row = await db.get_provider_session(source_type)
+    if not row:
+        return None
+    username = (row.get("credential_username") or "").strip()
+    password = row.get("credential_password") or ""
+    if not username or not password:
+        return None
+    return username, password
+
+
+async def _login_with_saved_provider_credentials(source_type: str) -> bool:
+    credentials = await _saved_provider_credentials(source_type)
+    if not credentials:
+        return False
+    username, password = credentials
+    result = await _provider_for(source_type).login(username, password)
+    return bool(result.get("success"))
+
+
+async def _ensure_saved_provider_login(provider, source_type: str) -> None:
+    try:
+        logged_in = await _login_with_saved_provider_credentials(source_type)
+    except ProviderInteractionRequired:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{provider.display_name}: session navigateur verifiee requise",
+        )
+    except ProviderAuthError:
+        raise HTTPException(status_code=401, detail=f"{provider.display_name}: connexion requise")
+    except ProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not logged_in:
+        raise HTTPException(status_code=401, detail=f"{provider.display_name}: connexion requise")
 
 
 @app.get("/api/providers")
@@ -1551,14 +2392,102 @@ async def provider_login(source_type: str, body: ProviderLoginBody):
     if source_type not in _available_source_types():
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
+    if not getattr(provider.capabilities, "can_login", False):
+        raise HTTPException(status_code=400, detail=f"{provider.display_name}: account connection unsupported")
+    username = (body.username or "").strip()
+    password = body.password or ""
+    saved_credentials = False
+    if password:
+        if not username:
+            raise HTTPException(status_code=400, detail="Username is required")
+        await db.save_provider_credentials(source_type, username, password)
+        saved_credentials = True
+    else:
+        credentials = await _saved_provider_credentials(source_type)
+        if not credentials:
+            raise HTTPException(status_code=400, detail="Username and password are required")
+        username, password = credentials
+        saved_credentials = True
     try:
-        result = await provider.login(body.username, body.password)
+        result = await provider.login(username, password)
     except ProviderInteractionRequired as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        return JSONResponse(
+            status_code=409,
+            content={"success": False, "savedCredentials": saved_credentials, "detail": str(exc)},
+        )
     except ProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "savedCredentials": saved_credentials, "detail": str(exc)},
+        )
     if not result.get("success"):
-        raise HTTPException(status_code=401, detail=result.get("error", "Login failed"))
+        return JSONResponse(
+            status_code=401,
+            content={
+                "success": False,
+                "savedCredentials": saved_credentials,
+                "detail": result.get("error", "Login failed"),
+            },
+        )
+    result["savedCredentials"] = saved_credentials
+    return result
+
+
+def _provider_session_payload(body: ProviderSessionBody) -> tuple[Optional[list[dict[str, Any]]], list[dict[str, Any]]]:
+    storage_state = body.storageState if isinstance(body.storageState, dict) else {}
+    cookies = body.cookies if body.cookies is not None else storage_state.get("cookies")
+    local_storage = (
+        body.localStorage
+        if body.localStorage is not None
+        else body.origins
+        if body.origins is not None
+        else storage_state.get("origins")
+    )
+
+    if cookies is not None and not isinstance(cookies, list):
+        raise HTTPException(status_code=400, detail="Session cookies must be a JSON array or cookie header")
+    normalized_cookies = [
+        cookie
+        for cookie in (cookies or [])
+        if isinstance(cookie, dict) and cookie.get("name") and cookie.get("value") is not None
+    ]
+    if local_storage is None:
+        local_storage = []
+    if not isinstance(local_storage, list):
+        raise HTTPException(status_code=400, detail="localStorage/origins must be a JSON array")
+    normalized_storage = [entry for entry in local_storage if isinstance(entry, dict)]
+    return normalized_cookies or None, normalized_storage
+
+
+@app.post("/api/providers/{source_type}/session")
+async def provider_import_session(source_type: str, body: ProviderSessionBody):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+    provider = _provider_for(source_type)
+    if not getattr(provider.capabilities, "can_login", False):
+        raise HTTPException(status_code=400, detail=f"{provider.display_name}: session import unsupported")
+    cookies, local_storage = _provider_session_payload(body)
+    cookie_header = (body.cookieHeader or "").strip()
+    if not cookies and not cookie_header and not local_storage:
+        raise HTTPException(status_code=400, detail="No valid session data provided")
+    username = (body.username or "").strip() or None
+    try:
+        result = await provider.import_session(
+            username=username,
+            cookie_header=cookie_header or None,
+            cookies=cookies,
+            local_storage=local_storage,
+            user_agent=(body.userAgent or body.user_agent or None),
+            x_bc=(body.xBc or body.xbc or None),
+        )
+    except ProviderError as exc:
+        return JSONResponse(status_code=400, content={"success": False, "detail": str(exc)})
+    if not result.get("success"):
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "detail": result.get("error", "Session import failed")},
+        )
     return result
 
 
@@ -1577,34 +2506,51 @@ async def provider_sync_following(source_type: str):
     if source_type not in _available_source_types():
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
+    if not getattr(provider.capabilities, "can_sync_following", False):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{provider.display_name}: remote following sync unsupported; local follows only",
+        )
     try:
-        timeout = float(os.getenv("PSTREAMREC_FOLLOW_SYNC_TIMEOUT", "45") or "45")
-        items = await asyncio.wait_for(provider.sync_following(), timeout=timeout)
+        try:
+            items = await asyncio.wait_for(provider.sync_following(), timeout=60)
+        except ProviderAuthError:
+            await _ensure_saved_provider_login(provider, source_type)
+            items = await asyncio.wait_for(provider.sync_following(), timeout=60)
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"{provider.display_name}: sync timeout")
+        raise HTTPException(status_code=504, detail=f"{provider.display_name}: following sync timeout")
+    except ProviderInteractionRequired as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ProviderAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    synced = set()
+    synced_usernames = set()
     for item in items or []:
         username = item.get("username")
         if not username:
             continue
+        thumbnail = item.get("thumbnail_url") or item.get("thumbnail")
         await db.upsert_followed_model(
             username=username,
             display_name=item.get("display_name") or username,
             is_online=bool(item.get("is_online", item.get("isOnline", False))),
             viewers=int(item.get("viewers") or 0),
-            thumbnail_url=item.get("thumbnail") or item.get("thumbnail_url"),
+            thumbnail_url=thumbnail,
             source_type=source_type,
             room_status=item.get("room_status") or item.get("roomStatus"),
         )
-        synced.add(username)
+        synced_usernames.add(username)
 
-    if source_type == "chaturbate":
-        await db.remove_unfollowed(synced, source_type=source_type)
-    await db.reconcile_model_sources_from_followed()
-    return {"synced": len(synced), "message": f"{provider.display_name}: {len(synced)} follows synchronises"}
+    await db.remove_unfollowed(synced_usernames, source_type=source_type)
+    repaired_sources = await db.reconcile_model_sources_from_followed()
+    return {
+        "synced": len(synced_usernames),
+        "sourceType": source_type,
+        "repairedSources": repaired_sources,
+        "message": f"{provider.display_name}: {len(synced_usernames)} follows synced",
+    }
 
 
 @app.get("/api/providers/{source_type}/is-following/{username}")
@@ -1613,15 +2559,29 @@ async def provider_is_following(source_type: str, username: str):
     if source_type not in _available_source_types():
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
-    remote = False
-    try:
-        if provider.capabilities.can_follow:
-            remote = bool(await provider.is_following(username))
-    except Exception:
-        remote = False
-    local = await db.get_followed_model(username)
+    local = await db.get_followed_model(username, source_type=source_type)
     local_match = bool(local and (local.get("source_type") or "chaturbate") == source_type)
-    return {"isFollowing": remote or local_match}
+    remote_match = False
+    remote_checked = False
+    if getattr(provider.capabilities, "can_sync_following", False):
+        try:
+            remote_match = bool(await provider.is_following(username))
+            remote_checked = True
+        except ProviderAuthError:
+            try:
+                await _ensure_saved_provider_login(provider, source_type)
+                remote_match = bool(await provider.is_following(username))
+                remote_checked = True
+            except HTTPException:
+                remote_checked = False
+        except ProviderError:
+            remote_checked = False
+    return {
+        "isFollowing": bool(remote_match or local_match),
+        "localOnly": not getattr(provider.capabilities, "can_sync_following", False),
+        "localFollowing": local_match,
+        "remoteFollowing": remote_match if remote_checked else None,
+    }
 
 
 @app.post("/api/providers/{source_type}/follow/{username}")
@@ -1630,13 +2590,24 @@ async def provider_follow(source_type: str, username: str):
     if source_type not in _available_source_types():
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
-    if provider.capabilities.can_follow:
-        result = await provider.follow(username)
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error", "Follow failed"))
+    if getattr(provider.capabilities, "can_sync_following", False):
+        try:
+            try:
+                result = await provider.follow(username)
+            except ProviderAuthError:
+                await _ensure_saved_provider_login(provider, source_type)
+                result = await provider.follow(username)
+        except ProviderInteractionRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ProviderAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except ProviderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not result.get("success", True):
+            return JSONResponse(status_code=400, content=result)
+        result = {**result, "localOnly": False, "action": result.get("action") or "follow"}
     else:
-        result = {"success": True, "localOnly": True}
-
+        result = {"success": True, "localOnly": True, "action": "follow"}
     status = ProviderStatus(False, source_type=source_type)
     try:
         status = await _provider_status(source_type, username)
@@ -1661,12 +2632,24 @@ async def provider_unfollow(source_type: str, username: str):
     if source_type not in _available_source_types():
         raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
     provider = _provider_for(source_type)
-    if provider.capabilities.can_follow:
-        result = await provider.unfollow(username)
-        if not result.get("success"):
-            raise HTTPException(status_code=400, detail=result.get("error", "Unfollow failed"))
+    if getattr(provider.capabilities, "can_sync_following", False):
+        try:
+            try:
+                result = await provider.unfollow(username)
+            except ProviderAuthError:
+                await _ensure_saved_provider_login(provider, source_type)
+                result = await provider.unfollow(username)
+        except ProviderInteractionRequired as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except ProviderAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except ProviderError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not result.get("success", True):
+            return JSONResponse(status_code=400, content=result)
+        result = {**result, "localOnly": False, "action": result.get("action") or "unfollow"}
     else:
-        result = {"success": True, "localOnly": True}
+        result = {"success": True, "localOnly": True, "action": "unfollow"}
     await db.delete_followed_model(username, source_type=source_type)
     return result
 
@@ -1687,19 +2670,20 @@ async def api_start(body: StartBody):
         logger.error("Champ 'target' vide dans la requête")
         raise HTTPException(status_code=400, detail="Champ 'target' requis")
 
+    requested_source = _normalize_source_type(body.source_type)
     model_settings = None
     if not target.startswith("http://") and not target.startswith("https://"):
         model_lookup_username = (body.person or target).strip()
         if model_lookup_username:
             try:
-                model_settings = await db.get_model(model_lookup_username)
+                model_settings = await db.get_model(model_lookup_username, source_type=requested_source)
             except Exception:
                 model_settings = None
     
     # Si c'est un auto-start, vérifier que auto_record est activé dans la DB
     if body.auto_start:
         username = body.person or target
-        model = model_settings or await db.get_model(username)
+        model = model_settings or await db.get_model(username, source_type=requested_source)
         if model:
             auto_record = bool(model.get('auto_record', True))
             if not auto_record:
@@ -1712,8 +2696,8 @@ async def api_start(body: StartBody):
     logger.info("Paramètres validés", target=target, source_type=body.source_type)
 
     m3u8_url: Optional[str] = None
-    m3u8_source_url: Optional[str] = None
     stream_headers: Optional[dict[str, str]] = None
+    source_url: Optional[str] = None
     person: Optional[str] = (body.person or "").strip() or None
     record_quality = body.record_quality or body.recordQuality
     if not record_quality and model_settings:
@@ -1722,7 +2706,6 @@ async def api_start(body: StartBody):
     filename_format = await _get_recording_filename_format()
 
     # Determine source type
-    requested_source = _normalize_source_type(body.source_type)
     stype = requested_source or await _infer_source_type(person or target, model_settings)
     if target.startswith("http://") or target.startswith("https://"):
         url_source = _source_type_from_url(target)
@@ -1738,7 +2721,7 @@ async def api_start(body: StartBody):
     if stype == "m3u8" or direct_media_url:
         logger.info("URL M3U8 directe détectée", url=target[:80])
         m3u8_url = target
-        m3u8_source_url = target
+        source_url = target
     else:
         effective_source = stype
         available_sources = _available_source_types()
@@ -1756,6 +2739,7 @@ async def api_start(body: StartBody):
             person = slugify(person)
             logger.subsection(f"Démarrage capture navigateur '{effective_source}'")
             try:
+                await _ensure_browser_capture_session(effective_source)
                 sess = _start_browser_capture(
                     effective_source,
                     target,
@@ -1778,6 +2762,9 @@ async def api_start(body: StartBody):
             except RuntimeError as e:
                 logger.error("Session browser capture impossible", person=person, error=str(e))
                 raise HTTPException(status_code=409, detail=str(e))
+            except ProviderError as e:
+                logger.error("Session browser capture refusee", person=person, error=str(e))
+                raise HTTPException(status_code=400, detail=_provider_error_detail(effective_source, target, e))
             except Exception as e:
                 logger.critical("Erreur création browser capture", exc_info=True, person=person, error=str(e))
                 raise HTTPException(status_code=500, detail=f"Erreur serveur: {str(e)}")
@@ -1795,7 +2782,7 @@ async def api_start(body: StartBody):
         logger.subsection(f"Résolution via source '{effective_source}'")
         try:
             resolved = await _resolve_stream(effective_source, target, max_height)
-            m3u8_url, stream_headers, m3u8_source_url = _ffmpeg_stream_input(resolved)
+            m3u8_url, stream_headers, source_url = _ffmpeg_stream_input(resolved)
             if not m3u8_url:
                 raise HTTPException(
                     status_code=400,
@@ -1826,6 +2813,7 @@ async def api_start(body: StartBody):
 
     person = slugify(person)
     logger.info("Identifiant slugifié", person=person, display_name=body.name)
+    source_url = source_url or m3u8_url
 
     segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
     logger.subsection("Démarrage Session FFmpeg")
@@ -1838,7 +2826,7 @@ async def api_start(body: StartBody):
             segment_duration_seconds=segment_duration_seconds,
             segment_size_bytes=segment_size_bytes,
             input_headers=stream_headers,
-            source_url=m3u8_source_url,
+            source_url=source_url,
             filename_format=filename_format,
         )
         duration_ms = (time.time() - start_time) * 1000
@@ -1871,7 +2859,10 @@ async def api_status():
 
 @app.post("/api/stop/{session_id}")
 async def api_stop(session_id: str):
+    ffmpeg_session = manager.get_session(session_id)
     ok = manager.stop_session(session_id)
+    if ok and ffmpeg_session:
+        await _index_ffmpeg_recording(ffmpeg_session)
     if not ok:
         browser_session = browser_capture_manager.get(session_id)
         ok = browser_capture_manager.stop_session(session_id)
@@ -2141,16 +3132,16 @@ async def api_process_restart(session_id: str):
 @app.get("/api/model/{username}/status")
 async def get_model_status(username: str, source: Optional[str] = None):
     """Récupère le statut d'un modèle via le registre provider."""
-    model = await db.get_model(username)
+    source_type = _normalize_source_type(source)
+    model = await db.get_model(username, source_type=source_type)
     if not model or not model.get('source_type'):
-        followed = await db.get_followed_model(username)
+        followed = await db.get_followed_model(username, source_type=source_type)
         if followed and followed.get('source_type'):
             if not model:
                 model = followed
             else:
                 model = {**model, 'source_type': followed['source_type']}
 
-    source_type = _normalize_source_type(source)
     if not source_type:
         source_type = await _infer_source_type(username, model)
 
@@ -2217,7 +3208,8 @@ async def get_model_stream(username: str, source: Optional[str] = None):
     try:
         model = None
         try:
-            model = await db.get_model(username)
+            requested_source = _normalize_source_type(source)
+            model = await db.get_model(username, source_type=requested_source)
         except Exception:
             pass
         source_type = _normalize_source_type(source)
@@ -2230,8 +3222,10 @@ async def get_model_stream(username: str, source: Optional[str] = None):
                 detail=f"Source '{source_type}' non disponible",
             )
         if _supports_browser_capture(source_type):
+            status = None
             person = slugify(username)
             try:
+                await _ensure_browser_capture_session(source_type)
                 sess = _start_browser_capture(
                     source_type,
                     username,
@@ -2253,9 +3247,9 @@ async def get_model_stream(username: str, source: Optional[str] = None):
                 "isOnline": True,
                 "sourceType": source_type,
                 "roomStatus": "public",
-                "viewers": 0,
-                "tags": [],
-                "thumbnail": None,
+                "viewers": int(status.viewers or 0) if status else 0,
+                "tags": list(status.tags or []) if status else [],
+                "thumbnail": status.thumbnail if status else None,
             }
         try:
             max_height = await _get_max_recording_height()
@@ -2268,7 +3262,7 @@ async def get_model_stream(username: str, source: Optional[str] = None):
 
         return {
             "username": username,
-            "streamUrl": _proxied_stream_url(resolved),
+            **_watch_stream_payload(resolved),
             "isOnline": True,
             "sourceType": source_type,
             "roomStatus": resolved.room_status,
@@ -2330,58 +3324,6 @@ async def get_thumbnail(username: str):
         media_type="image/svg+xml",
         headers={"Cache-Control": "public, max-age=10"}
     )
-
-
-@app.get("/api/dashboard")
-async def get_dashboard():
-    """
-    Endpoint optimisé qui retourne TOUTES les données depuis le cache SQLite
-    Ultra-rapide car tout est pré-calculé par la tâche de monitoring
-    """
-    try:
-        # Récupérer tous les modèles depuis SQLite (déjà avec statut à jour)
-        models = await db.get_all_models()
-        
-        # Récupérer les sessions actives
-        active_sessions = manager.list_status()
-        
-        # Formater les données pour le frontend
-        models_info = []
-        
-        for model in models:
-            username = model['username']
-            source_type = await _infer_source_type(username, model)
-            
-            # Récupérer le nombre d'enregistrements depuis SQLite
-            recordings_count = await db.get_recordings_count(username)
-            
-            model_info = {
-                "username": username,
-                "isOnline": bool(model.get('is_online', False)),
-                "isRecording": bool(model.get('is_recording', False)),
-                "viewers": model.get('viewers', 0),
-                "thumbnail": f"/api/thumbnail/{username}",
-                "recordingsCount": recordings_count,
-                "recordQuality": model.get('record_quality', 'best'),
-                "retentionDays": model.get('retention_days', 30),
-                "autoRecord": bool(model.get('auto_record', True)),
-                "roomStatus": model.get('room_status'),
-                "sourceType": source_type,
-                "source_type": source_type,
-            }
-            
-            models_info.append(model_info)
-        
-        # Retourner tout d'un coup
-        return {
-            "models": models_info,
-            "sessions": active_sessions,
-            "timestamp": int(time.time() * 1000)
-        }
-    
-    except Exception as e:
-        logger.error("Erreur dashboard", error=str(e), exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 def _format_duration_label(duration_seconds: int) -> str:
@@ -2606,6 +3548,469 @@ async def rescan_media_imports():
     }
 
 
+@app.get("/api/media-library")
+async def get_media_library(
+    username: Optional[str] = None,
+    kind: str = "all",
+    search: str = "",
+    sort: str = "newest",
+    watched: str = "all",
+    limit: int = 1000,
+    offset: int = 0,
+):
+    """Liste les médias présents dans les dossiers records."""
+    from .core.utils import format_bytes
+
+    all_items = await _scan_media_library_items()
+    folder_profiles = _list_media_profile_folders()
+    media_profiles = await db.get_all_media_profiles()
+    all_models = await db.get_all_models()
+    media_profiles_by_username = {
+        profile["username"]: profile
+        for profile in media_profiles
+        if profile.get("username")
+    }
+
+    profile_stats: dict[str, dict] = {}
+    for item in all_items:
+        profile = item["username"]
+        if profile not in profile_stats:
+            profile_stats[profile] = {
+                "username": profile,
+                "total": 0,
+                "videos": 0,
+                "images": 0,
+                "audio": 0,
+                "totalSize": 0,
+            }
+        stats = profile_stats[profile]
+        stats["total"] += 1
+        stats["totalSize"] += int(item.get("size") or 0)
+        if item.get("type") == "video":
+            stats["videos"] += 1
+        elif item.get("type") == "image":
+            stats["images"] += 1
+        elif item.get("type") == "audio":
+            stats["audio"] += 1
+
+        if int(item.get("createdAt") or 0) >= int(stats.get("latestAt") or 0):
+            stats["latestAt"] = int(item.get("createdAt") or 0)
+            stats["latestTitle"] = item.get("title") or item.get("filename") or ""
+            stats["latestType"] = item.get("type") or ""
+            stats["thumbnail"] = item.get("thumbnail")
+            stats["previewUrl"] = item.get("url")
+
+    profile_names = set(profile_stats)
+    profile_names.update(folder_profiles)
+    profile_names.update(media_profiles_by_username)
+    profile_names.update(model["username"] for model in all_models if model.get("username"))
+
+    profiles = []
+    for profile_name in profile_names:
+        profile = profile_stats.setdefault(profile_name, {
+            "username": profile_name,
+            "total": 0,
+            "videos": 0,
+            "images": 0,
+            "audio": 0,
+            "totalSize": 0,
+            "latestAt": None,
+            "latestTitle": "",
+            "latestType": "",
+            "thumbnail": None,
+            "previewUrl": None,
+        })
+        metadata = media_profiles_by_username.get(profile_name)
+        model = _model_for_media_profile(profile_name, all_models)
+        formatted_metadata = _media_profile_formatted(metadata)
+        source_type = await _infer_source_type(profile_name, model) if model else "chaturbate"
+        profiles.append({
+            **profile,
+            **formatted_metadata,
+            "displayName": formatted_metadata["displayName"] or (model or {}).get("display_name") or profile_name,
+            "folderExists": profile_name in folder_profiles,
+            "empty": int(profile.get("total") or 0) == 0,
+            "autoRecord": bool((model or {}).get("auto_record", False)),
+            "recordQuality": (model or {}).get("record_quality", "best"),
+            "retentionDays": (model or {}).get("retention_days", 30),
+            "sourceType": source_type,
+            "source_type": source_type,
+            "deleteUrl": f"/api/media-profiles/{quote(profile_name, safe='')}",
+            "totalSizeFormatted": format_bytes(profile["totalSize"]),
+        })
+    profiles.sort(key=lambda item: (
+        -int(item["total"] > 0),
+        -int(item.get("latestAt") or 0),
+        item["displayName"].lower(),
+        item["username"].lower(),
+    ))
+
+    normalized_kind = (kind or "all").strip().lower()
+    kind_aliases = {
+        "photos": "image",
+        "photo": "image",
+        "images": "image",
+        "videos": "video",
+        "audio": "audio",
+        "all": "all",
+        "tous": "all",
+    }
+    normalized_kind = kind_aliases.get(normalized_kind, normalized_kind)
+    if normalized_kind not in {"all", "video", "image", "audio"}:
+        normalized_kind = "all"
+
+    filtered = all_items
+    if username:
+        filtered = [item for item in filtered if item["username"] == username]
+    if normalized_kind != "all":
+        filtered = [item for item in filtered if item["type"] == normalized_kind]
+    if search:
+        query = search.strip().lower()
+        if query:
+            filtered = [
+                item for item in filtered
+                if query in item["filename"].lower()
+                or query in item["title"].lower()
+                or query in item["username"].lower()
+                or query in item["relativePath"].lower()
+            ]
+
+    watched_threshold = await _get_watched_threshold()
+    playback_positions = await db.get_all_playback_positions(username)
+    playback_by_recording_id = {
+        row.get("recording_id"): row
+        for row in playback_positions
+        if row.get("recording_id")
+    }
+    for item in filtered:
+        _attach_media_playback_state(
+            item,
+            playback_by_recording_id.get(item.get("recordingId")),
+            watched_threshold,
+        )
+
+    watched_filter = (watched or "all").strip().lower()
+    if watched_filter in {"unwatched", "not_watched", "unseen", "non_vue", "non_vues", "non-vue", "non-vues"}:
+        filtered = [
+            item for item in filtered
+            if item.get("type") == "video" and not item.get("isWatched")
+        ]
+    elif watched_filter in {"watched", "seen", "viewed", "vue", "vues"}:
+        filtered = [
+            item for item in filtered
+            if item.get("type") == "video" and item.get("isWatched")
+        ]
+
+    sort_key = (sort or "newest").strip().lower()
+    reverse = True
+    if sort_key == "oldest":
+        key_func = lambda item: item["createdAt"]
+        reverse = False
+    elif sort_key == "largest":
+        key_func = lambda item: item["size"]
+    elif sort_key == "smallest":
+        key_func = lambda item: item["size"]
+        reverse = False
+    elif sort_key == "name":
+        key_func = lambda item: (item["title"].lower(), item["filename"].lower())
+        reverse = False
+    else:
+        key_func = lambda item: item["createdAt"]
+
+    filtered = sorted(filtered, key=key_func, reverse=reverse)
+    total = len(filtered)
+    limit = max(1, min(int(limit or 1000), 5000))
+    offset = max(0, int(offset or 0))
+    page_items = filtered[offset:offset + limit]
+
+    library_stats = _media_library_stats(all_items)
+    filtered_stats = _media_library_stats(filtered)
+    return {
+        "items": page_items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": offset + limit < total,
+        "profiles": profiles,
+        "stats": {
+            **filtered_stats,
+            "totalSizeFormatted": format_bytes(filtered_stats["totalSize"]),
+        },
+        "libraryStats": {
+            **library_stats,
+            "totalSizeFormatted": format_bytes(library_stats["totalSize"]),
+        },
+    }
+
+
+@app.get("/api/media-profiles/{username}")
+async def get_media_profile(username: str):
+    """Retourne la fiche enrichie et les réglages stream d'un profil média."""
+    username = _validate_media_profile_username(username)
+    profile_dir = _media_profile_dir(username)
+    profile = await db.get_media_profile(username)
+    model = await db.get_model(username)
+    recordings = await db.get_recordings(username)
+    if not profile_dir.exists() and not profile and not model and not recordings:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return await _media_profile_payload(username)
+
+
+@app.put("/api/media-profiles/{username}")
+async def update_media_profile(username: str, body: dict):
+    """Met à jour les informations locales et les réglages stream d'un profil."""
+    username = _validate_media_profile_username(username)
+    requested_source = _normalize_source_type(
+        body.get("sourceType") or body.get("source_type")
+    ) or "chaturbate"
+    if requested_source not in _available_source_types():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{requested_source}' is not available",
+        )
+
+    profile_data = {
+        "display_name": body.get("displayName") or body.get("display_name") or "",
+        "first_name": body.get("firstName") or body.get("first_name") or "",
+        "last_name": body.get("lastName") or body.get("last_name") or "",
+        "age": body.get("age"),
+        "address": body.get("address") or "",
+        "city": body.get("city") or "",
+        "region": body.get("region") or "",
+        "postal_code": body.get("postalCode") or body.get("postal_code") or "",
+        "country": body.get("country") or "",
+        "aliases": body.get("aliases") or "",
+        "tags": body.get("tags") or "",
+        "notes": body.get("notes") or "",
+        "social_urls": body.get("socialUrls") or body.get("social_urls") or [],
+        "stream_urls": body.get("streamUrls") or body.get("stream_urls") or [],
+        "profile_urls": body.get("profileUrls") or body.get("profile_urls") or [],
+    }
+    await db.upsert_media_profile(username, profile_data)
+
+    existing = await db.get_model(username, source_type=requested_source)
+    retention_days = _normalize_retention_days(
+        body.get("retentionDays"),
+        (existing or {}).get("retention_days", await _get_default_retention_days()),
+    )
+    record_quality = (
+        body.get("recordQuality")
+        or (existing or {}).get("record_quality")
+        or await _get_default_record_quality()
+    )
+    auto_record = bool(body.get("autoRecord", (existing or {}).get("auto_record", False)))
+
+    await db.add_or_update_model(
+        username=username,
+        display_name=profile_data["display_name"] or username,
+        auto_record=auto_record,
+        record_quality=record_quality,
+        retention_days=retention_days,
+        source_type=requested_source,
+    )
+
+    return {
+        "success": True,
+        "profile": await _media_profile_payload(username),
+    }
+
+
+def _assert_media_profile_not_active(username: str):
+    for session in _all_recording_statuses():
+        if session.get("person") == username and session.get("running"):
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot delete a profile while it is recording.",
+            )
+
+
+@app.delete("/api/media-profiles/{username}")
+async def delete_media_profile(username: str):
+    """Supprime la fiche, les enregistrements DB et le dossier records du profil."""
+    username = _validate_media_profile_username(username)
+    profile_dir = _media_profile_dir(username)
+    _assert_media_profile_not_active(username)
+
+    profile = await db.get_media_profile(username)
+    model = await db.get_model(username)
+    recordings = await db.get_recordings(username)
+    folder_exists = profile_dir.exists()
+    if not folder_exists and not profile and not model and not recordings:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if folder_exists and not profile_dir.is_dir():
+        raise HTTPException(status_code=400, detail="The profile records path is not a folder")
+
+    for rec in recordings:
+        recording_id = rec.get("recording_id")
+        if recording_id:
+            await db.delete_playback_position(recording_id)
+    removed_recordings = await db.delete_recordings_for_username(username)
+    await db.delete_model(username)
+    await db.delete_media_profile(username)
+
+    folder_deleted = False
+    if folder_exists:
+        shutil.rmtree(profile_dir)
+        folder_deleted = True
+
+    thumb_dir = OUTPUT_DIR / "thumbnails" / username
+    thumbs_deleted = False
+    try:
+        if thumb_dir.exists() and thumb_dir.is_dir() and _path_is_inside_output(thumb_dir):
+            shutil.rmtree(thumb_dir)
+            thumbs_deleted = True
+    except OSError as e:
+        logger.warning("Suppression miniatures profil impossible", username=username, error=str(e))
+
+    logger.info(
+        "Profil média supprimé",
+        username=username,
+        folder_deleted=folder_deleted,
+        removed_recordings=removed_recordings,
+    )
+    return {
+        "success": True,
+        "username": username,
+        "folderDeleted": folder_deleted,
+        "thumbnailsDeleted": thumbs_deleted,
+        "removedRecordings": removed_recordings,
+    }
+
+
+def _resolved_path_key(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return str(Path(value).resolve())
+    except Exception:
+        return None
+
+
+def _path_is_inside_output(path: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(OUTPUT_DIR.resolve())
+    except Exception:
+        return False
+
+
+async def _find_recording_for_media_path(username: str, media_path: Path, relative_path: str) -> Optional[dict]:
+    target_key = _resolved_path_key(str(media_path))
+    recordings = await db.get_recordings(username)
+    for rec in recordings:
+        for key in ("file_path", "mp4_path", "playable_path"):
+            if target_key and _resolved_path_key(rec.get(key)) == target_key:
+                return rec
+        if len(Path(relative_path).parts) == 1 and rec.get("filename") == media_path.name:
+            return rec
+    return None
+
+
+def _assert_media_not_active(username: str, media_path: Path):
+    target_key = _resolved_path_key(str(media_path))
+    for session in _all_recording_statuses():
+        if not (session.get("person") == username and session.get("running")):
+            continue
+
+        record_path = session.get("record_path") or ""
+        active_key = _resolved_path_key(record_path)
+        if active_key and target_key and active_key == target_key:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot delete media while it is recording.",
+            )
+        if record_path and Path(record_path).stem == media_path.stem:
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot delete media while it is recording.",
+            )
+
+
+async def _delete_media_library_record(username: str, media_path: Path, relative_path: str) -> dict:
+    rec = await _find_recording_for_media_path(username, media_path, relative_path)
+    if rec and rec.get("media_kind") == "import":
+        deleted = await remove_import_record(
+            db,
+            rec,
+            reason="media_library_delete",
+            delete_original=True,
+        )
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Media not found")
+        return {
+            "success": True,
+            "message": "Media deleted",
+            "deletedFiles": [media_path.name],
+            "removedRecord": True,
+        }
+
+    paths_to_delete: list[Path] = [media_path]
+    removed_record = False
+    recording_id = None
+
+    if rec:
+        removed_record = True
+        recording_id = rec.get("recording_id")
+        for key in ("file_path", "mp4_path", "playable_path", "thumbnail_path"):
+            value = rec.get(key)
+            if value:
+                paths_to_delete.append(Path(value))
+
+    generated_thumb = OUTPUT_DIR / "thumbnails" / username / f"{media_path.stem}.jpg"
+    paths_to_delete.append(generated_thumb)
+
+    deleted_files = []
+    seen = set()
+    for path in paths_to_delete:
+        path_key = _resolved_path_key(str(path))
+        if not path_key or path_key in seen:
+            continue
+        seen.add(path_key)
+        if not _path_is_inside_output(path):
+            continue
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+                deleted_files.append(path.name)
+        except OSError as e:
+            logger.warning("Suppression média impossible", path=str(path), error=str(e))
+
+    if rec:
+        if recording_id:
+            await db.delete_recording_by_id(recording_id)
+            await db.delete_playback_position(recording_id)
+        else:
+            await db.delete_recording(username, rec.get("filename") or media_path.name)
+
+    if not deleted_files and not removed_record:
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    return {
+        "success": True,
+        "message": "Media deleted",
+        "deletedFiles": deleted_files,
+        "removedRecord": removed_record,
+    }
+
+
+@app.delete("/api/media-library/{username}/{file_path:path}")
+async def delete_media_library_item(username: str, file_path: str):
+    """Supprime un média depuis la bibliothèque locale records."""
+    media_path = _resolve_library_media_path(username, file_path)
+    if not media_path.exists() or not media_path.is_file():
+        raise HTTPException(status_code=404, detail="Media not found")
+
+    _assert_media_not_active(username, media_path)
+    result = await _delete_media_library_record(username, media_path, file_path)
+    logger.info(
+        "Média bibliothèque supprimé",
+        username=username,
+        file=file_path,
+        deleted_files=result.get("deletedFiles", []),
+        removed_record=result.get("removedRecord"),
+    )
+    return result
+
+
 @app.get("/api/all-recordings")
 async def get_all_recordings(
     page: int = 1,
@@ -2792,8 +4197,18 @@ async def add_model(model: dict):
     if not username:
         raise HTTPException(status_code=400, detail="Username requis")
 
+    requested_source = _normalize_source_type(
+        model.get("sourceType") or model.get("source_type")
+    )
+    source_type = requested_source or await _infer_source_type(username)
+    if source_type not in _available_source_types():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{source_type}' non disponible",
+        )
+
     # Vérifier si le modèle existe déjà
-    existing = await db.get_model(username)
+    existing = await db.get_model(username, source_type=source_type)
     if existing:
         raise HTTPException(status_code=409, detail="Modèle déjà existant")
 
@@ -2806,16 +4221,6 @@ async def add_model(model: dict):
         record_quality = await _get_default_record_quality()
     else:
         record_quality = 'best'
-    requested_source = _normalize_source_type(
-        model.get("sourceType") or model.get("source_type")
-    )
-    source_type = requested_source or await _infer_source_type(username)
-    if source_type not in _available_source_types():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Source '{source_type}' non disponible",
-        )
-
     if "retentionDays" in model and model.get("retentionDays") is not None:
         retention_days = _normalize_retention_days(model.get("retentionDays"))
     else:
@@ -2847,8 +4252,17 @@ async def add_model(model: dict):
 @app.put("/api/models/{username}")
 async def update_model(username: str, model_data: dict):
     """Met à jour les paramètres d'un modèle dans SQLite"""
+    requested_source = _normalize_source_type(
+        model_data.get('sourceType') or model_data.get('source_type')
+    )
+    if requested_source and requested_source not in _available_source_types():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source '{requested_source}' non disponible",
+        )
+
     # Vérifier si le modèle existe
-    existing = await db.get_model(username)
+    existing = await db.get_model(username, source_type=requested_source)
     if not existing:
         raise HTTPException(status_code=404, detail="Modèle introuvable")
     
@@ -2860,14 +4274,7 @@ async def update_model(username: str, model_data: dict):
     else:
         retention_days = existing.get("retention_days", 30)
 
-    requested_source = _normalize_source_type(
-        model_data.get('sourceType') or model_data.get('source_type')
-    )
-    if requested_source and requested_source not in _available_source_types():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Source '{requested_source}' non disponible",
-        )
+    source_type = requested_source or existing.get("source_type") or "chaturbate"
 
     # Mettre à jour dans SQLite
     await db.add_or_update_model(
@@ -2875,11 +4282,11 @@ async def update_model(username: str, model_data: dict):
         auto_record=model_data.get('autoRecord', existing.get('auto_record', True)),
         record_quality=model_data.get('recordQuality', existing.get('record_quality', 'best')),
         retention_days=retention_days,
-        source_type=requested_source,
+        source_type=source_type,
     )
     
     # Récupérer le modèle mis à jour
-    updated = await db.get_model(username)
+    updated = await db.get_model(username, source_type=source_type)
     
     return {
         "success": True,
@@ -2895,15 +4302,16 @@ async def update_model(username: str, model_data: dict):
 
 
 @app.delete("/api/models/{username}")
-async def delete_model(username: str):
+async def delete_model(username: str, source: Optional[str] = None):
     """Supprime un modèle de SQLite"""
+    source_type = _normalize_source_type(source)
     # Vérifier si le modèle existe
-    existing = await db.get_model(username)
+    existing = await db.get_model(username, source_type=source_type)
     if not existing:
         raise HTTPException(status_code=404, detail="Modèle introuvable")
     
     # Supprimer de SQLite
-    await db.delete_model(username)
+    await db.delete_model(username, source_type=source_type)
     
     # Récupérer la liste mise à jour
     all_models = await db.get_all_models()
@@ -3412,10 +4820,9 @@ async def get_recording_settings():
     show_ts_files = show_ts_val is not None and show_ts_val.lower() in {"1", "true", "yes"}
     auto_delete_watched = auto_delete_val is not None and auto_delete_val.lower() in {"1", "true", "yes"}
 
-    try:
-        auto_delete_threshold = int(auto_delete_threshold_val) if auto_delete_threshold_val is not None else 90
-    except (ValueError, TypeError):
-        auto_delete_threshold = 90
+    auto_delete_threshold = _normalize_watched_threshold(
+        auto_delete_threshold_val if auto_delete_threshold_val is not None else 90
+    )
 
     # Max recording resolution (0 = best available)
     max_res_val = await db.get_setting("max_resolution")
@@ -3436,6 +4843,7 @@ async def get_recording_settings():
     segment_duration_minutes = await _get_segment_duration_minutes()
     segment_size_mb = await _get_segment_size_mb()
     filename_format = normalize_filename_format(await db.get_setting("filename_format"))
+    check_interval_seconds = await get_check_interval_seconds(db)
 
     return {
         "auto_convert": auto_convert,
@@ -3449,6 +4857,8 @@ async def get_recording_settings():
         "segment_duration_minutes": segment_duration_minutes,
         "segment_size_mb": segment_size_mb,
         "filename_format": filename_format,
+        "check_interval": check_interval_seconds,
+        "check_interval_seconds": check_interval_seconds,
     }
 
 
@@ -3624,7 +5034,7 @@ async def update_recording_settings(body: dict):
     if "auto_delete_watched" in body:
         await db.set_setting("auto_delete_watched", str(body["auto_delete_watched"]).lower())
     if "auto_delete_threshold" in body:
-        threshold = max(0, min(100, int(body["auto_delete_threshold"])))
+        threshold = _normalize_watched_threshold(body["auto_delete_threshold"])
         await db.set_setting("auto_delete_threshold", str(threshold))
     if "max_resolution" in body:
         try:
@@ -3664,6 +5074,14 @@ async def update_recording_settings(body: dict):
             "filename_format",
             _normalize_filename_format_or_400(body["filename_format"]),
         )
+    if "check_interval_seconds" in body or "check_interval" in body:
+        try:
+            check_interval_seconds = normalize_check_interval_seconds(
+                body.get("check_interval_seconds", body.get("check_interval"))
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        await db.set_setting(CHECK_INTERVAL_SETTING_KEY, str(check_interval_seconds))
     if body.get("apply_default_retention_to_models"):
         if default_retention_days is None:
             default_retention_days = await _get_default_retention_days()
@@ -3705,15 +5123,6 @@ async def is_following_model(username: str):
 @app.patch("/api/models/{username}/auto-record")
 async def toggle_auto_record(username: str, body: dict):
     """Toggle auto-record for a model"""
-    existing = await db.get_model(username)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Model not found")
-
-    auto_record = body.get("autoRecord")
-    if auto_record is None:
-        raise HTTPException(status_code=400, detail="autoRecord field required")
-
-    new_auto = bool(auto_record)
     requested_source = _normalize_source_type(
         body.get("sourceType") or body.get("source_type")
     )
@@ -3722,6 +5131,16 @@ async def toggle_auto_record(username: str, body: dict):
             status_code=400,
             detail=f"Source '{requested_source}' non disponible",
         )
+    existing = await db.get_model(username, source_type=requested_source)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Model not found")
+
+    auto_record = body.get("autoRecord")
+    if auto_record is None:
+        raise HTTPException(status_code=400, detail="autoRecord field required")
+
+    source_type = requested_source or existing.get("source_type") or "chaturbate"
+    new_auto = bool(auto_record)
     was_auto = bool(existing.get("auto_record", False))
     record_quality = existing.get("record_quality", "best")
     # On the off -> on transition, apply the global default resolution so the
@@ -3734,13 +5153,13 @@ async def toggle_auto_record(username: str, body: dict):
         auto_record=new_auto,
         record_quality=record_quality,
         retention_days=existing.get("retention_days", 30),
-        source_type=requested_source,
+        source_type=source_type,
     )
     return {
         "success": True,
         "autoRecord": new_auto,
         "recordQuality": record_quality,
-        "sourceType": requested_source or existing.get("source_type") or "chaturbate",
+        "sourceType": source_type,
     }
 
 
@@ -3753,21 +5172,56 @@ async def get_playback_position(recording_id: str):
     """Get saved playback position for a recording"""
     pos = await db.get_playback_position(recording_id)
     if pos:
+        watched_threshold = await _get_watched_threshold()
+        is_watched = bool(pos.get("watched_at")) or _is_playback_watched(
+            pos["position_seconds"],
+            pos["duration_seconds"],
+            watched_threshold,
+        )
         return {
             "recordingId": recording_id,
             "position": pos["position_seconds"],
             "duration": pos["duration_seconds"],
+            "progress": _playback_progress(pos["position_seconds"], pos["duration_seconds"]),
+            "watchedThreshold": watched_threshold,
+            "isWatched": is_watched,
+            "watchedAt": pos.get("watched_at") or (pos.get("updated_at") if is_watched else None),
         }
-    return {"recordingId": recording_id, "position": 0, "duration": 0}
+    return {
+        "recordingId": recording_id,
+        "position": 0,
+        "duration": 0,
+        "progress": 0,
+        "watchedThreshold": await _get_watched_threshold(),
+        "isWatched": False,
+        "watchedAt": None,
+    }
 
 
 @app.post("/api/playback-position/{recording_id}")
 async def save_playback_position(recording_id: str, body: dict):
     """Save playback position for a recording. Auto-delete if threshold reached."""
-    position = body.get("position", 0)
-    duration = body.get("duration", 0)
+    try:
+        position = float(body.get("position", 0) or 0)
+    except (ValueError, TypeError):
+        position = 0
+    try:
+        duration = float(body.get("duration", 0) or 0)
+    except (ValueError, TypeError):
+        duration = 0
     username = body.get("username", "")
-    await db.save_playback_position(recording_id, username, position, duration)
+    watched_threshold = await _get_watched_threshold()
+    playback_progress = _playback_progress(position, duration)
+    position_reached_watched_threshold = _is_playback_watched(position, duration, watched_threshold)
+    await db.save_playback_position(
+        recording_id,
+        username,
+        position,
+        duration,
+        mark_watched=position_reached_watched_threshold,
+    )
+    saved_position = await db.get_playback_position(recording_id)
+    is_watched = bool((saved_position or {}).get("watched_at")) or position_reached_watched_threshold
 
     # Check auto-delete
     should_delete = False
@@ -3784,16 +5238,17 @@ async def save_playback_position(recording_id: str, body: dict):
             and auto_delete_val
             and auto_delete_val.lower() in {"1", "true", "yes"}
         ):
-            threshold_val = await db.get_setting("auto_delete_threshold")
-            try:
-                threshold = int(threshold_val) if threshold_val else 90
-            except (ValueError, TypeError):
-                threshold = 90
-            completion_pct = (position / duration) * 100
-            if completion_pct >= threshold:
+            if position_reached_watched_threshold:
                 should_delete = True
 
-    return {"success": True, "autoDelete": should_delete}
+    return {
+        "success": True,
+        "autoDelete": should_delete,
+        "isWatched": is_watched,
+        "progress": playback_progress,
+        "watchedThreshold": watched_threshold,
+        "watchedAt": (saved_position or {}).get("watched_at"),
+    }
 
 
 # ============================================
@@ -3858,8 +5313,6 @@ async def get_recordings_by_model(show_ts: bool = False):
 @app.post("/api/recordings/recalculate-durations")
 async def recalculate_all_durations():
     """Recalcule les durées de tous les enregistrements"""
-    from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
-    
     logger.info("API: Demande de recalcul des durées", endpoint="/api/recordings/recalculate-durations")
     
     try:
@@ -3877,7 +5330,7 @@ async def recalculate_all_durations():
 
 async def _recalculate_durations_task():
     """Tâche de recalcul des durées en arrière-plan"""
-    from app.tasks.monitor import get_video_duration, generate_recording_thumbnail
+    from app.tasks.monitor import generate_recording_thumbnail, get_media_created_at, get_video_duration
     
     logger.background_task("recalculate-durations", "Démarrage du recalcul")
     
@@ -3928,7 +5381,12 @@ async def _recalculate_durations_task():
                                 file_path=str(ts_file),
                                 file_size=ts_file.stat().st_size,
                                 duration_seconds=duration,
-                                thumbnail_path=thumbnail_path
+                                thumbnail_path=thumbnail_path,
+                                created_at=await get_media_created_at(
+                                    ts_file,
+                                    FFMPEG_PATH,
+                                    fallback_timestamp=int(ts_file.stat().st_mtime),
+                                ),
                             )
                             
                             total_updated += 1
@@ -4018,8 +5476,9 @@ async def auto_record_task():
                 if is_recording:
                     continue  # Déjà en cours
                 
+                source_hint = model.get("source_type") or "chaturbate"
                 # Vérifier le statut depuis le cache SQLite (mis à jour par monitor)
-                cached_status = await db.get_model(username)
+                cached_status = await db.get_model(username, source_type=source_hint)
                 
                 if cached_status and cached_status.get('is_online'):
                     # Modèle en ligne: résoudre le flux HLS
@@ -4043,6 +5502,7 @@ async def auto_record_task():
                         if _supports_browser_capture(source_type):
                             logger.background_task("auto-record", "Modèle WebRTC en ligne détecté", username=username)
                             try:
+                                await _ensure_browser_capture_session(source_type)
                                 sess = _start_browser_capture(
                                     source_type,
                                     username,
@@ -4061,6 +5521,11 @@ async def auto_record_task():
                                              session_id=sess.id)
                             except RuntimeError as e:
                                 logger.warning("Impossible démarrer browser capture",
+                                             task="auto-record",
+                                             username=username,
+                                             error=str(e))
+                            except ProviderError as e:
+                                logger.warning("Browser capture refusee",
                                              task="auto-record",
                                              username=username,
                                              error=str(e))
@@ -4247,6 +5712,7 @@ async def sync_cam4_following_task(cam4_auth):
                 continue
 
             items = await cam4_source.list_followed(cam4_auth.get_cookies())
+            synced = set()
             for item in items:
                 await db.upsert_followed_model(
                     username=item["username"],
@@ -4257,6 +5723,8 @@ async def sync_cam4_following_task(cam4_auth):
                     source_type="cam4",
                     room_status=item.get("room_status"),
                 )
+                synced.add(item["username"])
+            await db.remove_unfollowed(synced, source_type="cam4")
             if items:
                 repaired = await db.reconcile_model_sources_from_followed()
                 logger.debug("CAM4 following synced", count=len(items), task="cam4-sync")
@@ -4312,6 +5780,19 @@ async def startup_event():
     # Initialize Chaturbate auth service
     cb_auth = ChaturbateAuthService(db, flaresolverr)
     await cb_auth.initialize()
+    if CHATURBATE_USERNAME and CHATURBATE_PASSWORD:
+        try:
+            result = await cb_auth.login(CHATURBATE_USERNAME, CHATURBATE_PASSWORD)
+            if result.get("success"):
+                logger.info("Chaturbate auto-login succeeded", username=CHATURBATE_USERNAME)
+            else:
+                logger.warning(
+                    "Chaturbate auto-login failed",
+                    username=CHATURBATE_USERNAME,
+                    error=result.get("error"),
+                )
+        except Exception as exc:
+            logger.warning("Chaturbate auto-login error", username=CHATURBATE_USERNAME, error=str(exc))
 
     # Initialize CAM4 auth service (cookie-based session)
     global cam4_auth_service
@@ -4345,15 +5826,6 @@ async def startup_event():
     # Wire CAM4 router avec auth service
     cam4_router.init(cam4_auth_service, db)
 
-    # Auto-login if env vars are set
-    if CHATURBATE_USERNAME and CHATURBATE_PASSWORD:
-        logger.info("Auto-login Chaturbate", username=CHATURBATE_USERNAME)
-        result = await cb_auth.login(CHATURBATE_USERNAME, CHATURBATE_PASSWORD)
-        if result.get("success"):
-            logger.success("Chaturbate auto-login successful")
-        else:
-            logger.warning("Chaturbate auto-login failed", error=result.get("error"))
-
     # Démarrer les tâches de fond
     asyncio.create_task(monitor_models_task(
         db,
@@ -4365,13 +5837,13 @@ async def startup_event():
     ))
     asyncio.create_task(ffmpeg_watchdog_task())
     asyncio.create_task(auto_record_task())
+    asyncio.create_task(sync_following_task(cb_api, cb_auth))
+    asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))
     if MEDIA_IMPORTS_ENABLED:
         global media_import_manager
         media_import_manager = MediaImportManager(db, OUTPUT_DIR, FFMPEG_PATH)
         asyncio.create_task(media_imports_task(media_import_manager))
-    asyncio.create_task(sync_following_task(cb_api, cb_auth))
-    asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     logger.info("Background tasks démarrés",
-                tasks=["monitor", "ffmpeg-watchdog", "auto-record", "cleanup", "convert", "following-sync", "cam4-sync"])
+                tasks=["monitor", "ffmpeg-watchdog", "auto-record", "following-sync", "cam4-sync", "cleanup", "convert"])

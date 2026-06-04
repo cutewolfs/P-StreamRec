@@ -1,17 +1,22 @@
 import asyncio
 import unittest
+from pathlib import Path
 
 from app import main
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class HlsProxyTests(unittest.TestCase):
     def setUp(self):
         main._HLS_PROXY_CACHE.clear()
         main._HLS_PROXY_REVERSE.clear()
+        main._IVS_PLAYER_ASSET_CACHE.clear()
 
     def tearDown(self):
         main._HLS_PROXY_CACHE.clear()
         main._HLS_PROXY_REVERSE.clear()
+        main._IVS_PLAYER_ASSET_CACHE.clear()
 
     def test_rewrite_playlist_proxies_segments_and_keys(self):
         rewritten = main._rewrite_hls_playlist(
@@ -125,6 +130,64 @@ class HlsProxyTests(unittest.TestCase):
         self.assertNotIn("#EXT-X-ENDLIST", rewritten)
         self.assertIn(".mp4", rewritten)
 
+    def test_rewrite_stripchat_master_appends_mouflon_keys_to_variants(self):
+        rewritten = main._rewrite_hls_playlist(
+            "#EXTM3U\n"
+            "#EXT-X-MOUFLON:PSCH:v2:key-one\n"
+            "#EXT-X-MOUFLON:PSCH:v2:key-two\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000,NAME=\"source\"\n"
+            "https://media-hls.doppiocdn.net/live/model.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=1000,NAME=\"480p\"\n"
+            "https://media-hls.doppiocdn.net/live/model_480p.m3u8?minHeight=240\n",
+            "https://edge-hls.doppiocdn.net/hls/model/master.m3u8",
+        )
+
+        self.assertEqual(2, rewritten.count("/api/proxy/hls/"))
+        urls = {entry["url"] for entry in main._HLS_PROXY_CACHE.values()}
+        self.assertIn("https://media-hls.doppiocdn.net/live/model.m3u8?playlistType=lowLatency&psch=v2&pkey=key-one", urls)
+        self.assertIn(
+            "https://media-hls.doppiocdn.net/live/model_480p.m3u8?minHeight=240&playlistType=lowLatency&psch=v2&pkey=key-two",
+            urls,
+        )
+
+    def test_rewrite_stripchat_master_preserves_existing_playback_key(self):
+        main._rewrite_hls_playlist(
+            "#EXTM3U\n"
+            "#EXT-X-MOUFLON:PSCH:v2:key-one\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=2000,NAME=\"source\"\n"
+            "https://media-hls.doppiocdn.net/live/model.m3u8?minHeight=240&playlistType=standard&pkey=site-key\n",
+            "https://edge-hls.doppiocdn.net/hls/model/master.m3u8",
+        )
+
+        urls = {entry["url"] for entry in main._HLS_PROXY_CACHE.values()}
+        self.assertIn(
+            "https://media-hls.doppiocdn.net/live/model.m3u8?minHeight=240&playlistType=standard&pkey=site-key",
+            urls,
+        )
+
+    def test_rewrite_stripchat_media_playlist_uses_mouflon_segment_urls(self):
+        rewritten = main._rewrite_hls_playlist(
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:6\n"
+            "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            "#EXT-X-MOUFLON:URI:https://media-hls.doppiocdn.net/live/model_part0.mp4\n"
+            "#EXT-X-PART:DURATION=0.5,URI=\"https://media-hls.doppiocdn.net/live/media.mp4\"\n"
+            "#EXTINF:2.0,\n"
+            "#EXT-X-MOUFLON:URI:https://media-hls.doppiocdn.net/live/model_123.mp4\n"
+            "https://media-hls.doppiocdn.net/live/media.mp4\n",
+            "https://media-hls.doppiocdn.net/live/model.m3u8",
+        )
+
+        self.assertNotIn("#EXT-X-MOUFLON:URI", rewritten)
+        self.assertNotIn("#EXT-X-PART", rewritten)
+        self.assertIn("#EXTINF:0.5,", rewritten)
+        self.assertEqual(2, rewritten.count("/api/proxy/hls/"))
+        urls = {entry["url"] for entry in main._HLS_PROXY_CACHE.values()}
+        self.assertIn("https://media-hls.doppiocdn.net/live/init.mp4", urls)
+        self.assertIn("https://media-hls.doppiocdn.net/live/model_part0.mp4", urls)
+        self.assertNotIn("https://media-hls.doppiocdn.net/live/model_123.mp4", urls)
+        self.assertNotIn("https://media-hls.doppiocdn.net/live/media.mp4", urls)
+
     def test_ffmpeg_input_uses_local_proxy_for_livejasmin(self):
         stream = main.ResolvedStream(
             url="https://cdn.example.test/live/token",
@@ -144,7 +207,7 @@ class HlsProxyTests(unittest.TestCase):
         stream = main.ResolvedStream(
             url="https://cdn.example.test/live/master.m3u8",
             headers={"Referer": "https://example.test/model"},
-            source_type="streamate",
+            source_type="cams",
         )
 
         url, headers, source_url = main._ffmpeg_stream_input(stream)
@@ -167,6 +230,34 @@ class HlsProxyTests(unittest.TestCase):
         self.assertIn("/api/proxy/hls/", url)
         self.assertIsNone(headers)
         self.assertEqual(stream.url, source_url)
+
+    def test_watch_stream_payload_proxies_hls_by_default(self):
+        stream = main.ResolvedStream(
+            url="https://edge.example.test/live/channel.m3u8",
+            headers={"Referer": "https://example.test/live/alice"},
+            source_type="xcams",
+        )
+
+        payload = main._watch_stream_payload(stream)
+
+        self.assertNotIn("streamType", payload)
+        self.assertTrue(payload["streamUrl"].startswith("/api/proxy/hls/"))
+        self.assertEqual(1, len(main._HLS_PROXY_CACHE))
+
+    def test_watch_player_loads_ivs_script_from_local_vendor_route(self):
+        js = (ROOT / "static" / "watch.js").read_text()
+        html = (ROOT / "static" / "watch.html").read_text()
+
+        self.assertIn("/vendor/amazon-ivs-player.min.js", js)
+        self.assertNotIn("https://player.live-video.net/1.4.1/amazon-ivs-player.min.js", js)
+        self.assertIn("/static/watch.js?v=14", html)
+        self.assertIn("amazon-ivs-wasmworker.min.js", main.IVS_PLAYER_ASSETS)
+        self.assertIn("amazon-ivs-worker.min.js", main.IVS_PLAYER_ASSETS)
+        self.assertIn("amazon-ivs-wasmworker.min.wasm", main.IVS_PLAYER_ASSETS)
+
+    def test_stripchat_uses_hls_proxy_path(self):
+        self.assertFalse(main._supports_browser_capture("stripchat"))
+        self.assertFalse(main._supports_browser_capture("onlyfans"))
 
     def test_resolve_stream_rejects_discover_only_provider(self):
         class _Caps:

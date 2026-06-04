@@ -23,6 +23,10 @@ function isPrivateModel(model) {
   return isPrivateRoomStatus(model.room_status || model.roomStatus);
 }
 
+function isLiveFollowingModel(model) {
+  return isPubliclyOnline(model) || isPrivateModel(model);
+}
+
 // Render a small platform badge overlaid on the thumbnail.
 function renderPlatformBadge(sourceType) {
   var t = (sourceType || '').toLowerCase();
@@ -31,47 +35,68 @@ function renderPlatformBadge(sourceType) {
   return '<span class="' + cls + '" title="' + label + '">' + label + '</span>';
 }
 
-// State
-let trackedModels = new Set();
-let isLoggedIn = false;
-let followingProviders = [];
-
-async function fetchJsonWithTimeout(url, options, timeoutMs) {
-  timeoutMs = timeoutMs || 45000;
-  var controller = window.AbortController ? new AbortController() : null;
-  var timer = controller ? setTimeout(function() { controller.abort(); }, timeoutMs) : null;
-  try {
-    var requestOptions = options || {};
-    if (controller) requestOptions.signal = controller.signal;
-    var res = await fetch(url, requestOptions);
-    var data = await res.json().catch(function() { return {}; });
-    return { ok: res.ok, status: res.status, data: data };
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+function renderProviderBadge(sourceType) {
+  var t = (sourceType || '').toLowerCase();
+  var label = t.charAt(0).toUpperCase() + t.slice(1);
+  var cls = 'following-provider-badge platform-' + (t || 'unknown');
+  return '<span class="' + cls + '">' + escapeHtml(label) + '</span>';
 }
 
+function sourceKey(username, sourceType) {
+  return normalizeSourceType(sourceType || 'chaturbate') + ':' + (username || '');
+}
+
+// State
+let trackedModels = new Set();
+let followingProviders = [];
+let followingProviderMap = {};
+
 // ============================================
-// Check provider login status
+// Load provider capabilities
 // ============================================
 async function loadFollowingProviders() {
   try {
     var res = await fetch('/api/providers', { cache: 'no-store' });
     if (res.ok) {
       var data = await res.json();
-      followingProviders = (data.providers || []).filter(function(provider) {
-        var caps = provider.capabilities || {};
-        return caps.can_sync_following === true;
-      });
-      return followingProviders.some(function(provider) {
-        return provider.status && provider.status.isLoggedIn === true;
-      });
+      setFollowingProviders(data.providers || []);
+      return true;
     }
   } catch (e) {
     console.error('Error loading provider status:', e);
   }
   followingProviders = [];
+  followingProviderMap = {};
   return false;
+}
+
+function setFollowingProviders(providers) {
+  followingProviders = providers || [];
+  followingProviderMap = {};
+  followingProviders.forEach(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    if (sourceType) followingProviderMap[sourceType] = provider;
+  });
+}
+
+function mergeFollowingProviderSummaries(providers) {
+  if (!providers || !providers.length) return;
+  var merged = followingProviders.slice();
+  var indexBySource = {};
+  merged.forEach(function(provider, index) {
+    indexBySource[normalizeSourceType(provider.sourceType || provider.source_type)] = index;
+  });
+  providers.forEach(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    if (!sourceType) return;
+    if (indexBySource[sourceType] == null) {
+      indexBySource[sourceType] = merged.length;
+      merged.push(provider);
+    } else {
+      merged[indexBySource[sourceType]] = Object.assign({}, merged[indexBySource[sourceType]], provider);
+    }
+  });
+  setFollowingProviders(merged);
 }
 
 // ============================================
@@ -82,7 +107,9 @@ async function loadTrackedModels() {
     var res = await fetch('/api/models');
     if (res.ok) {
       var data = await res.json();
-      trackedModels = new Set((data.models || []).map(function(m) { return m.username; }));
+      trackedModels = new Set((data.models || []).map(function(m) {
+        return sourceKey(m.username, m.sourceType || m.source_type || 'chaturbate');
+      }));
     }
   } catch (e) {
     console.error('Error loading tracked models:', e);
@@ -97,6 +124,7 @@ async function loadFollowing() {
     var res = await fetch('/api/following');
     if (res.ok) {
       var data = await res.json();
+      mergeFollowingProviderSummaries(data.providers || []);
       return data.models || data.following || [];
     }
   } catch (e) {
@@ -109,53 +137,248 @@ async function loadFollowing() {
 // Render following models
 // ============================================
 function renderFollowing(models) {
-  var onlineGrid = document.getElementById('onlineGrid');
-  var offlineGrid = document.getElementById('offlineGrid');
-  var onlineSection = document.getElementById('onlineSection');
-  var offlineSection = document.getElementById('offlineSection');
-  var onlineCount = document.getElementById('onlineCount');
-  var offlineCount = document.getElementById('offlineCount');
+  var providerSections = document.getElementById('providerSections');
   var emptyFollowing = document.getElementById('emptyFollowing');
 
-  if (!models || models.length === 0) {
-    onlineSection.style.display = 'none';
-    offlineSection.style.display = 'none';
+  models = sortFollowingModels(models || []);
+
+  if (models.length === 0) {
+    providerSections.style.display = 'none';
     emptyFollowing.style.display = 'flex';
     return;
   }
 
   emptyFollowing.style.display = 'none';
+  providerSections.style.display = 'block';
+  providerSections.innerHTML = renderGlobalFollowingSection(models);
+}
 
-  var online = models.filter(function(m) {
-    return isPubliclyOnline(m) || isPrivateModel(m);
+function normalizeSourceType(sourceType) {
+  return (sourceType || '').toString().trim().toLowerCase();
+}
+
+function modelSourceType(model) {
+  return normalizeSourceType(model.source_type || model.platform || 'chaturbate');
+}
+
+function providerLabel(sourceType) {
+  var provider = followingProviderMap[normalizeSourceType(sourceType)] || {};
+  return provider.displayName || provider.display_name || sourceType || 'Unknown';
+}
+
+function providersForFollowing(models) {
+  var providerBySource = {};
+
+  followingProviders.forEach(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    if (!sourceType) return;
+    providerBySource[sourceType] = Object.assign({}, provider, { sourceType: sourceType });
   });
+
+  models.forEach(function(model) {
+    var sourceType = modelSourceType(model);
+    if (!providerBySource[sourceType]) {
+      var known = followingProviderMap[sourceType] || {};
+      providerBySource[sourceType] = Object.assign({
+        sourceType: sourceType,
+        displayName: providerLabel(sourceType),
+        capabilities: known.capabilities || {},
+        status: known.status || {}
+      }, known);
+    }
+  });
+
+  return Object.keys(providerBySource).map(function(sourceType) {
+    return providerBySource[sourceType];
+  }).sort(function(a, b) {
+    var aModels = modelsForProvider(models, a.sourceType || a.source_type).length;
+    var bModels = modelsForProvider(models, b.sourceType || b.source_type).length;
+    if (aModels !== bModels) return bModels - aModels;
+    return providerLabel(a.sourceType || a.source_type).localeCompare(providerLabel(b.sourceType || b.source_type));
+  });
+}
+
+function modelsForProvider(models, sourceType) {
+  var normalized = normalizeSourceType(sourceType);
+  return (models || []).filter(function(model) {
+    return modelSourceType(model) === normalized;
+  }).sort(compareFollowingModels);
+}
+
+function sortFollowingModels(models) {
+  return (models || []).slice().sort(compareFollowingModels);
+}
+
+function compareFollowingModels(a, b) {
+  var viewersA = modelViewers(a);
+  var viewersB = modelViewers(b);
+  if (viewersA !== viewersB) return viewersB - viewersA;
+  var rankA = modelStatusRank(a);
+  var rankB = modelStatusRank(b);
+  if (rankA !== rankB) return rankA - rankB;
+  var sourceCompare = providerLabel(modelSourceType(a)).localeCompare(providerLabel(modelSourceType(b)));
+  if (sourceCompare !== 0) return sourceCompare;
+  return (a.username || a.name || '').localeCompare(b.username || b.name || '');
+}
+
+function modelViewers(model) {
+  if (!isPubliclyOnline(model)) return 0;
+  var value = Number(model.viewers || model.num_viewers || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function modelStatusRank(model) {
+  if (isPubliclyOnline(model)) return 0;
+  if (isPrivateModel(model)) return 1;
+  return 2;
+}
+
+function providerCountForModels(models) {
+  var seen = {};
+  (models || []).forEach(function(model) {
+    seen[modelSourceType(model)] = true;
+  });
+  return Object.keys(seen).length;
+}
+
+function connectedFollowingProviders(models) {
+  var seen = {};
+  var sourceTypes = {};
+  (models || []).forEach(function(model) {
+    sourceTypes[modelSourceType(model)] = true;
+  });
+  return Object.keys(sourceTypes).map(function(sourceType) {
+    var provider = followingProviderMap[sourceType] || {};
+    return Object.assign({
+      sourceType: sourceType,
+      displayName: providerLabel(sourceType),
+      status: {},
+      capabilities: {}
+    }, provider);
+  }).filter(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    if (!sourceType || seen[sourceType]) return false;
+    seen[sourceType] = true;
+    return true;
+  });
+}
+
+function modelsMatchingSource(models, sourceType) {
+  var normalized = normalizeSourceType(sourceType);
+  return (models || []).filter(function(model) {
+    return modelSourceType(model) === normalized;
+  });
+}
+
+function renderConnectedProviderMeta(models) {
+  return connectedFollowingProviders(models).map(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    var providerModels = modelsMatchingSource(models, sourceType);
+    var online = providerModels.filter(function(model) { return isPubliclyOnline(model); }).length;
+    var name = providerLabel(sourceType).toUpperCase();
+    return '<span class="following-provider-counter">' +
+      '<span class="following-provider-counter-name">' + escapeHtml(name) + '</span>' +
+      ' <span class="following-provider-counter-count">' + online + '/' + providerModels.length + '</span>' +
+    '</span>';
+  }).join(' ');
+}
+
+function renderGlobalFollowingSection(models) {
+  var liveModels = models.filter(isLiveFollowingModel);
+  var offlineModels = models.filter(function(model) { return !isLiveFollowingModel(model); });
+  var meta = renderConnectedProviderMeta(models);
+  var body = renderProviderStatusGroup('Live online', liveModels, 'online') +
+    renderProviderStatusGroup('Offline', offlineModels, 'offline');
+
+  return '<section class="following-provider-section following-global-section">' +
+    '<div class="following-provider-header">' +
+      '<div>' +
+        '<div class="following-provider-title">' +
+          '<h2>All providers</h2>' +
+          '<span class="count">' + models.length + '</span>' +
+        '</div>' +
+        (meta ? '<div class="following-provider-meta following-provider-counters">' + meta + '</div>' : '') +
+      '</div>' +
+    '</div>' +
+    body +
+  '</section>';
+}
+
+function syncCapableFollowingProviders() {
+  return (followingProviders || []).filter(function(provider) {
+    var caps = provider.capabilities || {};
+    return caps.can_sync_following === true;
+  });
+}
+
+function providerCanStartSync(provider) {
+  var status = provider.status || {};
+  return status.isLoggedIn === true || status.hasSavedCredentials === true || status.hasSavedSessionData === true;
+}
+
+function renderProviderSection(provider, models) {
+  var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+  var displayName = provider.displayName || provider.display_name || providerLabel(sourceType);
+  var caps = provider.capabilities || {};
+  var status = provider.status || {};
+  var online = models.filter(isLiveFollowingModel);
   var offline = models.filter(function(m) {
-    return !isPubliclyOnline(m) && !isPrivateModel(m);
+    return !isLiveFollowingModel(m);
   });
+  var meta = providerMetaText(provider, models.length);
+  var body = '';
 
-  // Online section
-  if (online.length > 0) {
-    onlineSection.style.display = 'block';
-    onlineCount.textContent = online.length;
-    onlineGrid.innerHTML = online.map(function(model) { return renderFollowingCard(model); }).join('');
+  if (models.length) {
+    body += renderProviderStatusGroup('Online', online, 'online');
+    body += renderProviderStatusGroup('Offline', offline, 'offline');
   } else {
-    onlineSection.style.display = 'none';
+    body = '<div class="following-provider-empty">' + escapeHtml(emptyProviderText(provider)) + '</div>';
   }
 
-  // Offline section
-  if (offline.length > 0) {
-    offlineSection.style.display = 'block';
-    offlineCount.textContent = offline.length;
-    offlineGrid.innerHTML = offline.map(function(model) { return renderFollowingCard(model); }).join('');
-  } else {
-    offlineSection.style.display = 'none';
-  }
+  return '<section class="following-provider-section" data-source="' + escapeHtml(sourceType) + '">' +
+    '<div class="following-provider-header">' +
+      '<div>' +
+        '<div class="following-provider-title">' +
+          renderProviderBadge(sourceType) +
+          '<h2>' + escapeHtml(displayName) + '</h2>' +
+          '<span class="count">' + models.length + '</span>' +
+        '</div>' +
+        '<div class="following-provider-meta">' + escapeHtml(meta) + '</div>' +
+      '</div>' +
+    '</div>' +
+    body +
+  '</section>';
+}
+
+function renderProviderStatusGroup(label, models, kind) {
+  if (!models.length) return '';
+  var dot = kind === 'online' ? 'var(--success)' : 'var(--text-muted)';
+  return '<div class="following-provider-status-group">' +
+    '<div class="following-provider-status-title">' +
+      '<span style="color: ' + dot + ';">&#9679;</span>' +
+      '<span>' + label + '</span>' +
+      '<span class="count">' + models.length + '</span>' +
+    '</div>' +
+    '<div class="following-grid">' + models.map(function(model) { return renderFollowingCard(model); }).join('') + '</div>' +
+  '</div>';
+}
+
+function providerMetaText(provider, modelCount) {
+  var pieces = [];
+  pieces.push('Local follows');
+  if (modelCount === 0) pieces.push('none saved');
+  return pieces.join(' / ');
+}
+
+function emptyProviderText(provider) {
+  return 'No local follows saved for this provider.';
 }
 
 function renderFollowingCard(model) {
   var username = model.username || model.name || '';
   var thumbUrl = model.thumbnail_url || model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + username + '.jpg');
-  var isTracked = trackedModels.has(username);
+  var sourceType = model.source_type || model.platform || 'chaturbate';
+  var isTracked = trackedModels.has(sourceKey(username, sourceType));
   var isRecording = model.isRecording || model.is_recording || false;
   var isPrivate = isPrivateModel(model);
   var isOnline = isPubliclyOnline(model);
@@ -172,7 +395,6 @@ function renderFollowingCard(model) {
   }
 
   var platformBadge = renderPlatformBadge(model.source_type || model.platform || 'chaturbate');
-  var sourceType = model.source_type || model.platform || 'chaturbate';
   var watchHref = '/watch/' + encodeURIComponent(username) + '?source=' + encodeURIComponent(sourceType);
   var privateRibbon = isPrivate ? '<div class="following-private-ribbon">Private show</div>' : '';
 
@@ -221,15 +443,20 @@ function formatLastSeen(timestamp) {
 // ============================================
 // Track a followed model
 // ============================================
-async function trackFollowedModel(username, btn) {
-  if (trackedModels.has(username)) return;
+async function trackFollowedModel(username, sourceType, btn) {
+  if (typeof sourceType !== 'string') {
+    btn = sourceType;
+    sourceType = 'chaturbate';
+  }
+  sourceType = normalizeSourceType(sourceType || 'chaturbate');
+  if (trackedModels.has(sourceKey(username, sourceType))) return;
 
   btn.textContent = '...';
   btn.disabled = true;
 
   try {
     // Try the dedicated following track endpoint first
-    var res = await fetch('/api/following/' + username + '/track', {
+    var res = await fetch('/api/following/' + username + '/track?source_type=' + encodeURIComponent(sourceType), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' }
     });
@@ -242,13 +469,14 @@ async function trackFollowedModel(username, btn) {
         body: JSON.stringify({
           username: username,
           autoRecord: true,
-          recordQuality: 'best'
+          recordQuality: 'best',
+          sourceType: sourceType
         })
       });
     }
 
     if (res.ok || res.status === 409) {
-      trackedModels.add(username);
+      trackedModels.add(sourceKey(username, sourceType));
       btn.textContent = 'Tracked';
       btn.classList.add('tracked');
       btn.disabled = false;
@@ -267,77 +495,63 @@ async function trackFollowedModel(username, btn) {
 }
 
 // ============================================
-// Sync following list
+// Refresh local following list
 // ============================================
 async function syncFollowing() {
   var options = arguments[0] || {};
   var silent = options.silent === true;
-  var syncBtn = document.getElementById('syncBtn');
-  var syncIcon = document.getElementById('syncIcon');
-
-  if (syncBtn) syncBtn.classList.add('syncing');
-  if (syncIcon) syncIcon.style.animation = 'spin 1s linear infinite';
 
   try {
     if (!followingProviders.length) {
       await loadFollowingProviders();
     }
 
-    var targets = followingProviders.filter(function(provider) {
-      var caps = provider.capabilities || {};
-      return caps.can_sync_following === true && provider.status && provider.status.isLoggedIn === true;
-    });
-
-    if (!targets.length) {
-      if (!silent) showNotification('No connected provider to sync', 'error');
-      return [];
-    }
-
-    var synced = 0;
-    var failed = [];
-    for (var i = 0; i < targets.length; i += 1) {
-      var provider = targets[i];
-      try {
-        var result = await fetchJsonWithTimeout(
-          '/api/providers/' + encodeURIComponent(provider.sourceType) + '/following/sync',
-          { method: 'POST' },
-          45000
-        );
-        if (result.ok) {
-          synced += Number(result.data.synced || 0);
-        } else {
-          failed.push(provider.displayName || provider.sourceType);
-        }
-      } catch (e) {
-        failed.push(provider.displayName || provider.sourceType);
-      }
+    var providers = syncCapableFollowingProviders().filter(providerCanStartSync);
+    for (var i = 0; i < providers.length; i += 1) {
+      var sourceType = normalizeSourceType(providers[i].sourceType || providers[i].source_type);
+      await syncSingleProvider(sourceType, null, true);
     }
 
     var models = await loadFollowing();
     renderFollowing(models);
-    if (failed.length) {
-      if (!silent) showNotification('Sync incomplete: ' + failed.join(', '), 'error');
-    } else {
-      if (!silent) showNotification('Following list synced!', 'success');
-      updateLastSynced();
-    }
+    if (!silent) showNotification(providers.length ? 'Following synced' : 'Following list refreshed', 'success');
     return models;
   } catch (e) {
-    console.error('Error syncing following:', e);
+    console.error('Error refreshing following:', e);
     if (!silent) showNotification('Connection error', 'error');
     return [];
-  } finally {
-    if (syncBtn) syncBtn.classList.remove('syncing');
-    if (syncIcon) syncIcon.style.animation = '';
   }
 }
 
-function updateLastSynced() {
-  var el = document.getElementById('lastSynced');
-  if (el) {
-    var now = new Date();
-    el.textContent = 'Last synced: ' + now.toLocaleTimeString();
-    localStorage.setItem('following_last_synced', now.toISOString());
+async function syncSingleProvider(sourceType, button, silent) {
+  sourceType = normalizeSourceType(sourceType);
+  if (!sourceType) return false;
+  var originalText = button ? button.textContent : '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Syncing...';
+  }
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(sourceType) + '/following/sync', { method: 'POST' });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
+      if (!silent) showNotification(data.detail || 'Sync failed', 'error');
+      return false;
+    }
+    await loadFollowingProviders();
+    var models = await loadFollowing();
+    renderFollowing(models);
+    if (!silent) showNotification(data.message || 'Following synced', 'success');
+    return true;
+  } catch (e) {
+    console.error('Error syncing provider:', e);
+    if (!silent) showNotification('Connection error', 'error');
+    return false;
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   }
 }
 
@@ -395,9 +609,9 @@ function _bustChaturbateUrl(src) {
 
 async function refreshLiveThumbnails() {
   if (document.hidden) return;
-  var onlineGrid = document.getElementById('onlineGrid');
-  if (!onlineGrid) return;
-  var cards = onlineGrid.querySelectorAll('.following-card');
+  var providerSections = document.getElementById('providerSections');
+  if (!providerSections) return;
+  var cards = providerSections.querySelectorAll('.following-card.is-online, .following-card.is-private');
   if (!cards.length) return;
 
   cards.forEach(function(card) {
@@ -420,50 +634,15 @@ window.addEventListener('DOMContentLoaded', function() {
   style.textContent = '@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } } @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }';
   document.head.appendChild(style);
 
-  // Show last synced time from localStorage
-  var lastSynced = localStorage.getItem('following_last_synced');
-  if (lastSynced) {
-    var el = document.getElementById('lastSynced');
-    if (el) {
-      var date = new Date(lastSynced);
-      el.textContent = 'Last synced: ' + date.toLocaleString();
-    }
-  }
-
   var loadingState = document.getElementById('loadingState');
-  var loginBanner = document.getElementById('loginBanner');
-  var syncControls = document.getElementById('syncControls');
 
   // Load data
-  Promise.all([loadTrackedModels(), loadFollowingProviders()]).then(function(results) {
-    isLoggedIn = results[1];
-
+  Promise.all([loadTrackedModels(), loadFollowingProviders()]).then(function() {
     loadingState.style.display = 'none';
 
-    if (!isLoggedIn) {
-      // Not logged in - show banner but still try to load following
-      loginBanner.style.display = 'block';
-      syncControls.style.display = 'none';
-
-      // Try loading following anyway (might have cached data or public API)
-      loadFollowing().then(function(models) {
-        if (models.length > 0) {
-          syncControls.style.display = 'block';
-          renderFollowing(models);
-        }
-      });
-    } else {
-      // Logged in - show sync controls and load data
-      loginBanner.style.display = 'none';
-      syncControls.style.display = 'block';
-
-      loadFollowing().then(function(models) {
-        renderFollowing(models);
-        if (!models.length) {
-          syncFollowing({ silent: true });
-        }
-      });
-    }
+    loadFollowing().then(function(models) {
+      renderFollowing(models);
+    });
   }).catch(function(e) {
     console.error('Error initializing following page:', e);
     loadingState.innerHTML = '<div class="icon">&#9888;</div><p>Failed to load. Please try refreshing.</p>';

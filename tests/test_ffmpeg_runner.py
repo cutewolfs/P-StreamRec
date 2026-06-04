@@ -8,13 +8,16 @@ from app.ffmpeg_runner import FFmpegSession, _build_ffmpeg_command
 
 
 class FFmpegCommandTests(unittest.TestCase):
-    def _build(self, input_url):
+    def _build(self, input_url, **kwargs):
         with (
             patch("app.ffmpeg_runner.ffmpeg_http_proxy_url", return_value=None),
             patch("app.ffmpeg_runner.get_outbound_proxy_url", return_value=None),
             patch("app.ffmpeg_runner.is_socks_proxy", return_value=False),
         ):
-            return _build_ffmpeg_command("ffmpeg", input_url, "tee-output")
+            return _build_ffmpeg_command("ffmpeg", input_url, "tee-output", **kwargs)
+
+    def _maps(self, cmd):
+        return [cmd[i + 1] for i, part in enumerate(cmd) if part == "-map"]
 
     def _maps(self, cmd):
         return [cmd[index + 1] for index, value in enumerate(cmd) if value == "-map"]
@@ -83,19 +86,6 @@ class FFmpegCommandTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-extension_picky") + 1], "0")
         self.assertIn("-i", cmd)
 
-    def test_streamate_hls_skips_eof_reconnect(self):
-        cmd = self._build(
-            "https://manifest-server.naiadsystems.com/live/stream/playlist.m3u8"
-        )
-
-        self.assertNotIn("-reconnect", cmd)
-        self.assertNotIn("-reconnect_at_eof", cmd)
-        self.assertNotIn("-reconnect_streamed", cmd)
-        self.assertLess(cmd.index("-allowed_extensions"), cmd.index("-i"))
-        self.assertEqual(cmd[cmd.index("-allowed_extensions") + 1], "ALL")
-        self.assertLess(cmd.index("-allowed_segment_extensions"), cmd.index("-i"))
-        self.assertEqual(cmd[cmd.index("-allowed_segment_extensions") + 1], "ALL")
-
     def test_local_hls_proxy_skips_eof_reconnect(self):
         cmd = self._build("http://127.0.0.1:8080/api/proxy/hls/token.m3u8")
 
@@ -103,6 +93,23 @@ class FFmpegCommandTests(unittest.TestCase):
         self.assertNotIn("-reconnect_at_eof", cmd)
         self.assertNotIn("-reconnect_streamed", cmd)
         self.assertLess(cmd.index("-allowed_extensions"), cmd.index("-i"))
+        self.assertEqual(["0"], self._maps(cmd))
+
+    def test_proxied_chaturbate_llhls_uses_source_url_for_best_mapping(self):
+        cmd = self._build(
+            "http://127.0.0.1:8080/api/proxy/hls/token.m3u8",
+            source_url="https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+        )
+
+        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+
+    def test_chaturbate_llhls_height_cap_selects_matching_video_stream(self):
+        cmd = self._build(
+            "https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+            max_height=720,
+        )
+
+        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
 
     def test_provider_headers_are_passed_before_input(self):
         with (

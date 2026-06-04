@@ -4,25 +4,64 @@ Vérifie l'état en ligne, génère les miniatures et met à jour SQLite
 """
 import asyncio
 import aiohttp
+import json
+import re
 import subprocess
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
-from datetime import datetime
+from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
 
 if TYPE_CHECKING:
     from ..ffmpeg_runner import FFmpegManager
     from ..core.database import Database
 
 from ..logger import logger
-from ..core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS, OUTPUT_DIR
+from ..core.config import (
+    AUTO_RECORD_INTERVAL,
+    MIN_RECORDING_BYTES,
+    MIN_RECORDING_SECONDS,
+    OUTPUT_DIR,
+)
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 
 # Intervalle de vérification (en secondes)
-MONITOR_INTERVAL = 60  # Vérifie toutes les 60 secondes
+CHECK_INTERVAL_SETTING_KEY = "check_interval_seconds"
+MIN_CHECK_INTERVAL_SECONDS = 30
+MAX_CHECK_INTERVAL_SECONDS = 3600
+MONITOR_INTERVAL = AUTO_RECORD_INTERVAL
 THUMBNAIL_UPDATE_INTERVAL = 300  # Miniature offline: toutes les 5 minutes
 THUMBNAIL_UPDATE_INTERVAL_LIVE = 60  # Miniature live: toutes les 60s pour refléter l'activité
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
+
+
+def normalize_check_interval_seconds(value, default: int = MONITOR_INTERVAL) -> int:
+    try:
+        interval = int(value)
+    except (ValueError, TypeError):
+        interval = default
+
+    if interval < MIN_CHECK_INTERVAL_SECONDS:
+        raise ValueError(f"check interval must be at least {MIN_CHECK_INTERVAL_SECONDS} seconds")
+    if interval > MAX_CHECK_INTERVAL_SECONDS:
+        raise ValueError(f"check interval must be at most {MAX_CHECK_INTERVAL_SECONDS} seconds")
+    return interval
+
+
+async def get_check_interval_seconds(db: 'Database') -> int:
+    raw = await db.get_setting(CHECK_INTERVAL_SETTING_KEY)
+    try:
+        return normalize_check_interval_seconds(
+            raw if raw is not None else AUTO_RECORD_INTERVAL
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Intervalle de monitoring invalide, fallback env",
+            task="monitor",
+            value=raw,
+            error=str(exc),
+        )
+        return normalize_check_interval_seconds(AUTO_RECORD_INTERVAL)
 
 async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> bool:
     """Check if a model is live using the Chaturbate thumbnail CDN.
@@ -338,6 +377,152 @@ async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> in
     return 0
 
 
+_RECORDED_AT_TAG_KEYS = (
+    "creation_time",
+    "com.apple.quicktime.creationdate",
+    "date_utc",
+    "date-utc",
+    "encoded_date",
+    "tagged_date",
+    "creation_date",
+    "creationdate",
+    "date",
+)
+
+
+def _normalize_metadata_key(key: object) -> str:
+    return re.sub(r"[\s_-]+", "", str(key or "").strip().lower())
+
+
+def _parse_metadata_timestamp(value: object) -> int | None:
+    raw = str(value or "").strip().strip("\x00")
+    if not raw or raw.upper() in {"N/A", "NONE", "NULL"}:
+        return None
+
+    candidate = raw
+    if candidate.upper().startswith("UTC "):
+        candidate = candidate[4:].strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    if re.search(r"[+-]\d{4}$", candidate):
+        candidate = f"{candidate[:-5]}{candidate[-5:-2]}:{candidate[-2:]}"
+    if re.match(r"^\d{4}:\d{2}:\d{2}", candidate):
+        candidate = candidate.replace(":", "-", 2)
+
+    formats = (
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    )
+
+    parsed: datetime | None = None
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        for fmt in formats:
+            try:
+                parsed = datetime.strptime(candidate, fmt)
+                break
+            except ValueError:
+                continue
+
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    try:
+        return int(parsed.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _parse_video_recorded_at(probe_data: dict[str, Any]) -> int | None:
+    tag_maps: list[dict[str, Any]] = []
+    format_tags = (probe_data.get("format") or {}).get("tags")
+    if isinstance(format_tags, dict):
+        tag_maps.append(format_tags)
+    for stream in probe_data.get("streams") or []:
+        if isinstance(stream, dict) and isinstance(stream.get("tags"), dict):
+            tag_maps.append(stream["tags"])
+
+    wanted_keys = [_normalize_metadata_key(key) for key in _RECORDED_AT_TAG_KEYS]
+    for wanted_key in wanted_keys:
+        for tags in tag_maps:
+            for key, value in tags.items():
+                if _normalize_metadata_key(key) == wanted_key:
+                    parsed = _parse_metadata_timestamp(value)
+                    if parsed is not None:
+                        return parsed
+
+    for tags in tag_maps:
+        for key, value in tags.items():
+            normalized = _normalize_metadata_key(key)
+            if "date" in normalized or ("creation" in normalized and "time" in normalized):
+                parsed = _parse_metadata_timestamp(value)
+                if parsed is not None:
+                    return parsed
+    return None
+
+
+async def get_video_recorded_at(file_path: Path, ffmpeg_path: str = "ffmpeg") -> int | None:
+    """Read the media/container recorded date from ffprobe metadata tags."""
+    try:
+        ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
+
+        process = await asyncio.create_subprocess_exec(
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags:stream_tags",
+            "-of",
+            "json",
+            str(file_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        if process.returncode == 0 and stdout:
+            return _parse_video_recorded_at(json.loads(stdout.decode("utf-8", errors="replace")))
+    except Exception as e:
+        logger.debug("Erreur récupération date metadata vidéo", file_path=str(file_path), error=str(e))
+
+    return None
+
+
+def recording_timestamp_from_filename(filename: str) -> int | None:
+    match = re.match(r"^(\d{8})_(\d{6})", Path(filename).stem)
+    if not match:
+        return None
+    try:
+        parsed = datetime.strptime(f"{match.group(1)}_{match.group(2)}", "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+    return int(parsed.timestamp())
+
+
+async def get_media_created_at(
+    file_path: Path,
+    ffmpeg_path: str = "ffmpeg",
+    fallback_timestamp: int | None = None,
+) -> int:
+    recorded_at = await get_video_recorded_at(file_path, ffmpeg_path)
+    if recorded_at is not None:
+        return recorded_at
+    filename_at = recording_timestamp_from_filename(file_path.name)
+    if filename_at is not None:
+        return filename_at
+    if fallback_timestamp is not None:
+        return int(fallback_timestamp)
+    try:
+        return int(file_path.stat().st_mtime)
+    except OSError:
+        return int(datetime.now(tz=timezone.utc).timestamp())
+
+
 async def generate_recording_thumbnail(
     ts_file: Path,
     output_dir: Path,
@@ -519,6 +704,19 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                 # Extraire le timestamp du nom de fichier (format: YYYYMMDD_HHMMSS_xxx.ts)
                 # Sinon générer un nouveau recording_id
                 recording_id = f"{username}_{ts_file.stem}"
+
+            existing_created_at = int((existing_rec or {}).get('created_at') or 0)
+            created_at = existing_created_at
+            filename_created_at = recording_timestamp_from_filename(ts_file.name)
+            if (
+                created_at in {0, int(stat.st_mtime)}
+                or (filename_created_at is not None and created_at != filename_created_at)
+            ):
+                created_at = await get_media_created_at(
+                    ts_file,
+                    ffmpeg_path,
+                    fallback_timestamp=int(stat.st_mtime),
+                )
             
             await db.add_or_update_recording(
                 username=username,
@@ -527,7 +725,8 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                 file_size=stat.st_size,
                 recording_id=recording_id,
                 duration_seconds=duration_seconds,
-                thumbnail_path=thumbnail_path
+                thumbnail_path=thumbnail_path,
+                created_at=created_at,
             )
     
     except Exception as e:
@@ -560,13 +759,25 @@ async def monitor_models_task(
 
     await db.initialize()
 
+    async def sleep_until_next_check():
+        try:
+            interval = await get_check_interval_seconds(db)
+        except Exception as exc:
+            logger.warning(
+                "Impossible de lire l'intervalle de monitoring",
+                task="monitor",
+                error=str(exc),
+            )
+            interval = MONITOR_INTERVAL
+        await asyncio.sleep(interval)
+
     async with aiohttp_client_session() as session:
         while True:
             try:
                 models = await db.get_all_models()
 
                 if not models:
-                    await asyncio.sleep(MONITOR_INTERVAL)
+                    await sleep_until_next_check()
                     continue
 
                 logger.debug("Vérification des modèles", count=len(models))
@@ -678,6 +889,7 @@ async def monitor_models_task(
                             is_recording=is_recording,
                             thumbnail_path=thumbnail_path,
                             room_status=status.get('room_status'),
+                            source_type=source_type,
                         )
                         
                         # Mettre à jour le cache des enregistrements
@@ -697,10 +909,10 @@ async def monitor_models_task(
                         continue
                 
                 # Attendre avant la prochaine vérification
-                await asyncio.sleep(MONITOR_INTERVAL)
+                await sleep_until_next_check()
             
             except Exception as e:
                 logger.error("Erreur dans monitor task",
                            error=str(e),
                            exc_info=True)
-                await asyncio.sleep(60)
+                await sleep_until_next_check()
