@@ -34,7 +34,7 @@ jobs:
           sh -n docker/entrypoint.sh
 
   build-and-push:
-    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'beta'
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main' || github.ref_name == 'beta'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
