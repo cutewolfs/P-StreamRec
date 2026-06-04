@@ -50,6 +50,11 @@ from .tasks.media_imports import (
     SUPPORTED_VIDEO_EXTENSIONS,
     title_from_filename,
 )
+from .recording_names import (
+    ALLOWED_FILENAME_FORMATS,
+    FILENAME_FORMAT_TIMESTAMP,
+    normalize_filename_format,
+)
 from .services.flaresolverr import FlareSolverrClient
 from .services.chaturbate_auth import ChaturbateAuthService
 from .services.chaturbate_api import ChaturbateAPI
@@ -1552,6 +1557,7 @@ def _start_browser_capture(
     person: str,
     display_name: Optional[str] = None,
     record: bool = True,
+    filename_format: str = FILENAME_FORMAT_TIMESTAMP,
 ):
     provider = _provider_for(source_type)
     normalized_source = (source_type or "").strip().lower()
@@ -1569,6 +1575,7 @@ def _start_browser_capture(
         display_name=display_name or target,
         record=record,
         capture_mode=capture_mode,
+        filename_format=filename_format,
     )
 
 
@@ -2696,6 +2703,7 @@ async def api_start(body: StartBody):
     if not record_quality and model_settings:
         record_quality = model_settings.get("record_quality")
     max_height = await _get_recording_height_for_quality(record_quality)
+    filename_format = await _get_recording_filename_format()
 
     # Determine source type
     stype = requested_source or await _infer_source_type(person or target, model_settings)
@@ -2738,6 +2746,7 @@ async def api_start(body: StartBody):
                     person=person,
                     display_name=body.name or target,
                     record=True,
+                    filename_format=filename_format,
                 )
                 ready = await asyncio.to_thread(sess.wait_until_ready, 35)
                 if not ready:
@@ -2818,6 +2827,7 @@ async def api_start(body: StartBody):
             segment_size_bytes=segment_size_bytes,
             input_headers=stream_headers,
             source_url=source_url,
+            filename_format=filename_format,
         )
         duration_ms = (time.time() - start_time) * 1000
         logger.success("Session créée avec succès", 
@@ -4832,6 +4842,7 @@ async def get_recording_settings():
     default_retention_days = await _get_default_retention_days()
     segment_duration_minutes = await _get_segment_duration_minutes()
     segment_size_mb = await _get_segment_size_mb()
+    filename_format = normalize_filename_format(await db.get_setting("filename_format"))
     check_interval_seconds = await get_check_interval_seconds(db)
 
     return {
@@ -4845,6 +4856,7 @@ async def get_recording_settings():
         "default_retention_days": default_retention_days,
         "segment_duration_minutes": segment_duration_minutes,
         "segment_size_mb": segment_size_mb,
+        "filename_format": filename_format,
         "check_interval": check_interval_seconds,
         "check_interval_seconds": check_interval_seconds,
     }
@@ -4904,6 +4916,16 @@ def _normalize_segment_size_mb(value, default: int = 0) -> int:
     return size_mb
 
 
+def _normalize_filename_format_or_400(value) -> str:
+    filename_format = str(value or "").strip().lower()
+    if filename_format not in ALLOWED_FILENAME_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"filename_format must be one of {sorted(ALLOWED_FILENAME_FORMATS)}",
+        )
+    return filename_format
+
+
 async def _get_segment_duration_minutes() -> int:
     from .core.config import RECORD_SEGMENT_DURATION_MINUTES
 
@@ -4932,6 +4954,10 @@ async def _get_recording_segment_limits() -> tuple[int, int]:
     duration_minutes = await _get_segment_duration_minutes()
     size_mb = await _get_segment_size_mb()
     return duration_minutes * 60, size_mb * 1024 * 1024
+
+
+async def _get_recording_filename_format() -> str:
+    return normalize_filename_format(await db.get_setting("filename_format"))
 
 
 async def _get_max_recording_height() -> Optional[int]:
@@ -5043,6 +5069,11 @@ async def update_recording_settings(body: dict):
     if "segment_size_mb" in body:
         segment_size_mb = _normalize_segment_size_mb(body["segment_size_mb"])
         await db.set_setting("segment_size_mb", str(segment_size_mb))
+    if "filename_format" in body:
+        await db.set_setting(
+            "filename_format",
+            _normalize_filename_format_or_400(body["filename_format"]),
+        )
     if "check_interval_seconds" in body or "check_interval" in body:
         try:
             check_interval_seconds = normalize_check_interval_seconds(
@@ -5453,7 +5484,9 @@ async def auto_record_task():
                     # Modèle en ligne: résoudre le flux HLS
                     try:
                         hls_source = None
+                        hls_source_url = None
                         stream_headers = None
+                        filename_format = await _get_recording_filename_format()
                         max_height = await _get_recording_height_for_quality(
                             cached_status.get("record_quality")
                         )
@@ -5476,6 +5509,7 @@ async def auto_record_task():
                                     person=username,
                                     display_name=username,
                                     record=True,
+                                    filename_format=filename_format,
                                 )
                                 ready = await asyncio.to_thread(sess.wait_until_ready, 35)
                                 if not ready:
@@ -5500,7 +5534,7 @@ async def auto_record_task():
                                 resolved = await _resolve_stream(
                                     source_type, username, max_height
                                 )
-                                hls_source, stream_headers, source_url = _ffmpeg_stream_input(resolved)
+                                hls_source, stream_headers, hls_source_url = _ffmpeg_stream_input(resolved)
                             except Exception as e:
                                 logger.debug(
                                     "Auto-record resolve échec",
@@ -5523,7 +5557,8 @@ async def auto_record_task():
                                     segment_duration_seconds=segment_duration_seconds,
                                     segment_size_bytes=segment_size_bytes,
                                     input_headers=stream_headers,
-                                    source_url=source_url,
+                                    source_url=hls_source_url,
+                                    filename_format=filename_format,
                                 )
 
                                 if sess:

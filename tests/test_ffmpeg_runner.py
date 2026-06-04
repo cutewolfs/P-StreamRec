@@ -1,7 +1,10 @@
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
-from app.ffmpeg_runner import _build_ffmpeg_command
+from app.ffmpeg_runner import FFmpegSession, _build_ffmpeg_command
 
 
 class FFmpegCommandTests(unittest.TestCase):
@@ -15,6 +18,9 @@ class FFmpegCommandTests(unittest.TestCase):
 
     def _maps(self, cmd):
         return [cmd[i + 1] for i, part in enumerate(cmd) if part == "-map"]
+
+    def _maps(self, cmd):
+        return [cmd[index + 1] for index, value in enumerate(cmd) if value == "-map"]
 
     def test_chaturbate_cdn_uses_persistent_http_before_input(self):
         cmd = self._build("https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8")
@@ -31,6 +37,38 @@ class FFmpegCommandTests(unittest.TestCase):
         self.assertIn("Referer: https://chaturbate.com/", headers)
         self.assertIn("Origin: https://chaturbate.com", headers)
         self.assertIn("Connection: keep-alive", headers)
+        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+
+    def test_chaturbate_llhls_720p_uses_single_capped_variant(self):
+        with (
+            patch("app.ffmpeg_runner.ffmpeg_http_proxy_url", return_value=None),
+            patch("app.ffmpeg_runner.get_outbound_proxy_url", return_value=None),
+            patch("app.ffmpeg_runner.is_socks_proxy", return_value=False),
+        ):
+            cmd = _build_ffmpeg_command(
+                "ffmpeg",
+                "https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+                "tee-output",
+                max_height=720,
+            )
+
+        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
+
+    def test_proxied_chaturbate_llhls_uses_source_url_for_mapping(self):
+        with (
+            patch("app.ffmpeg_runner.ffmpeg_http_proxy_url", return_value=None),
+            patch("app.ffmpeg_runner.get_outbound_proxy_url", return_value=None),
+            patch("app.ffmpeg_runner.is_socks_proxy", return_value=False),
+        ):
+            cmd = _build_ffmpeg_command(
+                "ffmpeg",
+                "http://127.0.0.1:8080/api/proxy/hls/token.m3u8",
+                "tee-output",
+                source_url="https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+            )
+
+        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+        self.assertNotIn("-reconnect_at_eof", cmd)
 
     def test_non_chaturbate_hls_keeps_default_http_behavior(self):
         cmd = self._build("https://example.com/live/test/playlist.m3u8")
@@ -94,6 +132,59 @@ class FFmpegCommandTests(unittest.TestCase):
         headers = cmd[cmd.index("-headers") + 1]
         self.assertIn("Referer: https://example.com/model", headers)
         self.assertIn("Cookie: session=secret", headers)
+
+
+class FixedDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 5, 27, 12, 34, 56)
+        return value if tz is None else value.replace(tzinfo=tz)
+
+    @classmethod
+    def utcnow(cls):
+        return cls(2026, 5, 27, 16, 34, 56)
+
+
+class FFmpegFilenameTests(unittest.TestCase):
+    def _session(self, root: Path, **kwargs):
+        with patch("app.ffmpeg_runner.datetime", FixedDatetime):
+            return FFmpegSession(
+                session_id="abcdef1234",
+                input_url="https://example.test/live.m3u8",
+                sessions_dir=str(root / "sessions"),
+                records_dir_for_person=str(root / "records" / "model"),
+                person="model",
+                **kwargs,
+            )
+
+    def test_default_filename_keeps_timestamp_session_id_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._session(Path(tmp))
+
+        self.assertEqual("20260527_123456_abcdef.ts", session.record_filename)
+
+    def test_username_timestamp_filename_omits_session_id_until_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = root / "records" / "model"
+            records.mkdir(parents=True)
+
+            session = self._session(root, filename_format="username_timestamp")
+            self.assertEqual("model_20260527-123456.ts", session.record_filename)
+
+            (records / session.record_filename).write_bytes(b"existing")
+            collision = self._session(root, filename_format="username_timestamp")
+            self.assertEqual("model_20260527-123456_abcdef.ts", collision.record_filename)
+
+    def test_username_timestamp_segmented_filename_uses_part_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = self._session(
+                Path(tmp),
+                filename_format="username_timestamp",
+                segment_duration_seconds=1800,
+            )
+
+        self.assertEqual("model_20260527-123456_part001.ts", session.record_filename)
 
 
 if __name__ == "__main__":

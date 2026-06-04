@@ -503,6 +503,7 @@ async function loadRecordingSettings() {
       var defaultRetentionInput = document.getElementById('defaultRetentionInput');
       var segmentDurationSelect = document.getElementById('segmentDurationSelect');
       var segmentSizeInput = document.getElementById('segmentSizeInput');
+      var filenameFormatSelect = document.getElementById('filenameFormatSelect');
       var checkIntervalInput = document.getElementById('checkIntervalInput');
 
       if (autoConvertToggle) autoConvertToggle.checked = !!data.auto_convert;
@@ -533,6 +534,9 @@ async function loadRecordingSettings() {
       }
       if (segmentSizeInput) {
         segmentSizeInput.value = normalizeSegmentSizeMb(data.segment_size_mb);
+      }
+      if (filenameFormatSelect) {
+        filenameFormatSelect.value = data.filename_format || 'timestamp';
       }
       if (checkIntervalInput) {
         setCheckIntervalInput(data.check_interval_seconds || data.check_interval);

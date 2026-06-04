@@ -13,6 +13,10 @@ from .core.http_client import (
     is_socks_proxy,
 )
 from .core.config import MIN_RECORDING_SECONDS
+from .recording_names import (
+    FILENAME_FORMAT_TIMESTAMP,
+    recording_base_name,
+)
 
 # Chaturbate LL-HLS master playlists multiplex all quality levels into one stream.
 # Each entry maps a max_height ceiling to the ffmpeg video stream index.
@@ -165,16 +169,17 @@ def _build_ffmpeg_command(
 
     cmd.extend(_hls_input_args(input_url, input_headers))
 
+    stream_identity_url = source_url or input_url
+
     # For Chaturbate LL-HLS master playlists, the master URL contains both
     # video variants and a separate audio rendition group. The FFmpeg transport
     # URL may be the local HLS proxy, so use the original upstream URL for this
     # detection when available.
-    stream_identity_url = source_url or input_url
-    is_llhls = (
-        'llhls.m3u8' in stream_identity_url.lower()
+    is_chaturbate_llhls = (
+        "llhls.m3u8" in stream_identity_url.lower()
         and _is_chaturbate_hls_url(stream_identity_url)
     )
-    if is_llhls:
+    if is_chaturbate_llhls:
         v_idx = _llhls_video_stream_index(max_height)
         map_args = ["-map", f"0:v:{v_idx}", "-map", "0:a:0"]
     else:
@@ -202,6 +207,7 @@ class FFmpegSession:
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
+        filename_format: str = FILENAME_FORMAT_TIMESTAMP,
     ):
         self.id = session_id
         self.input_url = input_url
@@ -219,10 +225,13 @@ class FFmpegSession:
         self.process: Optional[subprocess.Popen] = None
         # Playback HLS is served from /streams/sessions/<id>/stream.m3u8
         self.playback_url = f"/streams/sessions/{self.id}/stream.m3u8"
-        self.record_base = f"{self.start_timestamp}_{session_id[:6]}"
+        self.filename_format = filename_format
         self.segment_duration_seconds = max(0, int(segment_duration_seconds or 0))
         self.segment_size_bytes = max(0, int(segment_size_bytes or 0))
         self.segment_enabled = self.segment_duration_seconds > 0 or self.segment_size_bytes > 0
+        self.record_base = self._unique_record_base(
+            recording_base_name(person, self.start_timestamp, session_id, filename_format)
+        )
         self.segment_index = 1
         # Recording file using unique name: YYYYMMDD_HHMMSS_ID.ts. Segmented
         # sessions append _partNNN only when segmentation is enabled.
@@ -244,7 +253,8 @@ class FFmpegSession:
                     sessions_dir=sessions_dir,
                     records_dir=records_dir_for_person,
                     segment_duration_seconds=self.segment_duration_seconds,
-                    segment_size_bytes=self.segment_size_bytes)
+                    segment_size_bytes=self.segment_size_bytes,
+                    filename_format=self.filename_format)
 
     def is_running(self) -> bool:
         if self.process is None:
@@ -265,6 +275,13 @@ class FFmpegSession:
         if self.segment_enabled:
             return f"{self.record_base}_part{segment_index:03d}.ts"
         return f"{self.record_base}.ts"
+
+    def _unique_record_base(self, base: str) -> str:
+        first_name = f"{base}_part001.ts" if self.segment_enabled else f"{base}.ts"
+        first_path = os.path.join(self.records_dir_for_person, first_name)
+        if not os.path.exists(first_path):
+            return base
+        return f"{base}_{self.id[:6]}"
 
     def _advance_segment_path(self):
         self.segment_index += 1
@@ -546,6 +563,7 @@ class FFmpegManager:
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
+        filename_format: str = FILENAME_FORMAT_TIMESTAMP,
     ) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
@@ -580,6 +598,7 @@ class FFmpegManager:
                 segment_size_bytes=segment_size_bytes,
                 input_headers=input_headers,
                 source_url=source_url,
+                filename_format=filename_format,
             )
 
             # Build tee spec: one branch to stdout (pipe:1) as MPEG-TS, one for HLS playback

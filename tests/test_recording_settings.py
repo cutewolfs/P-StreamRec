@@ -4,8 +4,8 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from app.core.database import Database
 from app import main as app_main
+from app.core.database import Database
 from app.tasks.monitor import get_check_interval_seconds
 
 
@@ -42,6 +42,26 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn("at least 30 seconds", ctx.exception.detail)
+
+    async def test_filename_format_defaults_to_timestamp(self):
+        settings = await app_main.get_recording_settings()
+
+        self.assertEqual("timestamp", settings["filename_format"])
+
+    async def test_filename_format_can_be_saved(self):
+        settings = await app_main.update_recording_settings(
+            {"filename_format": "username_timestamp"}
+        )
+
+        self.assertEqual("username_timestamp", settings["filename_format"])
+        self.assertEqual(
+            "username_timestamp",
+            await app_main.db.get_setting("filename_format"),
+        )
+
+    async def test_invalid_filename_format_is_rejected(self):
+        with self.assertRaises(HTTPException):
+            await app_main.update_recording_settings({"filename_format": "template"})
 
 
 if __name__ == "__main__":

@@ -15,6 +15,29 @@ MAX_CONVERSION_ATTEMPTS = 3
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
 
 
+def _video_stream_map_from_probe(probe_data: dict) -> str:
+    streams = probe_data.get("streams") if isinstance(probe_data, dict) else None
+    if not isinstance(streams, list) or not streams:
+        return "0:v:0"
+
+    def numeric(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked = sorted(
+        enumerate(streams),
+        key=lambda item: (
+            numeric(item[1].get("height") or item[1].get("coded_height")),
+            numeric(item[1].get("width") or item[1].get("coded_width")),
+            numeric(item[1].get("bit_rate")),
+        ),
+        reverse=True,
+    )
+    return f"0:v:{ranked[0][0]}"
+
+
 def _select_best_video_stream_map(probe_data: dict) -> str:
     """Return an FFmpeg -map value for the highest-quality video stream."""
     candidates = []
@@ -91,12 +114,11 @@ async def convert_ts_to_mp4(
                ts_file=ts_path.name,
                mp4_file=mp4_path.name)
 
-    video_map = await _best_video_stream_map(ts_path, ffmpeg_path)
-
     # Remux only: the HLS source is already H.264+AAC, so copying codecs
     # produces a valid MP4 almost instantly with near-zero CPU usage. Keep a
     # conventional video-then-audio stream order for broad player compatibility.
     # -bsf:a aac_adtstoasc : reformat ADTS AAC (TS) into MP4-friendly ASC
+    video_map = await _best_video_stream_map(ts_path, ffmpeg_path)
     cmd = [
         ffmpeg_path,
         "-nostdin", "-hide_banner", "-loglevel", "error",
