@@ -8,7 +8,7 @@ services:
       - LOG_LEVEL=info
       - TZ=${TZ:-America/Toronto}
     ports:
-      - "${FLARESOLVERR_PORT:-8191}:8191"
+      - "8191:8191"
     restart: unless-stopped
 
   p-streamrec:
@@ -39,8 +39,6 @@ services:
       # Chaturbate Authentication
       - CHATURBATE_USERNAME=${CHATURBATE_USERNAME:-}
       - CHATURBATE_PASSWORD=${CHATURBATE_PASSWORD:-}
-      # FlareSolverr
-      - FLARESOLVERR_URL=${FLARESOLVERR_URL:-http://flaresolverr:8191}
       # Optional outbound proxy for provider requests (HTTP(S) or SOCKS for Python resolvers)
       - PSTREAMREC_PROXY_URL=${PSTREAMREC_PROXY_URL:-}
       - HTTP_PROXY=${HTTP_PROXY:-}

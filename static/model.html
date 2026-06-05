@@ -829,10 +829,10 @@
               id="settingsAutoRecord"
               style="width: 20px; height: 20px; cursor: pointer; accent-color: var(--accent);"
             />
-            <span>🤖 Auto-record</span>
+            <span>Recording enabled</span>
           </label>
           <small style="color: var(--text-secondary); font-size: 0.875rem; margin-top: 0.5rem; display: block; margin-left: 2rem;">
-            Server automatically records when model goes online (checked every 2 minutes)
+            Server records when model goes online (checked every 2 minutes)
           </small>
         </div>
         
@@ -1920,8 +1920,8 @@
       }
     }
 
-    // NOTE: Auto-recording is now handled by the backend auto_record.py task
-    // This prevents forcing a recording when user just wants to watch live
+    // NOTE: scheduled recording is handled by the backend task.
+    // This prevents forcing a recording when user just wants to watch live.
 
     // Save progress every 10 seconds
     const video = document.getElementById('player');

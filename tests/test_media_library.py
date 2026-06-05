@@ -15,10 +15,12 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original_db = app_main.db
         self.original_output_dir = app_main.OUTPUT_DIR
+        self.original_profile_images_dir = app_main.PROFILE_IMAGES_DIR
 
         self.tmpdir = tempfile.TemporaryDirectory()
         self.output_dir = Path(self.tmpdir.name)
         app_main.OUTPUT_DIR = self.output_dir
+        app_main.PROFILE_IMAGES_DIR = self.output_dir / "profile-images"
         app_main.db = Database(self.output_dir / "streamrec.db")
         await app_main.db.initialize()
 
@@ -31,11 +33,14 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.video_thumb.write_bytes(b"thumb")
         self.photo = self.records_dir / "photo.jpg"
         self.photo.write_bytes(b"\xff\xd8\xff\xe0photo")
+        self.ts_file = self.records_dir / "raw.ts"
+        self.ts_file.write_bytes(b"ts should stay out of media")
         self.empty_dir = self.output_dir / "records" / "empty_model"
         self.empty_dir.mkdir(parents=True)
         old = time.time() - 120
         os.utime(self.video, (old, old))
         os.utime(self.photo, (old + 10, old + 10))
+        os.utime(self.ts_file, (old + 20, old + 20))
 
         await app_main.db.add_or_update_recording(
             username="model",
@@ -55,6 +60,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         app_main.db = self.original_db
         app_main.OUTPUT_DIR = self.original_output_dir
+        app_main.PROFILE_IMAGES_DIR = self.original_profile_images_dir
         self.tmpdir.cleanup()
 
     async def test_lists_videos_and_photos_from_records_folder(self):
@@ -67,7 +73,8 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["stats"]["images"], 1)
         self.assertEqual(data["profiles"][0]["username"], "model")
         self.assertEqual(data["profiles"][0]["latestTitle"], "photo")
-        self.assertEqual(data["profiles"][0]["thumbnail"], "/streams/library/model/photo.jpg")
+        self.assertEqual(data["profiles"][0]["profileImageUrl"], "")
+        self.assertNotIn("thumbnail", data["profiles"][0])
         profiles = {profile["username"]: profile for profile in data["profiles"]}
         self.assertIn("empty_model", profiles)
         self.assertEqual(profiles["empty_model"]["total"], 0)
@@ -79,6 +86,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items["clip.mp4"]["duration"], 12)
         self.assertEqual(items["photo.jpg"]["type"], "image")
         self.assertEqual(items["photo.jpg"]["thumbnail"], items["photo.jpg"]["url"])
+        self.assertNotIn("raw.ts", items)
 
     async def test_indexes_manual_video_with_duration_and_thumbnail(self):
         manual = self.records_dir / "manual_import.mp4"
@@ -172,6 +180,131 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         traversal = self.client.get("/streams/library/model/%2E%2E/secret.jpg")
         self.assertIn(traversal.status_code, {400, 404})
 
+        ts_media = self.client.get("/streams/library/model/raw.ts")
+        self.assertEqual(ts_media.status_code, 400)
+
+        delete_ts = self.client.delete("/api/media-library/model/raw.ts")
+        self.assertEqual(delete_ts.status_code, 400)
+        self.assertTrue(self.ts_file.exists())
+
+    async def test_web_upload_endpoint_removed_and_direct_image_files_are_listed(self):
+        upload = self.client.post(
+            "/api/media-profiles/empty_model/uploads",
+            content=b"\xff\xd8\xff\xe0portrait",
+        )
+        self.assertIn(upload.status_code, {404, 405})
+
+        portrait = self.empty_dir / "portrait.jpg"
+        portrait.write_bytes(b"\xff\xd8\xff\xe0portrait")
+        raw_ts = self.empty_dir / "raw.ts"
+        raw_ts.write_bytes(b"transport stream")
+
+        listing = self.client.get("/api/media-library?username=empty_model&kind=image")
+        self.assertEqual(listing.status_code, 200)
+        items = {item["filename"]: item for item in listing.json()["items"]}
+        self.assertEqual("image", items["portrait.jpg"]["type"])
+        self.assertNotIn("raw.ts", items)
+
+    async def test_direct_mp4_file_indexes_import_record(self):
+        media_file = self.empty_dir / "uploaded.mp4"
+        media_file.write_bytes(b"video bytes")
+        old = time.time() - 120
+        os.utime(media_file, (old, old))
+        thumb = self.output_dir / "thumbnails" / "empty_model" / "upload_thumb.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        thumb.write_bytes(b"thumb")
+
+        with (
+            patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=33)),
+            patch.object(app_main, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
+            patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
+        ):
+            listing = self.client.get("/api/media-library?username=empty_model&kind=video")
+
+        self.assertEqual(listing.status_code, 200)
+        item = listing.json()["items"][0]
+        self.assertEqual("uploaded.mp4", item["filename"])
+        self.assertEqual("video", item["type"])
+        self.assertTrue(item["url"].startswith("/streams/media/"))
+
+        recs = await app_main.db.get_recordings("empty_model")
+        self.assertEqual(1, len(recs))
+        self.assertEqual("import", recs[0]["media_kind"])
+        self.assertEqual("uploaded.mp4", recs[0]["filename"])
+        self.assertEqual(33, recs[0]["duration_seconds"])
+
+        self.assertEqual(recs[0]["recording_id"], item["recordingId"])
+        self.assertTrue(item["browserPlayable"])
+
+    async def test_direct_mkv_file_creates_playable_mp4_copy(self):
+        media_file = self.empty_dir / "bonus.mkv"
+        media_file.write_bytes(b"mkv bytes")
+        old = time.time() - 120
+        os.utime(media_file, (old, old))
+        converted = self.output_dir / "media_imports" / "empty_model" / "converted.mp4"
+        converted.parent.mkdir(parents=True, exist_ok=True)
+        converted.write_bytes(b"mp4 copy")
+        thumb = self.output_dir / "thumbnails" / "empty_model" / "upload_thumb.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        thumb.write_bytes(b"thumb")
+
+        with (
+            patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=44)),
+            patch.object(app_main, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
+            patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
+            patch.object(
+                app_main,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(True, converted, None)),
+            ),
+        ):
+            listing = self.client.get("/api/media-library?username=empty_model&kind=video")
+
+        rec = (await app_main.db.get_recordings("empty_model"))[0]
+        self.assertTrue(rec["file_path"].endswith("/records/empty_model/bonus.mkv"))
+        self.assertEqual(str(converted), rec["playable_path"])
+        self.assertEqual(str(converted), rec["mp4_path"])
+
+        item = listing.json()["items"][0]
+        self.assertTrue(item["url"].startswith("/streams/media/"))
+        self.assertTrue(item["browserPlayable"])
+
+    async def test_recordings_api_streams_nested_record_path_by_id(self):
+        nested_dir = self.output_dir / "records" / "model" / "videos" / "record"
+        nested_dir.mkdir(parents=True)
+        nested = nested_dir / "nested.ts"
+        nested.write_bytes(b"nested-recording")
+        await app_main.db.add_or_update_recording(
+            username="model",
+            filename="nested.ts",
+            file_path=str(nested),
+            file_size=nested.stat().st_size,
+            recording_id="rec_nested",
+            duration_seconds=12,
+            is_converted=False,
+            media_kind="recording",
+            created_at=int(time.time()) - 120,
+        )
+
+        listing = self.client.get("/api/recordings/model?show_ts=true")
+        self.assertEqual(listing.status_code, 200)
+        items = {item["recordingId"]: item for item in listing.json()["recordings"]}
+        self.assertEqual("/streams/recordings/rec_nested", items["rec_nested"]["url"])
+
+        stream = self.client.get(
+            "/streams/recordings/rec_nested",
+            headers={"Range": "bytes=0-5"},
+        )
+        self.assertEqual(stream.status_code, 206)
+        self.assertEqual(stream.content, b"nested")
+
+        legacy_url = self.client.get(
+            "/streams/records/model/nested.ts",
+            headers={"Range": "bytes=0-5"},
+        )
+        self.assertEqual(legacy_url.status_code, 206)
+        self.assertEqual(legacy_url.content, b"nested")
+
     async def test_deletes_photo_and_indexed_video(self):
         photo = self.client.delete("/api/media-library/model/photo.jpg")
         self.assertEqual(photo.status_code, 200)
@@ -196,6 +329,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
                 "displayName": "Empty Model",
                 "firstName": "Empty",
                 "lastName": "Model",
+                "birthDate": "1999-04-03",
                 "age": 25,
                 "country": "Canada",
                 "socialUrls": ["https://social.example/empty"],
@@ -213,6 +347,8 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         data = profile.json()
         self.assertEqual(data["displayName"], "Empty Model")
         self.assertEqual(data["firstName"], "Empty")
+        self.assertEqual(data["birthDate"], "1999-04-03")
+        self.assertEqual(data["birth_date"], "1999-04-03")
         self.assertEqual(data["age"], 25)
         self.assertEqual(data["country"], "Canada")
         self.assertEqual(data["socialUrls"], ["https://social.example/empty"])
@@ -225,6 +361,144 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         profiles = {item["username"]: item for item in listing.json()["profiles"]}
         self.assertEqual(profiles["empty_model"]["displayName"], "Empty Model")
         self.assertEqual(profiles["empty_model"]["recordQuality"], "720p")
+        self.assertEqual(profiles["empty_model"]["streamSources"][0]["channelUsername"], "empty_model")
+
+    async def test_updates_profile_with_multiple_stream_sources(self):
+        response = self.client.put(
+            "/api/media-profiles/empty_model",
+            json={
+                "displayName": "Multi Source",
+                "streamSources": [
+                    {
+                        "sourceType": "chaturbate",
+                        "channelUsername": "empty_one",
+                        "channelUrl": "https://chaturbate.com/empty_one/",
+                        "recordQuality": "1080p",
+                        "retentionDays": 7,
+                        "autoRecord": True,
+                    },
+                    {
+                        "sourceType": "chaturbate",
+                        "channelUsername": "empty_two",
+                        "recordQuality": "720p",
+                        "retentionDays": 0,
+                        "autoRecord": True,
+                    },
+                    {
+                        "sourceType": "cam4",
+                        "channelUsername": "empty_cam4",
+                        "channelUrl": "https://www.cam4.com/empty_cam4",
+                        "recordQuality": "best",
+                        "retentionDays": 30,
+                        "autoRecord": False,
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()["profile"]
+        self.assertEqual(len(profile["streamSources"]), 3)
+        sources = {item["channelUsername"]: item for item in profile["streamSources"]}
+        self.assertEqual(sources["empty_one"]["recordPath"], "empty_model/videos/record")
+        self.assertEqual(sources["empty_two"]["retentionDays"], 0)
+
+        self.assertIsNotNone(await app_main.db.get_model("empty_one", source_type="chaturbate"))
+        self.assertIsNotNone(await app_main.db.get_model("empty_two", source_type="chaturbate"))
+        self.assertIsNotNone(await app_main.db.get_model("empty_cam4", source_type="cam4"))
+
+        listing = self.client.get("/api/media-library")
+        profiles = {item["username"]: item for item in listing.json()["profiles"]}
+        self.assertEqual(len(profiles["empty_model"]["streamSources"]), 3)
+
+    async def test_links_live_to_existing_media_profile(self):
+        create = self.client.put(
+            "/api/media-profiles/empty_model",
+            json={"displayName": "Existing Profile", "streamSources": []},
+        )
+        self.assertEqual(create.status_code, 200)
+
+        response = self.client.post(
+            "/api/media-profiles/link-live",
+            json={
+                "profileUsername": "empty_model",
+                "liveUsername": "channel_one",
+                "sourceType": "chaturbate",
+                "channelUrl": "https://chaturbate.com/channel_one/",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["source"]["channelUsername"], "channel_one")
+        self.assertTrue(data["source"]["autoRecord"])
+        self.assertEqual(data["profile"]["streamSources"][0]["channelUsername"], "channel_one")
+        self.assertIn("https://chaturbate.com/channel_one/", data["profile"]["streamUrls"])
+        model = await app_main.db.get_model("channel_one", source_type="chaturbate")
+        self.assertIsNotNone(model)
+        self.assertTrue(model["auto_record"])
+
+    async def test_links_live_and_creates_media_profile(self):
+        response = self.client.post(
+            "/api/media-profiles/link-live",
+            json={
+                "createProfile": True,
+                "profileUsername": "brand_new",
+                "displayName": "Brand New",
+                "liveUsername": "brand_new_live",
+                "sourceType": "cam4",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()["profile"]
+        self.assertEqual(profile["username"], "brand_new")
+        self.assertEqual(profile["displayName"], "Brand New")
+        self.assertEqual(profile["streamSources"][0]["sourceType"], "cam4")
+        self.assertEqual(profile["streamSources"][0]["channelUsername"], "brand_new_live")
+        self.assertEqual(profile["streamSources"][0]["recordPath"], "brand_new/videos/record")
+
+    async def test_resolves_and_serves_dedicated_profile_image(self):
+        async def fake_download(username, image_url):
+            self.assertEqual(username, "empty_model")
+            self.assertEqual(image_url, "https://images.example/empty.jpg")
+            app_main.PROFILE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            image_path = app_main.PROFILE_IMAGES_DIR / "empty_model.jpg"
+            image_path.write_bytes(b"\xff\xd8\xff\xe0profile")
+            return {
+                "path": str(image_path),
+                "size": image_path.stat().st_size,
+                "contentType": "image/jpeg",
+            }
+
+        with (
+            patch.object(
+                app_main,
+                "_resolve_profile_image_from_babepedia",
+                new=AsyncMock(return_value={
+                    "imageUrl": "https://images.example/empty.jpg",
+                    "sourceUrl": "https://www.babepedia.com/babe/Empty_Model",
+                }),
+            ),
+            patch.object(app_main, "_download_profile_image", new=AsyncMock(side_effect=fake_download)),
+        ):
+            response = self.client.post(
+                "/api/media-profiles/empty_model/profile-image/resolve",
+                json={"query": "Empty Model"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        profile = response.json()["profile"]
+        self.assertTrue(profile["profileImageUrl"].startswith("/api/media-profiles/empty_model/profile-image?v="))
+        self.assertEqual(profile["profileImageSourceUrl"], "https://www.babepedia.com/babe/Empty_Model")
+
+        image = self.client.get("/api/media-profiles/empty_model/profile-image")
+        self.assertEqual(image.status_code, 200)
+        self.assertEqual(image.content, b"\xff\xd8\xff\xe0profile")
+        self.assertTrue(image.headers["content-type"].startswith("image/jpeg"))
+
+        listing = self.client.get("/api/media-library")
+        profiles = {item["username"]: item for item in listing.json()["profiles"]}
+        self.assertTrue(profiles["empty_model"]["profileImageUrl"].startswith("/api/media-profiles/empty_model/profile-image?v="))
+        self.assertEqual(profiles["empty_model"]["profileImageSourceUrl"], "https://www.babepedia.com/babe/Empty_Model")
 
     async def test_deletes_profile_folder_metadata_and_recordings(self):
         response = self.client.put(

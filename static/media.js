@@ -9,7 +9,8 @@
     items: [],
     profiles: [],
     kind: 'video',
-    profile: '',
+    selectedProfile: '',
+    filterProfile: '',
     search: '',
     sort: 'newest',
     loading: false,
@@ -18,7 +19,13 @@
     currentViewerItem: null,
     profileSettings: null,
     viewerSaveInterval: null,
-    unwatchedOnly: false
+    viewerNextTimer: null,
+    viewerNextCountdownTimer: null,
+    loadController: null,
+    loadRequestId: 0,
+    unwatchedOnly: false,
+    creatingProfile: false,
+    resolvingProfileImage: false
   };
 
   var searchTimer = null;
@@ -143,8 +150,28 @@
   }
 
   function profileLabel(profile) {
-    if (!profile) return state.profile || '';
+    if (!profile) return state.selectedProfile || state.filterProfile || '';
     return profile.displayName || profile.username || '';
+  }
+
+  function profileExists(username) {
+    return !!(username && profileByUsername(username));
+  }
+
+  function mediaCountLabel(count, singular, plural) {
+    count = Number(count) || 0;
+    return count + ' ' + (count === 1 ? singular : plural);
+  }
+
+  function formatProfileMediaCounts(profile) {
+    return mediaCountLabel(profile && profile.videos, 'video', 'videos') +
+      ' - ' +
+      mediaCountLabel(profile && profile.images, 'image', 'images');
+  }
+
+  function profileImageUrl(profile) {
+    if (!profile) return '';
+    return profile.profileImageUrl || profile.profile_image_url || '';
   }
 
   function firstLetter(value) {
@@ -164,37 +191,78 @@
     return String(value || '');
   }
 
+  function normalizeProfileUsername(value) {
+    return String(value || '')
+      .trim()
+      .replace(/[^A-Za-z0-9_.-]+/g, '-')
+      .replace(/^[._-]+|[._-]+$/g, '');
+  }
+
+  function channelUsernameFromUrl(value) {
+    try {
+      var url = new URL(String(value || '').trim());
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+      var ignored = { b: true, chat: true, en: true, fr: true, room: true, rooms: true, videochat: true };
+      var parts = url.pathname.split('/').map(function(part) {
+        return decodeURIComponent(part || '').trim().replace(/^@+/, '');
+      }).filter(Boolean);
+      for (var i = 0; i < parts.length; i++) {
+        if (!ignored[parts[i].toLowerCase()]) return normalizeProfileUsername(parts[i]);
+      }
+      return parts.length ? normalizeProfileUsername(parts[parts.length - 1]) : '';
+    } catch (e) {
+      return '';
+    }
+  }
+
   function buildQuery() {
     var params = new URLSearchParams();
     params.set('kind', state.unwatchedOnly ? 'video' : state.kind);
     params.set('sort', state.sort);
     params.set('limit', '1000');
     if (state.unwatchedOnly) params.set('watched', 'unwatched');
-    if (state.profile) params.set('username', state.profile);
+    if (state.filterProfile) params.set('username', state.filterProfile);
     if (state.search) params.set('search', state.search);
     return params.toString();
   }
 
   async function loadMediaLibrary() {
-    if (state.loading) return;
+    var requestId = state.loadRequestId + 1;
+    state.loadRequestId = requestId;
+
+    if (state.loadController && typeof state.loadController.abort === 'function') {
+      state.loadController.abort();
+    }
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    state.loadController = controller;
     state.loading = true;
     renderLoading();
 
     try {
-      var res = await fetch('/api/media-library?' + buildQuery(), { cache: 'no-store' });
+      var fetchOptions = { cache: 'no-store' };
+      if (controller) fetchOptions.signal = controller.signal;
+      var res = await fetch('/api/media-library?' + buildQuery(), fetchOptions);
       if (!res.ok) throw new Error('Failed to load media library');
       var data = await res.json();
+      if (requestId !== state.loadRequestId) return;
       state.items = data.items || [];
       state.profiles = data.profiles || [];
+      if (state.selectedProfile && !profileExists(state.selectedProfile)) state.selectedProfile = '';
+      if (state.filterProfile && !profileExists(state.filterProfile)) state.filterProfile = '';
       renderStats(data.libraryStats || data.stats || {});
+      renderProfileFilter();
       renderProfileCarousel();
-      renderProfileDetail();
       renderRecentSection(data.total || state.items.length);
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      if (requestId !== state.loadRequestId) return;
       console.error('Error loading media library:', e);
       renderError();
     } finally {
-      state.loading = false;
+      if (requestId === state.loadRequestId) {
+        state.loading = false;
+        state.loadController = null;
+      }
     }
   }
 
@@ -235,6 +303,7 @@
     var rail = $('mediaProfileRail');
     var meta = $('mediaProfileMeta');
     if (!rail) return;
+    var scrollLeft = rail.scrollLeft || 0;
 
     if (meta) {
       var count = state.profiles.length;
@@ -247,24 +316,53 @@
     }
 
     rail.innerHTML = state.profiles.map(renderProfileCard).join('');
+    if (scrollLeft) {
+      requestAnimationFrame(function() {
+        rail.scrollLeft = scrollLeft;
+      });
+    }
+  }
+
+  function renderProfileFilter() {
+    var select = $('mediaProfileFilter');
+    if (!select) return;
+
+    var current = state.filterProfile;
+    var options = ['<option value="">All profiles</option>'];
+    state.profiles.forEach(function(profile) {
+      var label = profileLabel(profile);
+      var suffix = profile.displayName ? ' / ' + profile.username : '';
+      options.push(
+        '<option value="' + escapeHtml(profile.username) + '">' +
+          escapeHtml(label + suffix) +
+        '</option>'
+      );
+    });
+    select.innerHTML = options.join('');
+    if (current && profileExists(current)) {
+      select.value = current;
+    } else {
+      select.value = '';
+    }
   }
 
   function renderProfileCard(profile) {
-    var active = state.profile === profile.username;
+    var active = state.selectedProfile === profile.username;
     var name = profileLabel(profile);
     var image = '';
-    if (profile.thumbnail) {
-      image = '<img src="' + escapeHtml(profile.thumbnail) + '" alt="' + escapeHtml(name) + '" loading="lazy" onerror="this.style.display=\'none\'; this.parentElement.classList.add(\'missing-thumb\');">';
+    var profileImage = profileImageUrl(profile);
+    if (profileImage) {
+      image = '<img src="' + escapeHtml(profileImage) + '" alt="' + escapeHtml(name) + '" loading="lazy" onerror="this.style.display=\'none\'; this.parentElement.classList.add(\'missing-thumb\');">';
     }
 
-    var countLabel = (profile.videos || 0) + ' videos';
-    if (profile.images) countLabel += ' / ' + profile.images + ' photos';
+    var countLabel = formatProfileMediaCounts(profile);
 
     return '' +
-      '<button class="media-profile-card' + (active ? ' active' : '') + '" type="button" data-profile="' + escapeHtml(profile.username) + '">' +
+      '<article class="media-profile-card' + (active ? ' active' : '') + '" role="button" tabindex="0" data-profile="' + escapeHtml(profile.username) + '">' +
         '<div class="media-profile-poster">' +
           image +
           '<div class="media-profile-placeholder"><span>' + escapeHtml(firstLetter(name)) + '</span></div>' +
+          '<button class="media-profile-menu-btn" type="button" title="Profile settings" aria-label="Profile settings" data-profile-action="settings" data-profile="' + escapeHtml(profile.username) + '">&#8942;</button>' +
           '<span class="media-profile-total">' + escapeHtml(String(profile.total || 0)) + '</span>' +
         '</div>' +
         '<div class="media-profile-info">' +
@@ -272,35 +370,13 @@
           (name !== profile.username ? '<div class="media-profile-handle">' + escapeHtml(profile.username) + '</div>' : '') +
           '<div class="media-profile-counts">' + escapeHtml(countLabel) + '</div>' +
         '</div>' +
-      '</button>';
+      '</article>';
   }
 
-  function renderProfileDetail() {
-    var detail = $('mediaProfileDetail');
-    if (!detail) return;
-    if (!state.profile) {
-      detail.hidden = true;
-      return;
-    }
-
-    var profile = profileByUsername(state.profile);
-    var name = profileLabel(profile);
-    var avatar = $('mediaProfileAvatar');
-    var title = $('mediaProfileDetailName');
-    var meta = $('mediaProfileDetailMeta');
-    if (avatar) avatar.textContent = firstLetter(name);
-    if (title) title.textContent = name || state.profile;
-    if (meta) {
-      var parts = [];
-      if (profile && profile.username && profile.displayName) parts.push(profile.username);
-      parts.push(((profile && profile.videos) || 0) + ' videos');
-      parts.push(((profile && profile.images) || 0) + ' photos');
-      if (profile && profile.country) parts.push(profile.country);
-      if (profile && profile.recordQuality) parts.push('Quality ' + profile.recordQuality);
-      if (profile && profile.retentionDays != null) parts.push(profile.retentionDays + ' days');
-      meta.textContent = parts.join(' / ');
-    }
-    detail.hidden = false;
+  function syncProfileSelectionUI() {
+    document.querySelectorAll('.media-profile-card').forEach(function(card) {
+      card.classList.toggle('active', card.dataset.profile === state.selectedProfile);
+    });
   }
 
   function renderRecentSection(total) {
@@ -312,14 +388,9 @@
   function renderRecentTitle() {
     var title = $('mediaRecentTitle');
     var meta = $('mediaResultMeta');
-    var clearBtn = $('mediaClearProfileBtn');
     if (title) {
       var base = state.unwatchedOnly ? 'Unwatched videos' : state.kind === 'image' ? 'Recent photos' : state.kind === 'all' ? 'Recent media' : 'Recent videos';
-      title.textContent = state.profile ? base + ' / ' + profileLabel(profileByUsername(state.profile)) : base;
-    }
-    if (clearBtn) {
-      clearBtn.hidden = !state.profile;
-      clearBtn.textContent = state.profile ? 'All profiles' : 'All profiles';
+      title.textContent = state.filterProfile ? base + ' / ' + profileLabel(profileByUsername(state.filterProfile)) : base;
     }
     if (meta) {
       var label = state.unwatchedOnly
@@ -339,7 +410,7 @@
       var label = state.unwatchedOnly
         ? (total === 1 ? '1 unwatched video' : total + ' unwatched videos')
         : (total === 1 ? '1 media item' : total + ' media items');
-      if (state.profile) label += ' in ' + state.profile;
+      if (state.filterProfile) label += ' in ' + state.filterProfile;
       if (state.search) label += ' matching search';
       meta.textContent = label;
     }
@@ -401,6 +472,112 @@
       clearInterval(state.viewerSaveInterval);
       state.viewerSaveInterval = null;
     }
+  }
+
+  function clearViewerNextPrompt() {
+    if (state.viewerNextTimer) {
+      clearTimeout(state.viewerNextTimer);
+      state.viewerNextTimer = null;
+    }
+    if (state.viewerNextCountdownTimer) {
+      clearInterval(state.viewerNextCountdownTimer);
+      state.viewerNextCountdownTimer = null;
+    }
+    var stage = $('mediaViewerStage');
+    var prompt = stage ? stage.querySelector('.media-next-prompt') : null;
+    if (prompt) prompt.remove();
+  }
+
+  function currentVideoPlaylist() {
+    return state.items.filter(function(item) {
+      return item && item.type === 'video';
+    });
+  }
+
+  function nextVideoItem(item) {
+    if (!item) return null;
+    var videos = currentVideoPlaylist();
+    for (var i = 0; i < videos.length; i++) {
+      if (videos[i].id === item.id) {
+        return videos[i + 1] || null;
+      }
+    }
+    return null;
+  }
+
+  function previousVideoItem(item) {
+    if (!item) return null;
+    var videos = currentVideoPlaylist();
+    for (var i = 0; i < videos.length; i++) {
+      if (videos[i].id === item.id) {
+        return videos[i - 1] || null;
+      }
+    }
+    return null;
+  }
+
+  function playNextVideo(nextItem) {
+    if (!nextItem) return;
+    clearViewerNextPrompt();
+    openViewer(nextItem);
+  }
+
+  function updateViewerNav(item) {
+    var prev = $('mediaViewerPrev');
+    var next = $('mediaViewerNext');
+    var previousItem = item && item.type === 'video' ? previousVideoItem(item) : null;
+    var nextItem = item && item.type === 'video' ? nextVideoItem(item) : null;
+    if (prev) {
+      prev.disabled = !previousItem;
+      prev.dataset.mediaId = previousItem ? previousItem.id : '';
+    }
+    if (next) {
+      next.disabled = !nextItem;
+      next.dataset.mediaId = nextItem ? nextItem.id : '';
+    }
+  }
+
+  function showNextPrompt(item) {
+    if (!item || !state.currentViewerItem || state.currentViewerItem.id !== item.id) return;
+    var nextItem = nextVideoItem(item);
+    if (!nextItem) return;
+    var stage = $('mediaViewerStage');
+    if (!stage) return;
+
+    clearViewerNextPrompt();
+    var countdown = 5;
+    var prompt = document.createElement('div');
+    prompt.className = 'media-next-prompt';
+    prompt.innerHTML = '' +
+      '<div>' +
+        '<div class="media-next-kicker">Up next</div>' +
+        '<h3>' + escapeHtml(nextItem.title || nextItem.filename) + '</h3>' +
+        '<p><span data-next-countdown>' + countdown + '</span>s until next video</p>' +
+      '</div>' +
+      '<div class="media-next-actions">' +
+        '<button type="button" data-next-action="stay">Stay</button>' +
+        '<button type="button" data-next-action="next">Next</button>' +
+      '</div>';
+    stage.appendChild(prompt);
+
+    prompt.addEventListener('click', function(ev) {
+      var action = ev.target.closest('[data-next-action]');
+      if (!action) return;
+      if (action.dataset.nextAction === 'next') {
+        playNextVideo(nextItem);
+      } else {
+        clearViewerNextPrompt();
+      }
+    });
+
+    state.viewerNextCountdownTimer = setInterval(function() {
+      countdown -= 1;
+      var countNode = prompt.querySelector('[data-next-countdown]');
+      if (countNode) countNode.textContent = String(Math.max(0, countdown));
+    }, 1000);
+    state.viewerNextTimer = setTimeout(function() {
+      playNextVideo(nextItem);
+    }, countdown * 1000);
   }
 
   function videoPlaybackDuration(video, item) {
@@ -490,8 +667,13 @@
     video.addEventListener('pause', function() {
       saveMediaPlaybackPosition(video, item, { force: true });
     });
+    video.addEventListener('play', function() {
+      clearViewerNextPrompt();
+    });
     video.addEventListener('ended', function() {
-      saveMediaPlaybackPosition(video, item, { force: true });
+      saveMediaPlaybackPosition(video, item, { force: true }).then(function() {
+        showNextPrompt(item);
+      });
     });
     state.viewerSaveInterval = setInterval(function() {
       if (!video.paused && !video.ended) {
@@ -510,10 +692,12 @@
     var deleteBtn = $('mediaViewerDelete');
     if (!viewer || !stage) return;
 
+    clearViewerNextPrompt();
     state.currentViewerItem = item;
     title.textContent = item.title || item.filename;
     meta.textContent = item.username + ' / ' + formatType(item) + ' / ' + (item.sizeFormatted || '') + ' / ' + formatDate(item.createdAt);
     if (deleteBtn) deleteBtn.dataset.mediaId = item.id;
+    updateViewerNav(item);
 
     stage.innerHTML = '';
     var mediaNode;
@@ -556,12 +740,14 @@
 
     var active = stage.querySelector('video, audio');
     clearViewerSaveInterval();
+    clearViewerNextPrompt();
     if (active && active.tagName && active.tagName.toLowerCase() === 'video') {
       saveMediaPlaybackPosition(active, state.currentViewerItem, { force: true });
     }
     if (active) active.pause();
     stage.innerHTML = '';
     state.currentViewerItem = null;
+    updateViewerNav(null);
     viewer.style.display = 'none';
     viewer.setAttribute('aria-hidden', 'true');
     document.body.classList.remove('media-viewer-open');
@@ -667,14 +853,163 @@
     return field ? field.value.trim() : '';
   }
 
+  function qualityOptionsHtml(value) {
+    var values = ['best', '2160p', '1440p', '1080p', '720p', '480p', '360p'];
+    if (value && values.indexOf(value) === -1) values.push(value);
+    return values.map(function(option) {
+      return '<option value="' + escapeHtml(option) + '"' + (option === value ? ' selected' : '') + '>' + escapeHtml(option === 'best' ? 'Best' : option) + '</option>';
+    }).join('');
+  }
+
+  function sourceOptionsHtml(value) {
+    var options = [
+      { value: 'chaturbate', label: 'Chaturbate' },
+      { value: 'cam4', label: 'CAM4' }
+    ];
+    var found = options.some(function(option) { return option.value === value; });
+    if (value && !found) options.push({ value: value, label: value });
+    return options.map(function(option) {
+      return '<option value="' + escapeHtml(option.value) + '"' + (option.value === value ? ' selected' : '') + '>' + escapeHtml(option.label) + '</option>';
+    }).join('');
+  }
+
+  function normalizeProfileSource(source, fallbackUsername) {
+    source = source || {};
+    var retention = parseInt(source.retentionDays == null ? source.retention_days : source.retentionDays, 10);
+    if (Number.isNaN(retention)) retention = 30;
+    retention = Math.max(0, Math.min(365, retention));
+    return {
+      sourceType: (source.sourceType || source.source_type || 'chaturbate').toString().trim().toLowerCase() || 'chaturbate',
+      channelUsername: source.channelUsername || source.channel_username || source.username || fallbackUsername || '',
+      channelUrl: source.channelUrl || source.channel_url || '',
+      recordQuality: source.recordQuality || source.record_quality || 'best',
+      retentionDays: retention,
+      autoRecord: !!(source.autoRecord != null ? source.autoRecord : source.auto_record)
+    };
+  }
+
+  function profileSourcesFromProfile(profile) {
+    profile = profile || {};
+    var sources = Array.isArray(profile.streamSources) ? profile.streamSources : profile.stream_sources;
+    if (Array.isArray(sources) && sources.length) {
+      return sources.map(function(source) {
+        return normalizeProfileSource(source, profile.username || state.selectedProfile || '');
+      });
+    }
+    if (!profile.username && state.creatingProfile) {
+      return [normalizeProfileSource({
+        sourceType: 'chaturbate',
+        channelUsername: '',
+        recordQuality: 'best',
+        retentionDays: 30,
+        autoRecord: false
+      }, '')];
+    }
+    return [normalizeProfileSource({
+      sourceType: profile.sourceType || profile.source_type || 'chaturbate',
+      channelUsername: profile.username || state.selectedProfile || '',
+      channelUrl: Array.isArray(profile.streamUrls) && profile.streamUrls.length ? profile.streamUrls[0] : '',
+      recordQuality: profile.recordQuality || 'best',
+      retentionDays: profile.retentionDays == null ? 30 : profile.retentionDays,
+      autoRecord: !!profile.autoRecord
+    }, profile.username || state.selectedProfile || '')];
+  }
+
+  function renderProfileSources(sources) {
+    var list = $('profileSourcesList');
+    if (!list) return;
+    sources = Array.isArray(sources) && sources.length ? sources : [normalizeProfileSource({}, '')];
+    list.innerHTML = sources.map(function(source, index) {
+      source = normalizeProfileSource(source, '');
+      return '' +
+        '<div class="media-profile-source-row" data-source-index="' + index + '">' +
+          '<input data-source-field="channelUsername" type="hidden" value="' + escapeHtml(source.channelUsername) + '">' +
+          '<label>Source<select data-source-field="sourceType">' + sourceOptionsHtml(source.sourceType) + '</select></label>' +
+          '<label>URL<input data-source-field="channelUrl" type="url" autocomplete="off" value="' + escapeHtml(source.channelUrl) + '" placeholder="https://..."></label>' +
+          '<label>Quality<select data-source-field="recordQuality">' + qualityOptionsHtml(source.recordQuality) + '</select></label>' +
+          '<label>Retention<input data-source-field="retentionDays" type="number" min="0" max="365" value="' + escapeHtml(source.retentionDays) + '"></label>' +
+          '<label class="media-settings-check"><input data-source-field="autoRecord" type="checkbox"' + (source.autoRecord ? ' checked' : '') + '><span>Auto-record</span></label>' +
+          '<button class="media-source-remove-btn" data-source-action="remove" type="button" title="Remove source" aria-label="Remove source">&#215;</button>' +
+        '</div>';
+    }).join('');
+    syncLegacyStreamFields(sources);
+  }
+
+  function readProfileSources() {
+    var rows = Array.prototype.slice.call(document.querySelectorAll('.media-profile-source-row'));
+    return rows.map(function(row) {
+      function get(field) {
+        var el = row.querySelector('[data-source-field="' + field + '"]');
+        if (!el) return '';
+        if (el.type === 'checkbox') return !!el.checked;
+        return el.value.trim();
+      }
+      var channelUrl = get('channelUrl');
+      var retention = parseInt(get('retentionDays'), 10);
+      if (Number.isNaN(retention)) retention = 30;
+      return {
+        sourceType: get('sourceType') || 'chaturbate',
+        channelUsername: channelUsernameFromUrl(channelUrl) || normalizeProfileUsername(get('channelUsername')),
+        channelUrl: channelUrl,
+        recordQuality: get('recordQuality') || 'best',
+        retentionDays: Math.max(0, Math.min(365, retention)),
+        autoRecord: !!get('autoRecord')
+      };
+    }).filter(function(source) {
+      return source.channelUsername || source.channelUrl;
+    });
+  }
+
+  function syncLegacyStreamFields(sources) {
+    sources = Array.isArray(sources) ? sources : [];
+    var first = normalizeProfileSource(sources[0] || {}, state.selectedProfile || '');
+    var quality = $('profileRecordQuality');
+    var retention = $('profileRetentionDays');
+    var source = $('profileSourceType');
+    var auto = $('profileAutoRecord');
+    ensureSelectOption(quality, first.recordQuality || 'best');
+    if (quality) quality.value = first.recordQuality || 'best';
+    if (retention) retention.value = first.retentionDays == null ? 30 : first.retentionDays;
+    ensureSelectOption(source, first.sourceType || 'chaturbate');
+    if (source) source.value = first.sourceType || 'chaturbate';
+    if (auto) auto.checked = !!first.autoRecord;
+  }
+
+  function addProfileSource(source) {
+    var sources = readProfileSources();
+    sources.push(normalizeProfileSource(source || {
+      sourceType: 'chaturbate',
+      channelUsername: '',
+      recordQuality: 'best',
+      retentionDays: 30,
+      autoRecord: true
+    }, state.selectedProfile || ''));
+    renderProfileSources(sources);
+  }
+
   function fillProfileSettings(profile) {
     state.profileSettings = profile;
+    state.creatingProfile = !profile || !profile.username;
+    profile = profile || {};
     var subtitle = $('mediaProfileSettingsSubtitle');
-    if (subtitle) subtitle.textContent = profile.username;
+    var title = $('mediaProfileSettingsTitle');
+    if (title) title.textContent = state.creatingProfile ? 'New profile' : 'Profile settings';
+    if (subtitle) subtitle.textContent = state.creatingProfile ? 'Create a local media profile' : profile.username;
+
+    var usernameField = $('profileUsernameField');
+    var usernameInput = $('profileUsername');
+    if (usernameField) usernameField.style.display = state.creatingProfile ? 'grid' : 'none';
+    if (usernameInput) {
+      usernameInput.value = profile.username || '';
+      usernameInput.disabled = !state.creatingProfile;
+    }
 
     setField('profileDisplayName', profile.displayName || '');
     setField('profileFirstName', profile.firstName || '');
     setField('profileLastName', profile.lastName || '');
+    setField('profileBirthDate', profile.birthDate || profile.birth_date || '');
+    setField('profileImageUrl', profile.profileImageUrl || profile.profile_image_url || '');
+    setField('profileImageSourceUrl', profile.profileImageSourceUrl || profile.profile_image_source_url || '');
     setField('profileAge', profile.age == null ? '' : profile.age);
     setField('profileAliases', profile.aliases || '');
     setField('profileTags', profile.tags || '');
@@ -696,16 +1031,42 @@
     if (source) source.value = profile.sourceType || profile.source_type || 'chaturbate';
     var auto = $('profileAutoRecord');
     if (auto) auto.checked = !!profile.autoRecord;
+    renderProfileSources(profileSourcesFromProfile(profile));
+
+    var deleteBtn = $('mediaProfileDeleteBtn');
+    if (deleteBtn) deleteBtn.style.display = state.creatingProfile ? 'none' : '';
   }
 
-  async function openProfileSettings() {
-    if (!state.profile) return;
+  function openNewProfileSettings() {
+    var modal = $('mediaProfileSettingsModal');
+    fillProfileSettings({
+      username: '',
+      sourceType: 'chaturbate',
+      recordQuality: 'best',
+      retentionDays: 30,
+      autoRecord: false
+    });
+    if (modal) {
+      modal.style.display = 'flex';
+      modal.setAttribute('aria-hidden', 'false');
+      document.body.classList.add('media-profile-settings-open');
+    }
+    var usernameInput = $('profileUsername');
+    if (usernameInput) usernameInput.focus();
+  }
+
+  async function openProfileSettings(profileUsername) {
+    if (profileUsername) {
+      state.selectedProfile = profileUsername;
+      syncProfileSelectionUI();
+    }
+    if (!state.selectedProfile) return;
     var modal = $('mediaProfileSettingsModal');
     var save = $('mediaProfileSettingsSave');
     if (save) save.disabled = true;
 
     try {
-      var res = await fetch('/api/media-profiles/' + encodeURIComponent(state.profile), { cache: 'no-store' });
+      var res = await fetch('/api/media-profiles/' + encodeURIComponent(state.selectedProfile), { cache: 'no-store' });
       var data = await res.json().catch(function() { return {}; });
       if (!res.ok) throw new Error(data.detail || 'Profile unavailable');
       fillProfileSettings(data);
@@ -729,31 +1090,92 @@
       modal.setAttribute('aria-hidden', 'true');
       document.body.classList.remove('media-profile-settings-open');
     }
+    state.creatingProfile = false;
+  }
+
+  async function resolveProfileImage() {
+    if (state.resolvingProfileImage) return;
+    var username = state.creatingProfile ? normalizeProfileUsername(fieldValue('profileUsername')) : state.selectedProfile;
+    if (!username) {
+      showToast('Username is required', 'error');
+      return;
+    }
+
+    var button = $('profileResolveImageBtn');
+    state.resolvingProfileImage = true;
+    if (button) {
+      button.disabled = true;
+      button.textContent = 'Fetching...';
+    }
+
+    var query = fieldValue('profileDisplayName') ||
+      [fieldValue('profileFirstName'), fieldValue('profileLastName')].filter(Boolean).join(' ') ||
+      username;
+    var payload = {
+      query: query,
+      profileImageUrl: fieldValue('profileImageUrl'),
+      sourceUrl: fieldValue('profileImageSourceUrl'),
+      profileUrls: splitLines(fieldValue('profileProfileUrls'))
+    };
+
+    try {
+      var res = await fetch('/api/media-profiles/' + encodeURIComponent(username) + '/profile-image/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      var data = await res.json().catch(function() { return {}; });
+      if (!res.ok) throw new Error(data.detail || 'Profile image unavailable');
+      var profile = data.profile || {};
+      setField('profileImageUrl', profile.profileImageUrl || profile.profile_image_url || '');
+      setField('profileImageSourceUrl', profile.profileImageSourceUrl || profile.profile_image_source_url || payload.sourceUrl || '');
+      state.profileSettings = profile;
+      if (state.creatingProfile) state.selectedProfile = username;
+      await loadMediaLibrary();
+      showToast('Profile image updated');
+    } catch (e) {
+      console.error('Error resolving profile image:', e);
+      showToast(e.message || 'Profile image unavailable', 'error');
+    } finally {
+      state.resolvingProfileImage = false;
+      if (button) {
+        button.disabled = false;
+        button.textContent = 'Fetch Babepedia image';
+      }
+    }
   }
 
   async function saveProfileSettings(ev) {
     if (ev) ev.preventDefault();
-    if (!state.profile) return;
+    var username = state.creatingProfile ? normalizeProfileUsername(fieldValue('profileUsername')) : state.selectedProfile;
+    if (!username) {
+      showToast('Username is required', 'error');
+      return;
+    }
     var save = $('mediaProfileSettingsSave');
     if (save) {
       save.disabled = true;
       save.textContent = 'Saving...';
     }
 
-    var retention = parseInt(fieldValue('profileRetentionDays'), 10);
-    if (Number.isNaN(retention)) retention = 30;
-    retention = Math.max(0, Math.min(365, retention));
-
     var ageValue = fieldValue('profileAge');
     var age = ageValue ? parseInt(ageValue, 10) : null;
     if (Number.isNaN(age)) age = null;
 
+    var profileSources = readProfileSources();
+    syncLegacyStreamFields(profileSources);
+    var retention = parseInt(fieldValue('profileRetentionDays'), 10);
+    if (Number.isNaN(retention)) retention = 30;
+    retention = Math.max(0, Math.min(365, retention));
     var auto = $('profileAutoRecord');
     var source = $('profileSourceType');
     var payload = {
       displayName: fieldValue('profileDisplayName'),
       firstName: fieldValue('profileFirstName'),
       lastName: fieldValue('profileLastName'),
+      birthDate: fieldValue('profileBirthDate'),
+      profileImageUrl: fieldValue('profileImageUrl'),
+      profileImageSourceUrl: fieldValue('profileImageSourceUrl'),
       age: age,
       aliases: fieldValue('profileAliases'),
       tags: fieldValue('profileTags'),
@@ -769,11 +1191,12 @@
       recordQuality: fieldValue('profileRecordQuality') || 'best',
       retentionDays: retention,
       sourceType: source ? source.value : 'chaturbate',
-      autoRecord: auto ? auto.checked : false
+      autoRecord: auto ? auto.checked : false,
+      streamSources: profileSources
     };
 
     try {
-      var res = await fetch('/api/media-profiles/' + encodeURIComponent(state.profile), {
+      var res = await fetch('/api/media-profiles/' + encodeURIComponent(username), {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -784,6 +1207,7 @@
       }
       showToast('Settings saved', 'success');
       closeProfileSettings();
+      state.selectedProfile = username;
       await loadMediaLibrary();
     } catch (e) {
       console.error('Error saving profile settings:', e);
@@ -797,8 +1221,8 @@
   }
 
   function openProfileDeleteConfirm() {
-    if (!state.profile) return;
-    var profile = state.profileSettings || profileByUsername(state.profile) || { username: state.profile };
+    if (!state.selectedProfile) return;
+    var profile = state.profileSettings || profileByUsername(state.selectedProfile) || { username: state.selectedProfile };
     state.pendingProfileDelete = profile;
     var target = $('mediaProfileDeleteTarget');
     var confirm = $('mediaProfileDeleteConfirm');
@@ -842,7 +1266,8 @@
       }
       closeProfileDeleteConfirm();
       closeProfileSettings();
-      state.profile = '';
+      if (state.filterProfile === profile.username) state.filterProfile = '';
+      state.selectedProfile = '';
       state.profileSettings = null;
       showToast('Profile deleted', 'success');
       await loadMediaLibrary();
@@ -865,6 +1290,9 @@
     var sort = $('mediaSortSelect');
     if (sort) sort.value = state.sort;
 
+    var profileFilter = $('mediaProfileFilter');
+    if (profileFilter) profileFilter.value = state.filterProfile || '';
+
     var unwatchedToggle = $('mediaUnwatchedOnlyToggle');
     if (unwatchedToggle) {
       unwatchedToggle.checked = !!state.unwatchedOnly;
@@ -879,16 +1307,23 @@
     loadMediaLibrary();
   }
 
-  function setProfile(profile, shouldScroll) {
-    state.profile = profile || '';
-    if (state.profile) state.kind = 'video';
-    loadMediaLibrary();
+  function selectProfile(profile, shouldScroll) {
+    state.selectedProfile = profile || '';
+    state.filterProfile = profile || '';
+    syncProfileSelectionUI();
     if (shouldScroll) {
-      var recent = document.querySelector('.media-recent-section');
-      if (recent && recent.scrollIntoView) {
-        recent.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      var results = document.querySelector('.media-recent-section');
+      if (results && results.scrollIntoView) {
+        results.scrollIntoView({ block: 'start', behavior: 'smooth' });
       }
     }
+    loadMediaLibrary();
+  }
+
+  function setFilterProfile(profile) {
+    state.filterProfile = profile || '';
+    state.selectedProfile = profile || '';
+    loadMediaLibrary();
   }
 
   function scrollProfiles(direction) {
@@ -918,6 +1353,13 @@
       });
     }
 
+    var profileFilter = $('mediaProfileFilter');
+    if (profileFilter) {
+      profileFilter.addEventListener('change', function() {
+        setFilterProfile(profileFilter.value);
+      });
+    }
+
     var unwatchedToggle = $('mediaUnwatchedOnlyToggle');
     if (unwatchedToggle) {
       unwatchedToggle.addEventListener('change', function() {
@@ -939,18 +1381,29 @@
     var next = $('mediaProfileNext');
     if (next) next.addEventListener('click', function() { scrollProfiles(1); });
 
-    var clearProfile = $('mediaClearProfileBtn');
-    if (clearProfile) clearProfile.addEventListener('click', function() { setProfile('', false); });
-
-    var profileSettings = $('mediaProfileSettingsBtn');
-    if (profileSettings) profileSettings.addEventListener('click', openProfileSettings);
+    var newProfile = $('mediaNewProfileBtn');
+    if (newProfile) newProfile.addEventListener('click', openNewProfileSettings);
 
     var rail = $('mediaProfileRail');
     if (rail) {
       rail.addEventListener('click', function(ev) {
+        var settings = ev.target.closest('[data-profile-action="settings"]');
+        if (settings) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          openProfileSettings(settings.dataset.profile || '');
+          return;
+        }
         var card = ev.target.closest('.media-profile-card');
         if (!card) return;
-        setProfile(card.dataset.profile || '', true);
+        selectProfile(card.dataset.profile || '', true);
+      });
+      rail.addEventListener('keydown', function(ev) {
+        if (ev.key !== 'Enter' && ev.key !== ' ') return;
+        var card = ev.target.closest('.media-profile-card');
+        if (!card) return;
+        ev.preventDefault();
+        selectProfile(card.dataset.profile || '', true);
       });
     }
 
@@ -988,6 +1441,22 @@
       });
     }
 
+    var viewerPrev = $('mediaViewerPrev');
+    if (viewerPrev) {
+      viewerPrev.addEventListener('click', function() {
+        var previousItem = previousVideoItem(state.currentViewerItem);
+        if (previousItem) openViewer(previousItem);
+      });
+    }
+
+    var viewerNext = $('mediaViewerNext');
+    if (viewerNext) {
+      viewerNext.addEventListener('click', function() {
+        var nextItem = nextVideoItem(state.currentViewerItem);
+        if (nextItem) openViewer(nextItem);
+      });
+    }
+
     var deleteCancel = $('mediaDeleteCancel');
     if (deleteCancel) deleteCancel.addEventListener('click', closeDeleteConfirm);
 
@@ -997,6 +1466,9 @@
     var profileSettingsForm = $('mediaProfileSettingsForm');
     if (profileSettingsForm) profileSettingsForm.addEventListener('submit', saveProfileSettings);
 
+    var profileResolveImage = $('profileResolveImageBtn');
+    if (profileResolveImage) profileResolveImage.addEventListener('click', resolveProfileImage);
+
     var profileSettingsClose = $('mediaProfileSettingsClose');
     if (profileSettingsClose) profileSettingsClose.addEventListener('click', closeProfileSettings);
 
@@ -1005,6 +1477,36 @@
 
     var profileDelete = $('mediaProfileDeleteBtn');
     if (profileDelete) profileDelete.addEventListener('click', openProfileDeleteConfirm);
+
+    var profileAddSource = $('profileAddSourceBtn');
+    if (profileAddSource) profileAddSource.addEventListener('click', function() {
+      addProfileSource();
+    });
+
+    var profileSourcesList = $('profileSourcesList');
+    if (profileSourcesList) {
+      profileSourcesList.addEventListener('click', function(ev) {
+        var remove = ev.target.closest('[data-source-action="remove"]');
+        if (!remove) return;
+        var rows = Array.prototype.slice.call(document.querySelectorAll('.media-profile-source-row'));
+        if (rows.length <= 1) {
+          rows[0].querySelectorAll('input').forEach(function(input) {
+            if (input.type === 'checkbox') input.checked = false;
+            else input.value = '';
+          });
+          return;
+        }
+        var row = remove.closest('.media-profile-source-row');
+        if (row) row.remove();
+        syncLegacyStreamFields(readProfileSources());
+      });
+      profileSourcesList.addEventListener('change', function() {
+        syncLegacyStreamFields(readProfileSources());
+      });
+      profileSourcesList.addEventListener('input', function() {
+        syncLegacyStreamFields(readProfileSources());
+      });
+    }
 
     var profileDeleteCancel = $('mediaProfileDeleteCancel');
     if (profileDeleteCancel) profileDeleteCancel.addEventListener('click', closeProfileDeleteConfirm);

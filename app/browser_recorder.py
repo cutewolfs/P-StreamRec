@@ -62,13 +62,17 @@ class BrowserCaptureSession:
         file_extension: str = "webm",
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
         session_store=None,
+        target: Optional[str] = None,
+        session_key: Optional[str] = None,
     ):
         self.id = session_id
         self.source_type = source_type
         self.page_url = page_url
+        self.target = (target or "").strip()
         self.sessions_dir = sessions_dir
         self.records_dir_for_person = records_dir_for_person
         self.person = person
+        self.session_key = session_key or person
         self.name = display_name or person or session_id
         self.record = bool(record)
         self.browser_root = browser_root
@@ -580,12 +584,17 @@ class BrowserCaptureManager:
         record: bool = True,
         capture_mode: str = "media_recorder",
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
+        records_dir_for_person: Optional[Path] = None,
+        target: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> BrowserCaptureSession:
         with self._lock:
             self._prune_finished_locked()
+            session_key = session_key or person
             if record:
                 for session in self._sessions.values():
-                    if session.record and session.person == person and session.is_running():
+                    existing_key = getattr(session, "session_key", None) or getattr(session, "person", None)
+                    if session.record and existing_key == session_key and session.is_running():
                         raise RuntimeError(f"Une session est déjà en cours pour '{person}'.")
             else:
                 for session in self._sessions.values():
@@ -608,13 +617,15 @@ class BrowserCaptureManager:
                 source_type=source_type,
                 page_url=page_url,
                 sessions_dir=self.sessions_root / session_id,
-                records_dir_for_person=self.records_root / person,
+                records_dir_for_person=records_dir_for_person or self.records_root / person,
                 person=person,
                 display_name=display_name,
                 record=record,
                 browser_root=self.browser_root,
                 filename_format=filename_format,
                 session_store=self.session_store,
+                target=target,
+                session_key=session_key,
             )
             session.capture_mode = (capture_mode or "media_recorder").strip().lower()
             self._sessions[session_id] = session
@@ -662,6 +673,8 @@ class BrowserCaptureManager:
                     "bytes_written": session.bytes_written,
                     "seconds_since_progress": int(session.seconds_since_progress()),
                     "source_type": session.source_type,
+                    "target": session.target,
+                    "session_key": session.session_key,
                     "capture_type": "browser",
                     "capture_mode": getattr(session, "capture_mode", "media_recorder"),
                 })

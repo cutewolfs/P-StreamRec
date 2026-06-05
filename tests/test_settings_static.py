@@ -26,6 +26,46 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("settingsApiPill", html)
         self.assertNotIn("settingsApiDot", html)
 
+    def test_settings_application_tab_is_removed(self):
+        html = (ROOT / "static" / "settings.html").read_text()
+        js = (ROOT / "static" / "settings.js").read_text()
+
+        self.assertNotIn('data-tab="application"', html)
+        self.assertNotIn('id="tab-application"', html)
+        self.assertNotIn('id="appVersionSetting"', html)
+        self.assertNotIn('id="apiStatus"', html)
+        self.assertNotIn("appVersionSetting", js)
+
+    def test_flaresolverr_settings_url_can_be_edited(self):
+        html = (ROOT / "static" / "settings.html").read_text()
+        js = (ROOT / "static" / "settings.js").read_text()
+
+        self.assertIn("flareUrlInput", html)
+        self.assertIn("flareSaveBtn", html)
+        self.assertIn("saveFlareSolverrUrl", js)
+        self.assertIn("loadFlareSolverrSettings", js)
+        self.assertIn("/api/settings/flaresolverr", js)
+        self.assertIn("FlareSolverr URL saved", js)
+        self.assertNotIn("configured via environment variables", html)
+
+    def test_flaresolverr_is_not_configured_by_environment_variables(self):
+        files = [
+            "app/main.py",
+            "app/core/config.py",
+            "app/providers/browser.py",
+            "app/services/flaresolverr.py",
+            "docker-compose.yml",
+            "README.md",
+            "static/wiki.html",
+        ]
+        text = "\n".join((ROOT / path).read_text() for path in files)
+
+        self.assertNotIn("FLARESOLVERR_URL", text)
+        self.assertNotIn("PSTREAMREC_FLARESOLVERR_URL", text)
+        self.assertNotIn("FLARESOLVERR_MAX_TIMEOUT", text)
+        self.assertNotIn("PSTREAMREC_FLARESOLVERR_TIMEOUT_MS", text)
+        self.assertNotRegex(text, r"os\.getenv\([^)]*FLARESOLVERR")
+
     def test_recording_settings_exposes_check_interval_control(self):
         html = (ROOT / "static" / "settings.html").read_text()
         js = (ROOT / "static" / "settings.js").read_text()
@@ -75,26 +115,94 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("if (caps.can_sync_following === true) {\n      providerBySource[sourceType]", js)
         self.assertIn("No local follows saved for this provider.", js)
 
-    def test_media_page_has_unwatched_video_filter(self):
+    def test_media_page_has_profile_filter_and_continuous_playback(self):
         html = (ROOT / "static" / "media.html").read_text()
         header = (ROOT / "static" / "header.html").read_text()
         js = (ROOT / "static" / "media.js").read_text()
         css = (ROOT / "static" / "styles.css").read_text()
 
-        self.assertIn('data-page="media">Media</a>', header)
+        self.assertNotIn('href="/recordings"', header)
+        self.assertNotIn('data-page="recordings"', header)
+        self.assertNotIn("Recordings</a>", header)
+        self.assertIn('href="/media" class="nav-link" data-page="media">Media</a>', header)
+        self.assertNotIn('href="/stash"', header)
         self.assertIn("<title>Media - P-StreamRec</title>", html)
+        self.assertIn("mediaNewProfileBtn", html)
+        self.assertIn("mediaProfileFilter", html)
+        self.assertNotIn("mediaProfileDetail", html)
+        self.assertNotIn("mediaProfileFilterBtn", html)
+        self.assertNotIn("mediaProfileClearBtn", html)
+        self.assertNotIn("mediaUploadBtn", html)
+        self.assertNotIn("mediaUploadForm", html)
+        self.assertNotIn("/uploads", html)
+        self.assertIn("Date of birth", html)
+        self.assertIn("Profile image URL", html)
+        self.assertIn("Babepedia page URL", html)
+        self.assertIn("Fetch Babepedia image", html)
+        self.assertIn("profileSourcesList", html)
+        self.assertIn("profileAddSourceBtn", html)
+        self.assertIn("Add source", html)
         self.assertIn("mediaUnwatchedOnlyToggle", html)
         self.assertIn("Unwatched", html)
+        self.assertIn("profileImageUrl", js)
+        self.assertIn("streamSources", js)
+        self.assertIn("channelUsername", js)
+        self.assertIn("channelUsernameFromUrl", js)
+        self.assertIn("selectedProfile", js)
+        self.assertIn("filterProfile", js)
+        self.assertIn("formatProfileMediaCounts", js)
+        self.assertIn("mediaProfileFilter", js)
+        self.assertIn("media-profile-menu-btn", js)
+        self.assertIn('data-profile-action="settings"', js)
+        self.assertNotIn("renderProfileDetail", js)
+        self.assertNotIn("filterSelectedProfile", js)
+        self.assertNotIn("clearSelectedProfile", js)
+        self.assertIn("showNextPrompt", js)
+        self.assertIn("nextVideoItem", js)
+        self.assertIn("data-next-action", js)
+        self.assertNotIn("openUploadModal", js)
+        self.assertNotIn("uploadMediaFiles", js)
+        self.assertNotIn("/uploads", js)
+        self.assertNotIn("<label>Channel<input", js)
+        self.assertNotIn('data-source-field="channelUsername" type="text"', js)
+        self.assertNotIn("profile.thumbnail", js)
         self.assertIn("unwatchedOnly", js)
         self.assertIn("params.set('watched', 'unwatched')", js)
         self.assertIn("toLocaleString('en-US'", js)
         self.assertIn("Unwatched videos", js)
         self.assertIn("Watched", js)
         self.assertIn(".media-unwatched-toggle", css)
+        self.assertIn(".media-next-prompt", css)
+        self.assertIn(".media-profile-menu-btn", css)
+        self.assertNotIn(".media-profile-detail", css)
+        self.assertNotIn(".media-upload-modal", css)
         self.assertNotIn("M&eacute;dia", header)
         self.assertNotIn("Non vues", html)
         self.assertNotIn("Videos non vues", js)
         self.assertNotIn("Deja vu", js)
+
+    def test_watch_page_uses_set_recording_profile_flow(self):
+        html = (ROOT / "static" / "watch.html").read_text()
+        js = (ROOT / "static" / "watch.js").read_text()
+
+        self.assertIn("Set recording", html)
+        self.assertIn("recordingModal", html)
+        self.assertIn("recordingProfileSearch", html)
+        self.assertIn("Existing profile", html)
+        self.assertIn("New profile", html)
+        self.assertIn("/api/media-profiles/link-live", js)
+        self.assertIn("openRecordingModal", js)
+        self.assertIn("submitCreateRecordingProfile", js)
+        self.assertNotIn("Auto-Record", html)
+        self.assertNotIn("Auto-Record", js)
+        self.assertNotIn("toggleAutoRecord", js)
+
+    def test_recordings_page_redirects_to_media(self):
+        main = (ROOT / "app" / "main.py").read_text()
+
+        self.assertIn('@app.get("/recordings")', main)
+        self.assertIn('RedirectResponse(url="/media", status_code=307)', main)
+        self.assertNotIn('return FileResponse(str(STATIC_DIR / "recordings.html"))', main)
 
     def test_provider_settings_has_account_controls_for_sync_capable_providers(self):
         js = (ROOT / "static" / "settings.js").read_text()

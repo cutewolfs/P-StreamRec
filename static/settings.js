@@ -371,7 +371,7 @@ async function checkFlareSolverr(manual) {
   var statusEl = document.getElementById('flareStatus');
   var versionRow = document.getElementById('flareVersionRow');
   var versionEl = document.getElementById('flareVersion');
-  var urlEl = document.getElementById('flareUrl');
+  var urlInput = document.getElementById('flareUrlInput');
   var messageRow = document.getElementById('flareMessageRow');
   var messageEl = document.getElementById('flareMessage');
   var testBtn = document.getElementById('flareTestBtn');
@@ -406,8 +406,8 @@ async function checkFlareSolverr(manual) {
         versionEl.textContent = data.flaresolverrVersion;
       }
 
-      if (data.flaresolverrUrl && urlEl) {
-        urlEl.textContent = data.flaresolverrUrl;
+      if (data.flaresolverrUrl && urlInput && document.activeElement !== urlInput) {
+        urlInput.value = data.flaresolverrUrl;
       }
 
       if (manual) {
@@ -433,6 +433,62 @@ async function checkFlareSolverr(manual) {
   }
 }
 
+async function loadFlareSolverrSettings() {
+  var urlInput = document.getElementById('flareUrlInput');
+  if (!urlInput) return;
+
+  try {
+    var res = await fetch('/api/settings/flaresolverr', { cache: 'no-store' });
+    if (!res.ok) return;
+    var data = await res.json();
+    if (data.flaresolverrUrl || data.url) {
+      urlInput.value = data.flaresolverrUrl || data.url;
+    }
+  } catch (e) {
+    console.error('Error loading FlareSolverr settings:', e);
+  }
+}
+
+async function saveFlareSolverrUrl() {
+  var urlInput = document.getElementById('flareUrlInput');
+  var saveBtn = document.getElementById('flareSaveBtn');
+  if (!urlInput) return;
+
+  var url = String(urlInput.value || '').trim();
+  if (!url) {
+    showNotification('FlareSolverr URL is required', 'error');
+    return;
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+  }
+
+  try {
+    var res = await fetch('/api/settings/flaresolverr', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
+      showNotification(data.detail || 'Unable to save FlareSolverr URL', 'error');
+      return;
+    }
+    urlInput.value = data.flaresolverrUrl || data.url || url;
+    showNotification('FlareSolverr URL saved', 'success');
+    await checkFlareSolverr(true);
+  } catch (e) {
+    showNotification('Connection error', 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save';
+    }
+  }
+}
+
 // ============================================
 // Load app version and config
 // ============================================
@@ -441,8 +497,6 @@ async function loadAppInfo() {
     var res = await fetch('/api/version');
     if (res.ok) {
       var data = await res.json();
-      setText('appVersionSetting', 'v' + (data.version || 'unknown'));
-
       if (data.output_dir || data.config) {
         var config = data.config || data;
         if (config.output_dir) setText('outputDir', config.output_dir);
@@ -1317,6 +1371,7 @@ window.addEventListener('DOMContentLoaded', function() {
 
   // Load all data in parallel
   loadProviders();
+  loadFlareSolverrSettings();
   checkFlareSolverr();
   loadAppInfo();
   loadBlacklistedTags();

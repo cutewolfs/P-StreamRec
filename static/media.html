@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/media.js?v=6"></script>
+  <script defer src="/static/media.js?v=10"></script>
 </head>
 <body>
   <div id="header-placeholder"></div>
@@ -41,6 +41,7 @@
           <div class="media-section-subtitle" id="mediaProfileMeta">Loading...</div>
         </div>
         <div class="media-carousel-actions">
+          <button class="media-action-btn primary" id="mediaNewProfileBtn" type="button">New profile</button>
           <button class="media-carousel-btn" id="mediaProfilePrev" type="button" title="Previous" aria-label="Previous profiles">&#8592;</button>
           <button class="media-carousel-btn" id="mediaProfileNext" type="button" title="Next" aria-label="Next profiles">&#8594;</button>
         </div>
@@ -54,28 +55,11 @@
     </section>
 
     <section class="media-recent-section" aria-label="Recent media">
-      <div class="media-profile-detail" id="mediaProfileDetail" hidden>
-        <div class="media-profile-detail-main">
-          <div class="media-profile-avatar" id="mediaProfileAvatar">?</div>
-          <div>
-            <div class="media-profile-kicker">Channel</div>
-            <h2 id="mediaProfileDetailName">Profile</h2>
-            <div class="media-profile-detail-meta" id="mediaProfileDetailMeta"></div>
-          </div>
-        </div>
-        <div class="media-profile-detail-actions">
-          <button class="media-profile-settings-btn" id="mediaProfileSettingsBtn" type="button" title="Profile settings" aria-label="Profile settings">
-            <span aria-hidden="true">&#9881;</span>
-          </button>
-        </div>
-      </div>
-
       <div class="media-section-heading">
         <div>
           <h2 id="mediaRecentTitle">Recent videos</h2>
           <div class="media-section-subtitle" id="mediaResultMeta">Loading...</div>
         </div>
-        <button class="media-clear-profile-btn" id="mediaClearProfileBtn" type="button" hidden>All profiles</button>
       </div>
 
       <section class="media-controls" aria-label="Media filters">
@@ -83,6 +67,9 @@
           <span aria-hidden="true">&#8981;</span>
           <input id="mediaSearchInput" type="search" placeholder="Search media" autocomplete="off">
         </div>
+        <select id="mediaProfileFilter" class="media-select" aria-label="Profile filter">
+          <option value="">All profiles</option>
+        </select>
         <div class="media-kind-tabs" role="tablist" aria-label="Media type">
           <button class="media-kind-btn" type="button" data-kind="all">All</button>
           <button class="media-kind-btn active" type="button" data-kind="video">Videos</button>
@@ -123,6 +110,12 @@
           <div id="mediaViewerMeta"></div>
         </div>
         <div class="media-viewer-actions">
+          <button class="media-viewer-nav" id="mediaViewerPrev" type="button" title="Previous video" aria-label="Previous video">
+            <span aria-hidden="true">&#8592;</span>
+          </button>
+          <button class="media-viewer-nav" id="mediaViewerNext" type="button" title="Next video" aria-label="Next video">
+            <span aria-hidden="true">&#8594;</span>
+          </button>
           <button class="media-viewer-delete" id="mediaViewerDelete" type="button" title="Delete" aria-label="Delete">
             <span aria-hidden="true">&#128465;</span>
           </button>
@@ -158,9 +151,14 @@
         <div class="media-settings-grid">
           <section>
             <h3>Identity</h3>
+            <label id="profileUsernameField">Username<input id="profileUsername" type="text" autocomplete="off" placeholder="folder-name"></label>
             <label>Display name<input id="profileDisplayName" type="text" autocomplete="off"></label>
             <label>First name<input id="profileFirstName" type="text" autocomplete="off"></label>
             <label>Last name<input id="profileLastName" type="text" autocomplete="off"></label>
+            <label>Date of birth<input id="profileBirthDate" type="date"></label>
+            <label>Profile image URL<input id="profileImageUrl" type="url" autocomplete="off" placeholder="https://..."></label>
+            <label>Babepedia page URL<input id="profileImageSourceUrl" type="url" autocomplete="off" placeholder="https://www.babepedia.com/babe/..."></label>
+            <button class="media-profile-image-btn" id="profileResolveImageBtn" type="button">Fetch Babepedia image</button>
             <label>Age<input id="profileAge" type="number" min="0" max="120"></label>
             <label>Aliases<input id="profileAliases" type="text" autocomplete="off" placeholder="aliases, usernames, variants"></label>
             <label>Tags<input id="profileTags" type="text" autocomplete="off" placeholder="comma-separated tags"></label>
@@ -190,29 +188,24 @@
 
         <section>
           <h3>Stream</h3>
-          <div class="media-settings-grid compact">
-            <label>Quality
-              <select id="profileRecordQuality">
-                <option value="best">Best</option>
-                <option value="2160p">2160p</option>
-                <option value="1440p">1440p</option>
-                <option value="1080p">1080p</option>
-                <option value="720p">720p</option>
-                <option value="480p">480p</option>
-                <option value="360p">360p</option>
-              </select>
-            </label>
-            <label>Retention (days)<input id="profileRetentionDays" type="number" min="0" max="365"></label>
-            <label>Source
-              <select id="profileSourceType">
-                <option value="chaturbate">Chaturbate</option>
-                <option value="cam4">CAM4</option>
-              </select>
-            </label>
-            <label class="media-settings-check">
-              <input id="profileAutoRecord" type="checkbox">
-              <span>Auto-record</span>
-            </label>
+          <div class="media-profile-sources" id="profileSourcesList"></div>
+          <button class="media-source-add-btn" id="profileAddSourceBtn" type="button">Add source</button>
+          <div class="media-settings-legacy-fields" hidden>
+            <select id="profileRecordQuality">
+              <option value="best">Best</option>
+              <option value="2160p">2160p</option>
+              <option value="1440p">1440p</option>
+              <option value="1080p">1080p</option>
+              <option value="720p">720p</option>
+              <option value="480p">480p</option>
+              <option value="360p">360p</option>
+            </select>
+            <input id="profileRetentionDays" type="number" min="0" max="365">
+            <select id="profileSourceType">
+              <option value="chaturbate">Chaturbate</option>
+              <option value="cam4">CAM4</option>
+            </select>
+            <input id="profileAutoRecord" type="checkbox">
           </div>
         </section>
 

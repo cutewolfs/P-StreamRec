@@ -28,10 +28,6 @@ CHATURBATE_PASSWORD: Optional[str] = os.getenv("CHATURBATE_PASSWORD")
 CHATURBATE_CSRFTOKEN: Optional[str] = os.getenv("CHATURBATE_CSRFTOKEN")
 CHATURBATE_SESSIONID: Optional[str] = os.getenv("CHATURBATE_SESSIONID")
 
-# FlareSolverr
-FLARESOLVERR_URL: str = os.getenv("FLARESOLVERR_URL", "http://flaresolverr:8191")
-FLARESOLVERR_MAX_TIMEOUT: int = int(os.getenv("FLARESOLVERR_MAX_TIMEOUT", "60000"))
-
 # Chaturbate request settings
 CB_REQUEST_DELAY: float = float(os.getenv("CB_REQUEST_DELAY", "1.0"))
 

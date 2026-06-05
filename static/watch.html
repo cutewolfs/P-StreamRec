@@ -69,10 +69,46 @@
         <span id="followIcon">&#9829;</span>
         <span id="followText">Follow</span>
       </button>
-      <button class="watch-btn record-btn" id="recordBtn" onclick="toggleAutoRecord()" style="display: none;">
-        <span id="recordIcon">&#9679;</span>
-        <span id="recordText">Auto-Record</span>
+      <button class="watch-btn record-btn" id="recordBtn" onclick="openRecordingModal()" style="display: none;">
+        <span id="recordIcon">&#9881;</span>
+        <span id="recordText">Set recording</span>
       </button>
+    </div>
+  </div>
+
+  <div class="watch-recording-modal" id="recordingModal" style="display: none;" aria-hidden="true">
+    <div class="watch-recording-dialog" role="dialog" aria-modal="true" aria-labelledby="recordingModalTitle">
+      <div class="watch-recording-head">
+        <div>
+          <h2 id="recordingModalTitle">Set recording</h2>
+          <div id="recordingModalSubtitle">Choose where this live source belongs.</div>
+        </div>
+        <button class="watch-recording-close" type="button" onclick="closeRecordingModal()" aria-label="Close">&#215;</button>
+      </div>
+      <div class="watch-recording-tabs">
+        <button class="active" id="recordingExistingTab" type="button" onclick="setRecordingMode('existing')">Existing profile</button>
+        <button id="recordingCreateTab" type="button" onclick="setRecordingMode('create')">New profile</button>
+      </div>
+      <div class="watch-recording-body">
+        <section id="recordingExistingPane">
+          <label class="watch-recording-label">Search
+            <input id="recordingProfileSearch" type="search" autocomplete="off" placeholder="Search profiles">
+          </label>
+          <div class="watch-recording-list" id="recordingProfileList"></div>
+        </section>
+        <form id="recordingCreatePane" style="display: none;" onsubmit="submitCreateRecordingProfile(event)">
+          <label class="watch-recording-label">Username
+            <input id="recordingCreateUsername" type="text" autocomplete="off" required>
+          </label>
+          <label class="watch-recording-label">Display name
+            <input id="recordingCreateDisplayName" type="text" autocomplete="off">
+          </label>
+          <div class="watch-recording-actions">
+            <button class="watch-recording-secondary" type="button" onclick="closeRecordingModal()">Cancel</button>
+            <button class="watch-recording-primary" id="recordingCreateSubmit" type="submit">Create profile</button>
+          </div>
+        </form>
+      </div>
     </div>
   </div>
 

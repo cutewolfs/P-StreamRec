@@ -15,6 +15,7 @@ from yarl import URL
 
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from ..logger import logger
+from ..services.flaresolverr import DEFAULT_FLARE_SERVICE_URL, DEFAULT_FLARE_TIMEOUT_MS
 from .base import (
     BaseProvider,
     ProviderCapabilities,
@@ -1809,14 +1810,23 @@ class BrowserCaptureProvider(BaseProvider):
         page_url: str,
         username: Optional[str] = None,
     ) -> tuple[list[dict[str, Any]], Optional[str]]:
-        flaresolverr_url = (os.getenv("FLARESOLVERR_URL") or os.getenv("PSTREAMREC_FLARESOLVERR_URL") or "").strip()
+        flaresolverr_url = DEFAULT_FLARE_SERVICE_URL
+        if self.session_store:
+            try:
+                saved_url = await self.session_store.db.get_setting("flaresolverr_url")
+                if saved_url:
+                    parsed = urlparse(saved_url)
+                    if parsed.scheme in {"http", "https"} and parsed.netloc:
+                        flaresolverr_url = saved_url.strip().rstrip("/")
+            except Exception:
+                flaresolverr_url = DEFAULT_FLARE_SERVICE_URL
         if not flaresolverr_url:
             return [], None
 
         payload = {
             "cmd": "request.get",
             "url": page_url,
-            "maxTimeout": int(os.getenv("PSTREAMREC_FLARESOLVERR_TIMEOUT_MS", "60000") or "60000"),
+            "maxTimeout": DEFAULT_FLARE_TIMEOUT_MS,
         }
         endpoint = flaresolverr_url.rstrip("/") + "/v1"
         try:

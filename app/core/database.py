@@ -3,6 +3,7 @@ Gestion de la base de données SQLite pour le cache des modèles
 """
 import aiosqlite
 import json
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from datetime import datetime
@@ -19,6 +20,12 @@ class Database:
     @staticmethod
     def _normalize_source_type(source_type: Optional[str]) -> str:
         return (source_type or "").strip().lower() or "chaturbate"
+
+    @staticmethod
+    def _default_record_path(username: str) -> str:
+        model_folder = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(username or "").strip())
+        model_folder = model_folder.strip("._-") or "model"
+        return f"{model_folder}/videos/record"
 
     def _connect(self):
         """Ouvre une connexion aiosqlite avec timeout de verrou.
@@ -62,6 +69,7 @@ class Database:
                     auto_record BOOLEAN DEFAULT 1,
                     record_quality TEXT DEFAULT 'best',
                     retention_days INTEGER DEFAULT 30,
+                    record_path TEXT,
                     source_type TEXT NOT NULL DEFAULT 'chaturbate',
                     room_status TEXT,
                     created_at INTEGER,
@@ -79,6 +87,10 @@ class Database:
                     first_name TEXT,
                     last_name TEXT,
                     age INTEGER,
+                    birth_date TEXT,
+                    profile_image_url TEXT,
+                    profile_image_source_url TEXT,
+                    profile_image_path TEXT,
                     address TEXT,
                     city TEXT,
                     region TEXT,
@@ -92,6 +104,23 @@ class Database:
                     profile_urls TEXT,
                     created_at INTEGER,
                     updated_at INTEGER
+                )
+            """)
+
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS media_profile_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_username TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'chaturbate',
+                    channel_username TEXT NOT NULL,
+                    channel_url TEXT,
+                    auto_record BOOLEAN DEFAULT 1,
+                    record_quality TEXT DEFAULT 'best',
+                    retention_days INTEGER DEFAULT 30,
+                    record_path TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    UNIQUE(profile_username, source_type, channel_username)
                 )
             """)
             
@@ -231,6 +260,16 @@ class Database:
                 ON recordings(username, created_at DESC)
             """)
 
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_media_profile_sources_profile
+                ON media_profile_sources(profile_username)
+            """)
+
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_media_profile_sources_auto
+                ON media_profile_sources(auto_record, source_type, channel_username)
+            """)
+
             # Migrations idempotentes pour schémas existants
             await self._migrate_schema(db)
             await self._migrate_provider_identity_keys(db)
@@ -254,8 +293,13 @@ class Database:
             ("recordings", "playable_path", "TEXT"),
             ("recordings", "playable_size", "INTEGER"),
             ("recordings", "protected_from_retention", "BOOLEAN DEFAULT 0"),
+            ("media_profiles", "birth_date", "TEXT"),
+            ("media_profiles", "profile_image_url", "TEXT"),
+            ("media_profiles", "profile_image_source_url", "TEXT"),
+            ("media_profiles", "profile_image_path", "TEXT"),
             ("models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("models", "room_status", "TEXT"),
+            ("models", "record_path", "TEXT"),
             ("followed_models", "source_type", "TEXT DEFAULT 'chaturbate'"),
             ("followed_models", "room_status", "TEXT"),
             ("provider_sessions", "credential_username", "TEXT"),
@@ -300,6 +344,7 @@ class Database:
                     auto_record BOOLEAN DEFAULT 1,
                     record_quality TEXT DEFAULT 'best',
                     retention_days INTEGER DEFAULT 30,
+                    record_path TEXT,
                     source_type TEXT NOT NULL DEFAULT 'chaturbate',
                     room_status TEXT,
                     created_at INTEGER,
@@ -311,13 +356,13 @@ class Database:
                 INSERT OR REPLACE INTO models (
                     username, display_name, is_online, is_recording, viewers,
                     thumbnail_path, thumbnail_updated_at, last_check_at,
-                    auto_record, record_quality, retention_days, source_type,
+                    auto_record, record_quality, retention_days, record_path, source_type,
                     room_status, created_at, updated_at
                 )
                 SELECT
                     username, display_name, is_online, is_recording, viewers,
                     thumbnail_path, thumbnail_updated_at, last_check_at,
-                    auto_record, record_quality, retention_days,
+                    auto_record, record_quality, retention_days, record_path,
                     COALESCE(NULLIF(source_type, ''), 'chaturbate'),
                     room_status, created_at, updated_at
                 FROM models_legacy_provider_identity
@@ -390,6 +435,7 @@ class Database:
         auto_record: bool = True,
         record_quality: str = "best",
         retention_days: int = 30,
+        record_path: Optional[str] = None,
         source_type: Optional[str] = None,
     ):
         """Ajoute ou met à jour un modèle"""
@@ -402,19 +448,20 @@ class Database:
             await db.execute("""
                 INSERT INTO models (
                     username, display_name, auto_record, record_quality, 
-                    retention_days, source_type, created_at, updated_at
+                    retention_days, record_path, source_type, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, source_type) DO UPDATE SET
                     display_name = COALESCE(?, display_name),
                     auto_record = ?,
                     record_quality = ?,
                     retention_days = ?,
+                    record_path = COALESCE(?, record_path),
                     updated_at = ?
             """, (
                 username, display_name, auto_record, record_quality,
-                retention_days, source_type, now, now,
-                display_name, auto_record, record_quality, retention_days, now
+                retention_days, record_path, source_type, now, now,
+                display_name, auto_record, record_quality, retention_days, record_path, now
             ))
             await db.commit()
         
@@ -595,6 +642,15 @@ class Database:
         data["profile_urls"] = self._decode_json_list(data.get("profile_urls"))
         return data
 
+    def _format_media_profile_source_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(row)
+        data["auto_record"] = bool(data.get("auto_record"))
+        try:
+            data["retention_days"] = int(data.get("retention_days") if data.get("retention_days") is not None else 30)
+        except (TypeError, ValueError):
+            data["retention_days"] = 30
+        return data
+
     async def get_media_profile(self, username: str) -> Optional[Dict[str, Any]]:
         """Récupère la fiche locale d'un profil média."""
         await self.initialize()
@@ -634,6 +690,10 @@ class Database:
             "first_name": data.get("first_name"),
             "last_name": data.get("last_name"),
             "age": age,
+            "birth_date": data.get("birth_date"),
+            "profile_image_url": data.get("profile_image_url"),
+            "profile_image_source_url": data.get("profile_image_source_url"),
+            "profile_image_path": data.get("profile_image_path"),
             "address": data.get("address"),
             "city": data.get("city"),
             "region": data.get("region"),
@@ -651,16 +711,21 @@ class Database:
             await db.execute("""
                 INSERT INTO media_profiles (
                     username, display_name, first_name, last_name, age,
+                    birth_date, profile_image_url, profile_image_source_url, profile_image_path,
                     address, city, region, postal_code, country,
                     aliases, tags, notes, social_urls, stream_urls, profile_urls,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     display_name = ?,
                     first_name = ?,
                     last_name = ?,
                     age = ?,
+                    birth_date = ?,
+                    profile_image_url = ?,
+                    profile_image_source_url = ?,
+                    profile_image_path = ?,
                     address = ?,
                     city = ?,
                     region = ?,
@@ -679,6 +744,10 @@ class Database:
                 payload["first_name"],
                 payload["last_name"],
                 payload["age"],
+                payload["birth_date"],
+                payload["profile_image_url"],
+                payload["profile_image_source_url"],
+                payload["profile_image_path"],
                 payload["address"],
                 payload["city"],
                 payload["region"],
@@ -696,6 +765,10 @@ class Database:
                 payload["first_name"],
                 payload["last_name"],
                 payload["age"],
+                payload["birth_date"],
+                payload["profile_image_url"],
+                payload["profile_image_source_url"],
+                payload["profile_image_path"],
                 payload["address"],
                 payload["city"],
                 payload["region"],
@@ -714,11 +787,179 @@ class Database:
         profile = await self.get_media_profile(username)
         return profile or {"username": username}
 
+    async def get_media_profile_sources(self, profile_username: str) -> List[Dict[str, Any]]:
+        """Liste les sources d'enregistrement liées à un profil média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM media_profile_sources
+                WHERE profile_username = ?
+                ORDER BY source_type, channel_username
+                """,
+                (profile_username,),
+            )
+            rows = await cursor.fetchall()
+            return [self._format_media_profile_source_row(dict(row)) for row in rows]
+
+    async def get_all_media_profile_sources(self) -> List[Dict[str, Any]]:
+        """Liste toutes les sources d'enregistrement Media."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM media_profile_sources
+                ORDER BY profile_username, source_type, channel_username
+                """
+            )
+            rows = await cursor.fetchall()
+            return [self._format_media_profile_source_row(dict(row)) for row in rows]
+
+    async def get_media_profile_sources_for_auto_record(self) -> List[Dict[str, Any]]:
+        """Liste les sources Media dont l'enregistrement automatique est actif."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT * FROM media_profile_sources
+                WHERE auto_record = 1
+                ORDER BY profile_username, source_type, channel_username
+                """
+            )
+            rows = await cursor.fetchall()
+            return [self._format_media_profile_source_row(dict(row)) for row in rows]
+
+    async def upsert_media_profile_source(
+        self,
+        profile_username: str,
+        source_type: str,
+        channel_username: str,
+        channel_url: Optional[str] = None,
+        auto_record: bool = True,
+        record_quality: str = "best",
+        retention_days: int = 30,
+        record_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Crée ou met à jour une source de stream pour un profil média."""
+        await self.initialize()
+
+        now = int(datetime.now().timestamp())
+        source_type = self._normalize_source_type(source_type)
+        async with self._connect() as db:
+            await db.execute(
+                """
+                INSERT INTO media_profile_sources (
+                    profile_username, source_type, channel_username, channel_url,
+                    auto_record, record_quality, retention_days, record_path,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_username, source_type, channel_username) DO UPDATE SET
+                    channel_url = excluded.channel_url,
+                    auto_record = excluded.auto_record,
+                    record_quality = excluded.record_quality,
+                    retention_days = excluded.retention_days,
+                    record_path = excluded.record_path,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile_username,
+                    source_type,
+                    channel_username,
+                    channel_url,
+                    int(bool(auto_record)),
+                    record_quality,
+                    int(retention_days),
+                    record_path,
+                    now,
+                    now,
+                ),
+            )
+            await db.commit()
+
+        sources = await self.get_media_profile_sources(profile_username)
+        for source in sources:
+            if (
+                source.get("source_type") == source_type
+                and source.get("channel_username") == channel_username
+            ):
+                return source
+        return {
+            "profile_username": profile_username,
+            "source_type": source_type,
+            "channel_username": channel_username,
+            "channel_url": channel_url,
+            "auto_record": bool(auto_record),
+            "record_quality": record_quality,
+            "retention_days": int(retention_days),
+            "record_path": record_path,
+        }
+
+    async def replace_media_profile_sources(
+        self,
+        profile_username: str,
+        sources: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Remplace toutes les sources d'un profil média."""
+        await self.initialize()
+
+        now = int(datetime.now().timestamp())
+        async with self._connect() as db:
+            await db.execute(
+                "DELETE FROM media_profile_sources WHERE profile_username = ?",
+                (profile_username,),
+            )
+            for source in sources:
+                await db.execute(
+                    """
+                    INSERT INTO media_profile_sources (
+                        profile_username, source_type, channel_username, channel_url,
+                        auto_record, record_quality, retention_days, record_path,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        profile_username,
+                        self._normalize_source_type(source.get("source_type")),
+                        source.get("channel_username"),
+                        source.get("channel_url"),
+                        int(bool(source.get("auto_record"))),
+                        source.get("record_quality") or "best",
+                        int(source.get("retention_days") if source.get("retention_days") is not None else 30),
+                        source.get("record_path"),
+                        now,
+                        now,
+                    ),
+                )
+            await db.commit()
+
+        return await self.get_media_profile_sources(profile_username)
+
+    async def delete_media_profile_sources(self, profile_username: str) -> int:
+        """Supprime les sources de stream liées à un profil média."""
+        await self.initialize()
+
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM media_profile_sources WHERE profile_username = ?",
+                (profile_username,),
+            )
+            await db.commit()
+            return cursor.rowcount or 0
+
     async def delete_media_profile(self, username: str) -> None:
         """Supprime la fiche locale d'un profil média."""
         await self.initialize()
 
         async with self._connect() as db:
+            await db.execute("DELETE FROM media_profile_sources WHERE profile_username = ?", (username,))
             await db.execute("DELETE FROM media_profiles WHERE username = ?", (username,))
             await db.commit()
 
@@ -830,6 +1071,34 @@ class Database:
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def get_recordings_for_usernames(self, usernames: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Récupère les enregistrements de plusieurs profils en lots."""
+        await self.initialize()
+
+        clean_usernames = sorted({str(username) for username in usernames if str(username or "").strip()})
+        grouped: Dict[str, List[Dict[str, Any]]] = {username: [] for username in clean_usernames}
+        if not clean_usernames:
+            return grouped
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            for start in range(0, len(clean_usernames), 500):
+                chunk = clean_usernames[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = await db.execute(
+                    f"""
+                    SELECT * FROM recordings
+                    WHERE username IN ({placeholders})
+                    ORDER BY username, created_at DESC
+                    """,
+                    chunk,
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    data = dict(row)
+                    grouped.setdefault(data.get("username"), []).append(data)
+        return grouped
 
     async def get_import_recordings(self) -> List[Dict[str, Any]]:
         """Récupère les médias importés."""

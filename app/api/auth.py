@@ -19,6 +19,13 @@ def init(auth_service, flaresolverr=None):
     _flaresolverr = flaresolverr
 
 
+def set_flaresolverr(flaresolverr=None):
+    global _flaresolverr
+    _flaresolverr = flaresolverr
+    if _auth_service:
+        _auth_service.flaresolverr = flaresolverr
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str

@@ -209,7 +209,7 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
             for user_dir in records_root.iterdir():
                 if user_dir.is_dir():
                     username = user_dir.name
-                    for ts_file in user_dir.glob("*.ts"):
+                    for ts_file in user_dir.rglob("*.ts"):
                         # Vérifier si déjà dans la DB
                         recordings = await db.get_recordings(username)
                         existing = next((r for r in recordings if r['filename'] == ts_file.name), None)
@@ -273,7 +273,7 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                 recordings_by_filename = {r['filename']: r for r in user_recordings}
 
                 # Scanner TOUS les fichiers .ts dans le dossier de l'utilisateur
-                for ts_file in user_dir.glob("*.ts"):
+                for ts_file in user_dir.rglob("*.ts"):
                     ts_path = Path(ts_file)
 
                     # Vérifier si ce fichier est en cours d'enregistrement

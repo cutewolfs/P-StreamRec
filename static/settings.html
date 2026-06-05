@@ -9,7 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/loader.js"></script>
-  <script defer src="/static/settings.js?v=13"></script>
+  <script defer src="/static/settings.js?v=15"></script>
   <style>
     /* --- Processes tab --- */
     .proc-count-badge {
@@ -205,10 +205,6 @@
           <span class="settings-nav-icon">&#129514;</span>
           <span>Tests</span>
         </button>
-        <button class="settings-nav-item" data-tab="application">
-          <span class="settings-nav-icon">&#8505;</span>
-          <span>Application</span>
-        </button>
         <button class="settings-nav-item" data-tab="statistics">
           <span class="settings-nav-icon">&#128202;</span>
           <span>Statistics</span>
@@ -258,15 +254,28 @@
                 <span class="settings-row-value" id="flareVersion">-</span>
               </div>
               <div class="settings-row" id="flareUrlRow">
-                <span class="settings-row-label">URL</span>
-                <span class="settings-row-value" id="flareUrl" style="font-family: monospace; font-size: 0.85rem;">-</span>
+                <div>
+                  <span class="settings-row-label">URL</span>
+                  <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 0.25rem;">Endpoint used for Cloudflare challenge handling.</p>
+                </div>
+                <div style="display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end; flex-wrap: wrap;">
+                  <input
+                    type="url"
+                    id="flareUrlInput"
+                    placeholder="http://flaresolverr:8191"
+                    autocomplete="off"
+                    spellcheck="false"
+                    style="width: min(32rem, 100%); padding: 0.5rem 0.75rem; background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border); border-radius: 6px; font-family: monospace; font-size: 0.85rem;"
+                  />
+                  <button type="button" class="btn-secondary" id="flareSaveBtn" onclick="saveFlareSolverrUrl()" style="padding: 0.5rem 0.85rem; font-size: 0.85rem;">Save</button>
+                </div>
               </div>
               <div class="settings-row">
                 <button class="btn-primary" id="flareTestBtn" onclick="checkFlareSolverr(true)" style="padding: 0.45rem 1rem; font-size: 0.85rem;">Test connection</button>
               </div>
               <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-muted); line-height: 1.5;">
                 FlareSolverr helps bypass Cloudflare protection when accessing Chaturbate.
-                It is configured via environment variables (FLARESOLVERR_URL).
+                Saved here takes effect immediately and is reused on restart.
               </p>
             </div>
           </div>
@@ -534,27 +543,6 @@
               <div class="tests-list" id="testsList"></div>
             </div>
           </div>
-        </div>
-
-        <!-- Application Tab -->
-        <div class="settings-tab" id="tab-application">
-          <div class="settings-section">
-            <div class="settings-section-header">
-              <span class="icon">&#8505;</span>
-              <h3>Application</h3>
-            </div>
-            <div class="settings-section-body">
-              <div class="settings-row">
-                <span class="settings-row-label">Version</span>
-                <span class="settings-row-value" id="appVersionSetting">-</span>
-              </div>
-              <div class="settings-row">
-                <span class="settings-row-label">API Status</span>
-                <span class="status-indicator connected" id="apiStatus">Connected</span>
-              </div>
-            </div>
-          </div>
-
         </div>
 
         <!-- Statistics Tab -->

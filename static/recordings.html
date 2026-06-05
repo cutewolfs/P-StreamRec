@@ -10,7 +10,7 @@
   <link rel="stylesheet" href="/static/styles.css">
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <script src="/static/loader.js"></script>
-  <script defer src="/static/recordings.js?v=8"></script>
+  <script defer src="/static/recordings.js?v=9"></script>
   <style>
     /* --- Per-model edit panel --- */
     .model-edit-panel {
@@ -25,6 +25,7 @@
       border-radius: 12px;
     }
     .model-edit-panel .field { display: flex; flex-direction: column; gap: 0.35rem; }
+    .model-edit-panel .field.wide { grid-column: 1 / -1; }
     .model-edit-panel label {
       font-size: 0.72rem;
       letter-spacing: 0.05em;
@@ -208,6 +209,7 @@
         <div class="field">
           <label for="editRetention">Retention (days)</label>
           <input type="number" id="editRetention" min="0" max="365" step="1" />
+          <span class="effective-hint">0 keeps recordings forever</span>
         </div>
         <div class="field">
           <label for="editAutoRecord">Auto-Record</label>
@@ -215,6 +217,11 @@
             <option value="true">Enabled</option>
             <option value="false">Disabled</option>
           </select>
+        </div>
+        <div class="field wide">
+          <label for="editRecordPath">Storage Location</label>
+          <input type="text" id="editRecordPath" autocomplete="off" />
+          <span class="effective-hint" id="recordPathHint"></span>
         </div>
         <div class="actions">
           <button class="save-btn" id="saveModelBtn" onclick="saveModelSettings()">Save Changes</button>

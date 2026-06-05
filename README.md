@@ -4,179 +4,196 @@
 [![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
 [![Open Source](https://img.shields.io/badge/Open%20Source-Yes-green.svg)](https://github.com/raccommode/P-StreamRec)
 
-**Watch, record, and follow live cam streams across integrated providers + any m3u8 source — with a modern web interface.**
+**Discover, watch, record, and organize live cam streams with a profile-first media library.**
 
 ## Features
 
-- **24/7 automatic recording** — monitors models and records when they go live
-- **Recording segmentation** — optionally split captures by 30/60/90 minutes or by maximum file size
-- **Auto MP4 conversion** — converts TS to compressed MP4 in background (50-70% smaller)
-- **Discover** — browse live models from every supported site with gender, tag, and search filters
-- **Following** — one list aggregating your follows across providers
-- **Recordings** — manage all recordings with built-in video player
-- **Live Watch** — watch streams directly in the browser with HLS player
-- **Account login** — provider sessions are stored as cookies/localStorage, never passwords
-- **Protected providers** — Playwright browser capture plus yt-dlp extractors for JS/Cloudflare-heavy sites
-- **Settings** — manage accounts, FlareSolverr status, tag blacklist
-- **Password protection** — optional login to secure the interface
-- **GitOps updates** — update the app directly from the UI
-- **Docker ready** — one command to get started
+- **Discover** live models from supported providers with source, tag, gender, and search filters.
+- **Following** keeps local and provider-backed follows grouped by source.
+- **Watch** opens a browser player for live streams and exposes a **Set recording** flow.
+- **Set recording** links the current live channel to an existing Media profile or creates a new profile.
+- **Media** is the main library surface for finished recordings, imported files placed on disk, photos, and model profiles.
+- **Profiles** store display name, first/last name, birth date, aliases, tags, social links, notes, and a vertical profile image URL.
+- **Profile images** can be saved from a direct image URL or resolved from a Babepedia page URL.
+- **Multiple stream sources per profile** let one profile record several Chaturbate, CAM4, or other supported channels.
+- **Per-source recording controls** include source URL, quality, retention, and auto-record.
+- **Continuous playback** supports previous/next navigation and an automatic next-video prompt.
+- **Unwatched filters** make it possible to sort unseen videos from oldest to newest and continue through them.
+- **Automatic recording** monitors enabled profile sources and records when they go live.
+- **Recording segmentation** can split captures by time or maximum file size.
+- **Auto MP4 conversion** converts TS recordings to browser-friendly MP4 in the background.
+- **Settings** manage provider accounts, FlareSolverr URL, recording defaults, diagnostics, logs, and tag rules.
+- **FlareSolverr integration** is configurable from Settings and defaults to the bundled Compose service.
+- **Password protection** can restrict access to the web interface.
+- **Docker ready** for local installs, NAS setups, and one-command updates.
 
 ## Supported sites
 
 | Site | Discover | Watch | Record | Follow |
 |------|:--------:|:-----:|:------:|:------:|
-| **Chaturbate** | ✅ | ✅ | ✅ | ✅ |
-| **CAM4** | ✅ | ✅ | ✅ | ✅ |
-| Stripchat | ✅ | ✅ | ✅ | Local |
-| BongaCams | ✅ | ✅ | ✅ | Local |
-| MyFreeCams | ✅ | ✅ | ✅ | Local |
-| LiveJasmin | ✅ | ✅ | ✅ | Local |
-| CamSoda | ✅ | ✅ | ✅ | Local |
-| Cams.com | ✅ | ✅ | ✅ | Local |
-| Xcams | ✅ | ✅ | ✅ | Local |
+| **Chaturbate** | yes | yes | yes | yes |
+| **CAM4** | yes | yes | yes | yes |
+| Stripchat | yes | yes | yes | local |
+| BongaCams | yes | yes | yes | local |
+| MyFreeCams | yes | yes | yes | local |
+| LiveJasmin | yes | yes | yes | local |
+| CamSoda | yes | yes | yes | local |
+| Cams.com | yes | yes | yes | local |
+| Xcams | yes | yes | yes | local |
 
-New providers expose Discover through provider-specific browse/search pages, then resolve public live HLS/DASH streams through yt-dlp or the integrated Playwright browser. Follow is local unless the provider exposes a compatible authenticated follow API.
+Provider integrations expose Discover through provider-specific browse/search pages, then resolve public live HLS/DASH streams through yt-dlp or the integrated Playwright browser. Follow support is local unless the provider exposes a compatible authenticated follow API.
 
 ## Screenshots
 
-| Discover | Following | Recordings |
-|----------|-----------|------------|
-| ![Discover](discover.png) | ![Following](following.png) | ![Recordings](recordings.png) |
+| Discover | Following | Media |
+|----------|-----------|-------|
+| ![Discover](discover.png) | ![Following](following.png) | ![Media](recordings.png) |
 
 ## Quick Start
 
-### UmbrelOS (one-click install)
+### Docker Compose
 
-P-StreamRec ships as an Umbrel Community App Store. On your Umbrel:
-
-1. Open the **App Store**, click the store menu, then **Community App Stores → Add**
-2. Paste the repo URL: `https://github.com/raccommode/P-StreamRec`
-3. Install **P-StreamRec** from the store
-
-FlareSolverr is bundled inside the app — no extra setup required. Recordings are stored in `${APP_DATA_DIR}/data` on your Umbrel.
-
-### Docker Compose (recommended, includes FlareSolverr)
-
-```yaml
-version: "3.8"
-services:
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    environment:
-      - LOG_LEVEL=info
-    ports:
-      - "8191:8191"
-    restart: unless-stopped
-
-  p-streamrec:
-    image: ${PSTREAMREC_IMAGE:-ghcr.io/raccommode/p-streamrec:latest}
-    depends_on:
-      - flaresolverr
-    environment:
-      - CB_RESOLVER_ENABLED=true
-      - FLARESOLVERR_URL=http://flaresolverr:8191
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./data:/data
-    restart: unless-stopped
-```
-
-### Docker Run (simple)
+The included Compose stack starts P-StreamRec and FlareSolverr together.
 
 ```bash
-docker run -d --name p-streamrec \
-  -p 8080:8080 -v ./data:/data \
-  -e CB_RESOLVER_ENABLED=true \
-  ghcr.io/raccommode/p-streamrec:latest
+git clone https://github.com/raccommode/P-StreamRec.git
+cd P-StreamRec
+docker compose up -d
 ```
 
-**Access:** `http://localhost:8080`
+Open the app at `http://localhost:8080`.
 
-For local image testing without changing the default image:
+For local image testing:
 
 ```bash
 docker build -t p-streamrec:local .
-PSTREAMREC_IMAGE=p-streamrec:local HOST_PORT=2727 docker compose up -d --force-recreate
+PSTREAMREC_IMAGE=p-streamrec:local HOST_PORT=2727 docker compose up -d p-streamrec
 ```
 
-## Configuration
+Open the local test instance at `http://127.0.0.1:2727`.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OUTPUT_DIR` | `/data` | Recordings folder |
-| `PORT` | `8080` | Web interface port |
-| `HOST_PORT` | `8080` | Host port used by Docker Compose |
-| `PSTREAMREC_IMAGE` | `ghcr.io/raccommode/p-streamrec:latest` | Docker Compose image override for local builds |
-| `FFMPEG_PATH` | `ffmpeg` | Path to FFmpeg |
-| `RECORDING_RANGE_CHUNK_SIZE` | `8388608` | Max bytes returned for open-ended replay Range requests |
-| `CB_RESOLVER_ENABLED` | `true` | Enable Chaturbate support |
-| `PSTREAMREC_DNS_CACHE` | `false` | Enable a container-local DNS cache for FFmpeg/HLS lookups |
-| `PSTREAMREC_DNS_CACHE_UPSTREAMS` | — | Optional comma-separated upstream DNS servers for the local DNS cache |
-| `PSTREAMREC_BROWSER_HEADLESS` | `true` | Run the integrated Playwright browser headless |
-| `PSTREAMREC_BROWSER_CAPTURE_TIMEOUT` | `25` | Seconds to capture HLS/DASH requests from browser-protected providers |
-| `CB_REQUEST_DELAY` | `1.0` | Delay between Chaturbate requests (seconds) |
-| `PASSWORD` | — | Password to protect the interface (optional) |
-| `AUTO_RECORD_USERS` | — | Comma-separated usernames to auto-record |
-| `AUTO_RECORD_INTERVAL` | `120` | Default seconds between background live-status checks; can be overridden in Settings |
-| `RECORD_SEGMENT_DURATION_MINUTES` | `0` | Optional recording split interval: `0`, `30`, `60`, or `90` minutes |
-| `RECORD_SEGMENT_SIZE_MB` | `0` | Optional maximum TS segment size in MB; `0` disables size-based splitting |
-| `CHATURBATE_USERNAME` | — | Chaturbate login (optional, enables Following + better quality) |
-| `CHATURBATE_PASSWORD` | — | Chaturbate password (optional) |
-| `FLARESOLVERR_URL` | — | FlareSolverr URL (e.g. `http://flaresolverr:8191`) |
-| `PSTREAMREC_PROXY_URL` | — | Optional outbound proxy for provider requests (`http://`, `https://`, `socks4://`, `socks5://`) |
-| `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | — | Standard proxy env vars, also honored when `PSTREAMREC_PROXY_URL` is unset |
-| `NO_PROXY` | `localhost,127.0.0.1,flaresolverr` | Hosts that should bypass standard proxy env vars |
-| `TZ` | `UTC` | Timezone (e.g. `America/Toronto`) |
+### UmbrelOS
 
-For recording downloads, FFmpeg can use HTTP(S) proxies via `PSTREAMREC_PROXY_URL`
-or the standard proxy env vars. SOCKS proxies are supported by the Python
-resolvers/API calls; use an HTTP proxy if FFmpeg also needs to fetch HLS
-segments through the proxy.
+P-StreamRec ships as an Umbrel Community App Store app.
 
-For Chaturbate/CDN recordings that trigger repeated FFmpeg DNS lookups during
-live LL-HLS playlist reloads, set `PSTREAMREC_DNS_CACHE=true` to start a small
-`dnsmasq` cache inside the P-StreamRec container. The cache keeps repeated
-lookups local until the upstream DNS TTL expires. If your container already
-uses a localhost resolver, also set `PSTREAMREC_DNS_CACHE_UPSTREAMS=1.1.1.1,1.0.0.1`
-or your preferred upstream servers to avoid a resolver loop.
+1. Open the **App Store**.
+2. Open the store menu, then **Community App Stores -> Add**.
+3. Paste `https://github.com/raccommode/P-StreamRec`.
+4. Install **P-StreamRec**.
 
-## Usage
+FlareSolverr is bundled with the app and recordings are stored in the app data folder.
 
-1. **Add a model** — click **+**, choose a source, then enter a username or profile URL
-2. **Auto-record** — the system checks every 2 minutes and records when live
-3. **Auto-convert** — when the stream ends, TS is converted to MP4 automatically
-4. **Watch live** — click a model card to open the live player
-5. **Browse replays** — go to the Recordings page to watch or delete recordings
+## App Configuration
 
-### Recording format
+Most day-to-day configuration is handled from the web UI:
 
-- Original: `/data/records/<username>/YYYYMMDD_HHMMSS_ID.ts` (MPEG-TS, lossless)
-- Segmented original: `/data/records/<username>/YYYYMMDD_HHMMSS_ID_part001.ts`, `_part002.ts`, ... when duration or size segmentation is enabled
-- Converted: `/data/records/<username>/YYYYMMDD_HHMMSS_ID.mp4` (H.264, auto-generated)
+- **Settings -> Providers**: connect provider accounts, import browser sessions, and sync follows.
+- **Settings -> FlareSolverr**: edit, save, and test the FlareSolverr service URL.
+- **Settings -> Recording**: set monitor interval, default quality, retention, conversion, TS retention, segmentation, and watched cleanup.
+- **Settings -> Tests**: run local diagnostics for API, providers, recording, media, and supporting services.
+- **Media -> Profile settings**: edit model identity, profile image, links, notes, and stream sources.
 
-### Storage estimates
+FlareSolverr defaults to `http://flaresolverr:8191` when using the bundled Compose stack. If you run FlareSolverr somewhere else, save the custom URL in **Settings -> FlareSolverr**.
+
+## Media Library
+
+Media is built around profile folders under:
+
+```text
+/data/records/<profile>/
+```
+
+Automatic recordings and files you place manually in those folders appear in the Media library after indexing. The UI does not provide an upload button; add personal media by copying or dragging files into the profile folder on disk.
+
+Supported Media videos:
+
+```text
+.mp4 .m4v .mov .webm .mkv .avi
+```
+
+Supported Media photos:
+
+```text
+.jpg .jpeg .png .webp .gif .bmp .avif
+```
+
+Raw `.ts` files are intentionally excluded from Media. They may still exist on disk as original recording files or conversion sources, but Media only exposes browser-oriented videos and photos.
+
+## Recording Flow
+
+1. Open **Discover** or **Following**.
+2. Open a live model in **Watch**.
+3. Click **Set recording**.
+4. Choose an existing Media profile or create a new one.
+5. The live channel is saved as a stream source on that profile.
+6. Enable auto-record on any source that should be monitored automatically.
+
+Each profile can have multiple stream sources. This allows one model profile to record several channels, for example two Chaturbate pages or one Chaturbate page plus one CAM4 page.
+
+Source settings:
+
+- **URL**: the source page or channel URL.
+- **Quality**: `Best` or a specific maximum resolution.
+- **Retention**: days to keep recordings; `0` keeps them forever.
+- **Auto-record**: enables or disables background monitoring for that source.
+
+## Playback
+
+The Media page supports:
+
+- filtering by profile, type, search text, and watched state;
+- sorting by newest, oldest, largest, smallest, or name;
+- saved video playback progress;
+- watched/unwatched state;
+- previous and next video controls;
+- a short countdown prompt that automatically opens the next video if you do nothing.
+
+## Recording Files
+
+Default recording paths:
+
+```text
+/data/records/<profile>/<timestamp>_<id>.ts
+/data/records/<profile>/<timestamp>_<id>.mp4
+```
+
+Segmented recordings use numbered suffixes:
+
+```text
+/data/records/<profile>/<timestamp>_<id>_part001.ts
+/data/records/<profile>/<timestamp>_<id>_part002.ts
+```
+
+Estimated storage:
 
 | Format | Size per hour |
 |--------|---------------|
-| TS (original) | ~2–4 GB |
-| MP4 (converted) | ~600 MB–1.2 GB |
+| TS original | about 2-4 GB |
+| MP4 converted | about 600 MB-1.2 GB |
 
 ## Development
 
 ```bash
 git clone https://github.com/raccommode/P-StreamRec.git
 cd P-StreamRec
-python -m venv .venv && source .venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
-**Stack:** FastAPI, SQLite (aiosqlite), HLS.js, FFmpeg, Docker
+Recommended validation:
+
+```bash
+python3 -m compileall app
+python -m unittest discover -s tests
+docker build -t p-streamrec:local .
+```
+
+**Stack:** FastAPI, SQLite, HLS.js, FFmpeg, Playwright, Docker
 
 ## License
 
-**Non-Commercial Open Source License** — See [LICENSE](LICENSE)
+**Non-Commercial Open Source License** - See [LICENSE](LICENSE)
 
-Free to use, modify, and distribute — **no commercial use** — share modifications under same license — attribution required
+Free to use, modify, and distribute for non-commercial purposes. Modifications must keep the same license and attribution.
