@@ -1,10 +1,9 @@
-name: Fast checks / beta publish
+name: Fast checks / publish
 
 on:
   push:
     branches:
       - main
-      - beta
   workflow_dispatch:
     inputs:
       platforms:
@@ -34,7 +33,7 @@ jobs:
           sh -n docker/entrypoint.sh
 
   build-and-push:
-    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main' || github.ref_name == 'beta'
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -63,10 +62,6 @@ jobs:
 
           N=$(( LATEST + 1 ))
           VERSION="${PREFIX}.${N}"
-          if [ "${GITHUB_REF_NAME}" = "beta" ]; then
-            VERSION="${VERSION}-beta"
-          fi
-
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Computed version: $VERSION"
         env:
@@ -93,7 +88,6 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
-            type=raw,value=beta,enable=${{ github.ref_name == 'beta' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
