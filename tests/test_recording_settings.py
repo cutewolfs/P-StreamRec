@@ -12,12 +12,17 @@ from app.tasks.monitor import get_check_interval_seconds
 class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._original_db = app_main.db
+        self._original_flaresolverr_client = app_main.flaresolverr_client
         self._tmpdir = tempfile.TemporaryDirectory()
         app_main.db = Database(Path(self._tmpdir.name) / "streamrec.db")
         await app_main.db.initialize()
 
     async def asyncTearDown(self):
         app_main.db = self._original_db
+        app_main.flaresolverr_client = self._original_flaresolverr_client
+        app_main.auth_router.set_flaresolverr(self._original_flaresolverr_client)
+        if app_main.chaturbate_api:
+            app_main.chaturbate_api.flaresolverr = self._original_flaresolverr_client
         self._tmpdir.cleanup()
 
     async def test_check_interval_defaults_to_config_value(self):
@@ -62,6 +67,71 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_filename_format_is_rejected(self):
         with self.assertRaises(HTTPException):
             await app_main.update_recording_settings({"filename_format": "template"})
+
+    async def test_flaresolverr_url_defaults_to_internal_compose_service(self):
+        settings = await app_main.get_flaresolverr_settings()
+
+        self.assertEqual("http://flaresolverr:8191", settings["flaresolverrUrl"])
+
+    async def test_flaresolverr_url_can_be_saved_and_applied(self):
+        settings = await app_main.update_flaresolverr_settings(
+            {"url": "http://flaresolve:8191/"}
+        )
+
+        self.assertTrue(settings["success"])
+        self.assertEqual("http://flaresolve:8191", settings["flaresolverrUrl"])
+        self.assertEqual(
+            "http://flaresolve:8191",
+            await app_main.db.get_setting(app_main.FLARE_SERVICE_URL_SETTING_KEY),
+        )
+        self.assertEqual("http://flaresolve:8191", app_main.flaresolverr_client.base_url)
+
+    async def test_invalid_flaresolverr_url_is_rejected(self):
+        with self.assertRaises(HTTPException) as ctx:
+            await app_main.update_flaresolverr_settings({"url": "ftp://flaresolverr"})
+
+        self.assertEqual(400, ctx.exception.status_code)
+
+    async def test_existing_model_without_record_path_keeps_legacy_folder(self):
+        await app_main.db.add_or_update_model(username="model")
+
+        models = await app_main.get_models()
+        model = models["models"][0]
+
+        self.assertEqual("model", model["recordPath"])
+        self.assertEqual("model/videos/record", model["recordPathDefault"])
+
+    async def test_new_model_defaults_to_videos_record_folder(self):
+        await app_main.add_model({"username": "model"})
+
+        saved = await app_main.db.get_model("model")
+
+        self.assertEqual("model/videos/record", saved["record_path"])
+
+    async def test_model_record_path_can_be_saved_with_zero_retention(self):
+        await app_main.db.add_or_update_model(username="model")
+
+        result = await app_main.update_model(
+            "model",
+            {
+                "recordPath": "model/videos/record",
+                "retentionDays": 0,
+                "autoRecord": True,
+            },
+        )
+        saved = await app_main.db.get_model("model")
+
+        self.assertEqual("model/videos/record", result["model"]["recordPath"])
+        self.assertEqual("model/videos/record", saved["record_path"])
+        self.assertEqual(0, saved["retention_days"])
+
+    async def test_model_record_path_must_stay_inside_model_folder(self):
+        await app_main.db.add_or_update_model(username="model")
+
+        with self.assertRaises(HTTPException) as ctx:
+            await app_main.update_model("model", {"recordPath": "other/videos/record"})
+
+        self.assertEqual(400, ctx.exception.status_code)
 
 
 if __name__ == "__main__":

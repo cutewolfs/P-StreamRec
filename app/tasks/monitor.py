@@ -264,7 +264,7 @@ async def generate_thumbnail_from_recording(
             return None
         
         # Trouver la dernière rediffusion
-        ts_files = sorted(records_dir.glob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
+        ts_files = sorted(records_dir.rglob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
         
         if not ts_files:
             return None
@@ -567,12 +567,54 @@ async def generate_recording_thumbnail(
     return None
 
 
+async def _record_dirs_for_username(db: 'Database', username: str, output_dir: Path) -> list[Path]:
+    records_root = output_dir / "records"
+    candidates: list[Path] = []
+    try:
+        model = await db.get_model(username)
+    except Exception:
+        model = None
+
+    record_path = (model or {}).get("record_path")
+    if record_path:
+        try:
+            relative = Path(str(record_path))
+            if not relative.is_absolute() and not any(part in {"", ".", ".."} for part in relative.parts):
+                candidates.append(records_root / relative)
+        except Exception:
+            pass
+    else:
+        candidates.append(records_root / username)
+
+    candidates.extend([
+        records_root / username / "videos" / "record",
+        records_root / username,
+    ])
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    root = records_root.resolve()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(root):
+                continue
+            key = str(resolved)
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
 async def update_recordings_cache(db: 'Database', username: str, output_dir: Path, ffmpeg_path: str = "ffmpeg"):
     """Met à jour le cache des enregistrements dans SQLite"""
     try:
         import time
         records_root = output_dir / "records"
-        records_dir = records_root / username
+        records_dirs = await _record_dirs_for_username(db, username, output_dir)
 
         # Purge des rows DB orphelines : un fichier TS et MP4 qui n'existent
         # plus sur disque doivent être retirés de la DB, sinon le recording
@@ -598,7 +640,8 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                         task="monitor",
                     )
 
-        if not records_dir.exists():
+        records_dirs = [records_dir for records_dir in records_dirs if records_dir.exists()]
+        if not records_dirs:
             return
 
         async def cleanup_short_recording(ts_file: Path, existing_rec: dict | None, seconds_since_modification: float) -> bool:
@@ -656,7 +699,7 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
             )
             return True
 
-        for ts_file in records_dir.glob("*.ts"):
+        for ts_file in (ts_file for records_dir in records_dirs for ts_file in records_dir.glob("*.ts")):
             stat = ts_file.stat()
             
             # Récupérer la durée actuelle depuis la DB

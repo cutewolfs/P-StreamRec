@@ -734,35 +734,44 @@ async function toggleFollow() {
 }
 
 // ============================================
-// Track / Auto-record status
+// Recording profile link
 // ============================================
+var recordingProfiles = [];
+var recordingProfileSearch = '';
+
+function currentChannelUrl() {
+  var source = (currentSourceType || 'chaturbate').toLowerCase();
+  if (source === 'cam4') return 'https://www.cam4.com/' + encodeURIComponent(currentUsername);
+  return 'https://chaturbate.com/' + encodeURIComponent(currentUsername) + '/';
+}
+
 async function loadTrackStatus() {
   try {
-    var res = await fetch('/api/models');
+    var res = await fetch('/api/media-library?limit=1', { cache: 'no-store' });
     if (!res.ok) return;
     var data = await res.json();
-    var models = data.models || [];
+    var profiles = data.profiles || [];
     var found = null;
-    for (var i = 0; i < models.length; i++) {
-      var modelSource = (models[i].sourceType || models[i].source_type || 'chaturbate').toLowerCase();
+    for (var i = 0; i < profiles.length; i++) {
+      var sources = profiles[i].streamSources || profiles[i].stream_sources || [];
       var currentSource = (currentSourceType || 'chaturbate').toLowerCase();
-      if (models[i].username === currentUsername && modelSource === currentSource) {
-        found = models[i];
-        break;
+      for (var j = 0; j < sources.length; j++) {
+        var sourceType = (sources[j].sourceType || sources[j].source_type || 'chaturbate').toLowerCase();
+        var channelUsername = sources[j].channelUsername || sources[j].channel_username || '';
+        if (channelUsername === currentUsername && sourceType === currentSource) {
+          found = profiles[i];
+          break;
+        }
       }
+      if (found) break;
     }
 
-    if (found) {
-      isModelTracked = true;
-      isAutoRecord = found.autoRecord;
-    } else {
-      isModelTracked = false;
-      isAutoRecord = false;
-    }
+    isModelTracked = !!found;
+    isAutoRecord = !!found;
     updateRecordButton();
     document.getElementById('recordBtn').style.display = 'inline-flex';
   } catch (e) {
-    console.error('Error loading track status:', e);
+    console.error('Error loading recording profile status:', e);
   }
 }
 
@@ -773,72 +782,179 @@ function updateRecordButton() {
 
   if (isAutoRecord) {
     btn.classList.add('active');
-    icon.innerHTML = '&#9679;';
-    text.textContent = 'Recording On';
+    icon.innerHTML = '&#10003;';
+    text.textContent = 'Recording set';
   } else {
     btn.classList.remove('active');
-    icon.innerHTML = '&#9675;';
-    text.textContent = 'Auto-Record';
+    icon.innerHTML = '&#9881;';
+    text.textContent = 'Set recording';
   }
 }
 
-async function toggleAutoRecord() {
-  var btn = document.getElementById('recordBtn');
-  btn.disabled = true;
+function normalizeProfileUsername(value) {
+  return String(value || '')
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '');
+}
 
+function profileLabel(profile) {
+  return profile.displayName || profile.display_name || profile.username || '';
+}
+
+function sourceCountLabel(profile) {
+  var sources = profile.streamSources || profile.stream_sources || [];
+  if (!sources.length) return 'No source yet';
+  return sources.length === 1 ? '1 source' : sources.length + ' sources';
+}
+
+async function loadRecordingProfiles() {
   try {
-    // If not tracked, add model first
-    if (!isModelTracked) {
-      var addRes = await fetch('/api/models', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: currentUsername,
-          autoRecord: true,
-          recordQuality: 'best',
-          sourceType: currentSourceType || 'chaturbate'
-        })
-      });
-      if (addRes.ok || addRes.status === 409) {
-        isModelTracked = true;
-        isAutoRecord = true;
-        updateRecordButton();
-        showNotification('Auto-record enabled for ' + currentUsername, 'success');
-        return;
-      } else {
-        showNotification('Failed to enable auto-record', 'error');
-        return;
-      }
-    }
+    var res = await fetch('/api/media-library?limit=1', { cache: 'no-store' });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(data.detail || 'Profiles unavailable');
+    recordingProfiles = data.profiles || [];
+    renderRecordingProfileList();
+  } catch (e) {
+    console.error('Error loading recording profiles:', e);
+    recordingProfiles = [];
+    renderRecordingProfileList(e.message || 'Profiles unavailable');
+  }
+}
 
-    // Toggle auto-record
-    var newValue = !isAutoRecord;
-    var res = await fetch('/api/models/' + currentUsername + '/auto-record', {
-      method: 'PATCH',
+function renderRecordingProfileList(errorMessage) {
+  var list = document.getElementById('recordingProfileList');
+  if (!list) return;
+  if (errorMessage) {
+    list.innerHTML = '<div class="watch-recording-profile">' + escapeHtml(errorMessage) + '</div>';
+    return;
+  }
+  var query = recordingProfileSearch.trim().toLowerCase();
+  var profiles = recordingProfiles.filter(function(profile) {
+    if (!query) return true;
+    return [
+      profile.username,
+      profile.displayName || profile.display_name,
+      profile.firstName || profile.first_name,
+      profile.lastName || profile.last_name
+    ].join(' ').toLowerCase().indexOf(query) !== -1;
+  });
+  if (!profiles.length) {
+    list.innerHTML = '<div class="watch-recording-profile">No profile found</div>';
+    return;
+  }
+  list.innerHTML = profiles.map(function(profile) {
+    return '<button class="watch-recording-profile" type="button" data-profile="' + escapeHtml(profile.username) + '">' +
+      '<strong>' + escapeHtml(profileLabel(profile)) + '</strong>' +
+      '<span>' + escapeHtml(sourceCountLabel(profile)) + '</span>' +
+    '</button>';
+  }).join('');
+}
+
+function setRecordingMode(mode) {
+  var existingTab = document.getElementById('recordingExistingTab');
+  var createTab = document.getElementById('recordingCreateTab');
+  var existingPane = document.getElementById('recordingExistingPane');
+  var createPane = document.getElementById('recordingCreatePane');
+  var create = mode === 'create';
+  if (existingTab) existingTab.classList.toggle('active', !create);
+  if (createTab) createTab.classList.toggle('active', create);
+  if (existingPane) existingPane.style.display = create ? 'none' : '';
+  if (createPane) createPane.style.display = create ? '' : 'none';
+}
+
+function openRecordingModal() {
+  var modal = document.getElementById('recordingModal');
+  var usernameInput = document.getElementById('recordingCreateUsername');
+  var displayNameInput = document.getElementById('recordingCreateDisplayName');
+  if (usernameInput) usernameInput.value = normalizeProfileUsername(currentUsername);
+  if (displayNameInput) displayNameInput.value = currentUsername;
+  setRecordingMode('existing');
+  if (modal) {
+    modal.style.display = 'flex';
+    modal.setAttribute('aria-hidden', 'false');
+    document.body.classList.add('watch-recording-open');
+  }
+  loadRecordingProfiles();
+}
+
+function closeRecordingModal() {
+  var modal = document.getElementById('recordingModal');
+  if (modal) {
+    modal.style.display = 'none';
+    modal.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('watch-recording-open');
+  }
+}
+
+async function linkRecordingProfile(profileUsername, createProfile, displayName) {
+  var btn = document.getElementById('recordBtn');
+  if (btn) btn.disabled = true;
+  try {
+    var res = await fetch('/api/media-profiles/link-live', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        autoRecord: newValue,
-        sourceType: currentSourceType || 'chaturbate'
+        profileUsername: profileUsername,
+        createProfile: !!createProfile,
+        displayName: displayName || profileUsername,
+        liveUsername: currentUsername,
+        sourceType: currentSourceType || 'chaturbate',
+        channelUrl: currentChannelUrl(),
+        autoRecord: true
       })
     });
 
     if (res.ok) {
-      isAutoRecord = newValue;
+      isModelTracked = true;
+      isAutoRecord = true;
       updateRecordButton();
-      showNotification(
-        isAutoRecord ? 'Auto-record enabled' : 'Auto-record disabled',
-        'success'
-      );
+      closeRecordingModal();
+      showNotification('Recording configured', 'success');
+      await loadTrackStatus();
     } else {
-      showNotification('Failed to toggle auto-record', 'error');
+      var data = await res.json().catch(function() { return {}; });
+      showNotification(data.detail || 'Failed to set recording', 'error');
     }
   } catch (e) {
-    console.error('Error toggling auto-record:', e);
+    console.error('Error setting recording:', e);
     showNotification('Connection error', 'error');
   } finally {
-    btn.disabled = false;
+    if (btn) btn.disabled = false;
   }
 }
+
+async function submitCreateRecordingProfile(ev) {
+  if (ev) ev.preventDefault();
+  var username = normalizeProfileUsername(document.getElementById('recordingCreateUsername').value);
+  var displayName = document.getElementById('recordingCreateDisplayName').value.trim() || username;
+  if (!username) {
+    showNotification('Profile username is required', 'error');
+    return;
+  }
+  await linkRecordingProfile(username, true, displayName);
+}
+
+document.addEventListener('click', function(ev) {
+  var profileButton = ev.target.closest('.watch-recording-profile[data-profile]');
+  if (profileButton) {
+    linkRecordingProfile(profileButton.dataset.profile, false, '');
+    return;
+  }
+  var modal = document.getElementById('recordingModal');
+  if (modal && ev.target === modal) closeRecordingModal();
+});
+
+document.addEventListener('input', function(ev) {
+  if (ev.target && ev.target.id === 'recordingProfileSearch') {
+    recordingProfileSearch = ev.target.value || '';
+    renderRecordingProfileList();
+  }
+});
+
+document.addEventListener('keydown', function(ev) {
+  if (ev.key === 'Escape') closeRecordingModal();
+});
 
 // ============================================
 // Volume persistence (across sessions)

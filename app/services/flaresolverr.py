@@ -8,16 +8,28 @@ import aiohttp
 from typing import Optional, Dict, Any
 
 from ..logger import logger
-from ..core.config import FLARESOLVERR_URL, FLARESOLVERR_MAX_TIMEOUT
+
+
+DEFAULT_FLARE_SERVICE_URL = "http://flaresolverr:8191"
+DEFAULT_FLARE_TIMEOUT_MS = 60000
 
 
 class FlareSolverrClient:
-    def __init__(self, base_url: str = FLARESOLVERR_URL):
+    def __init__(self, base_url: str = DEFAULT_FLARE_SERVICE_URL):
         self.base_url = base_url.rstrip("/")
         self._semaphore = asyncio.Semaphore(1)
         self._cached_cf_clearance: Optional[str] = None
         self._cached_user_agent: Optional[str] = None
         self._cache_expires_at: float = 0
+
+    def set_base_url(self, base_url: str):
+        """Update the endpoint used by this client without recreating services."""
+        normalized = (base_url or "").strip().rstrip("/")
+        if normalized and normalized != self.base_url:
+            self.base_url = normalized
+            self._cached_cf_clearance = None
+            self._cached_user_agent = None
+            self._cache_expires_at = 0
 
     async def is_available(self) -> bool:
         """Check if FlareSolverr is healthy (shortcut, returns bool only)."""
@@ -117,7 +129,7 @@ class FlareSolverrClient:
                 payload = {
                     "cmd": "request.get",
                     "url": url,
-                    "maxTimeout": FLARESOLVERR_MAX_TIMEOUT
+                    "maxTimeout": DEFAULT_FLARE_TIMEOUT_MS
                 }
 
                 logger.info("Solving Cloudflare challenge via FlareSolverr", url=url)
@@ -126,7 +138,7 @@ class FlareSolverrClient:
                     async with session.post(
                         f"{self.base_url}/v1",
                         json=payload,
-                        timeout=aiohttp.ClientTimeout(total=FLARESOLVERR_MAX_TIMEOUT / 1000 + 10)
+                        timeout=aiohttp.ClientTimeout(total=DEFAULT_FLARE_TIMEOUT_MS / 1000 + 10)
                     ) as resp:
                         if resp.status != 200:
                             logger.error("FlareSolverr error", status=resp.status)

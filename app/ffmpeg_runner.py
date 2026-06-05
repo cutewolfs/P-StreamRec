@@ -208,14 +208,20 @@ class FFmpegSession:
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
+        source_type: Optional[str] = None,
+        target: Optional[str] = None,
+        session_key: Optional[str] = None,
     ):
         self.id = session_id
         self.input_url = input_url
         self.source_url = source_url or input_url
+        self.source_type = (source_type or "").strip().lower()
+        self.target = (target or "").strip()
         self.input_headers = dict(input_headers or {})
         self.sessions_dir = sessions_dir
         self.records_dir_for_person = records_dir_for_person
         self.person = person
+        self.session_key = session_key or person
         self.name = display_name or person or session_id
         self.created_at = datetime.utcnow().isoformat() + "Z"
         self.start_time = time.time()
@@ -564,16 +570,24 @@ class FFmpegManager:
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
+        records_dir_for_person: Optional[str] = None,
+        source_type: Optional[str] = None,
+        target: Optional[str] = None,
+        session_key: Optional[str] = None,
     ) -> FFmpegSession:
         logger.ffmpeg_start("new", person, input_url)
         
         with self._lock:
             self._prune_finished_locked()
 
-            # Prevent concurrent session for the same person to avoid TS conflicts
+            session_key = session_key or person
+            # Prevent concurrent session for the same logical target. Multi-source
+            # Media profiles pass a source-specific key so they can record more
+            # than one channel into the same profile folder.
             for s in self._sessions.values():
-                if getattr(s, "person", None) == person and s.is_running():
-                    logger.warning("Session déjà en cours", person=person, existing_session_id=s.id)
+                existing_key = getattr(s, "session_key", None) or getattr(s, "person", None)
+                if existing_key == session_key and s.is_running():
+                    logger.warning("Session déjà en cours", person=person, session_key=session_key, existing_session_id=s.id)
                     raise RuntimeError(f"Une session est déjà en cours pour '{person}'.")
 
             session_id = uuid.uuid4().hex[:10]
@@ -583,7 +597,7 @@ class FFmpegManager:
             os.makedirs(sessions_dir, exist_ok=True)
             logger.debug("Création répertoire session", path=sessions_dir)
             
-            records_dir_for_person = os.path.join(self.records_root, person)
+            records_dir_for_person = records_dir_for_person or os.path.join(self.records_root, person)
             os.makedirs(records_dir_for_person, exist_ok=True)
             logger.debug("Création répertoire enregistrement", path=records_dir_for_person)
             
@@ -599,6 +613,9 @@ class FFmpegManager:
                 input_headers=input_headers,
                 source_url=source_url,
                 filename_format=filename_format,
+                source_type=source_type,
+                target=target,
+                session_key=session_key,
             )
 
             # Build tee spec: one branch to stdout (pipe:1) as MPEG-TS, one for HLS playback
@@ -845,6 +862,9 @@ class FFmpegManager:
                     "start_date": sess.start_date,
                     "bytes_written": sess.bytes_written,
                     "seconds_since_progress": int(sess.seconds_since_progress()),
+                    "source_type": sess.source_type,
+                    "target": sess.target,
+                    "session_key": sess.session_key,
                 })
             logger.debug("Liste status sessions", count=len(out), sessions=[s["id"] for s in out])
             return out
