@@ -192,41 +192,18 @@ class ChaturbateAPI:
                 from urllib.parse import quote_plus
                 api_url += f"&keywords={quote_plus(combined_keywords)}"
 
-            resp = await self._request("GET", api_url)
+            headers = self._get_headers()
+            headers["Accept"] = "application/json"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+
+            resp = await self._request("GET", api_url, headers=headers)
 
             if resp and resp.status == 200:
-                try:
-                    data = resp.json()
-                    rooms = data.get("rooms", [])
-                    total = data.get("total_count", len(rooms))
-
-                    models = []
-                    for room in rooms:
-                        room_status = room.get("current_show") or room.get("room_status") or "public"
-                        models.append({
-                            "username": room.get("username", ""),
-                            "display_name": room.get("display_name", ""),
-                            "thumbnail": room.get("img", ""),
-                            "viewers": room.get("num_users", 0),
-                            "subject": room.get("subject", ""),
-                            "age": room.get("age", None),
-                            "gender": room.get("gender", ""),
-                            "is_online": True,
-                            "tags": room.get("tags", []),
-                            "room_status": room_status,
-                        })
-
-                    total_pages = max(1, (total + limit - 1) // limit)
-
-                    return {
-                        "models": models,
-                        "total": total,
-                        "page": page,
-                        "limit": limit,
-                        "total_pages": total_pages,
-                    }
-                except Exception as e:
-                    logger.debug("API roomlist parse error", error=str(e))
+                parsed = self._parse_roomlist_response(resp, page, limit)
+                if parsed is not None:
+                    return parsed
+            elif resp:
+                logger.debug("Chaturbate roomlist API failed", status=resp.status)
 
             # Fallback: scrape homepage
             return await self._scrape_live_models(page, limit, gender, search)
@@ -240,6 +217,153 @@ class ChaturbateAPI:
                 "limit": limit,
                 "total_pages": 1,
             }
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None or value == "":
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _as_optional_int(value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_tags(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [str(tag).strip() for tag in value if str(tag).strip()]
+        if isinstance(value, str):
+            return [tag for tag in re.split(r"[\s,#]+", value) if tag]
+        return []
+
+    @staticmethod
+    def _normalize_thumbnail(value: Any, username: str) -> str:
+        thumbnail = str(value or "").strip()
+        if thumbnail.startswith("//"):
+            thumbnail = "https:" + thumbnail
+        if not thumbnail and username:
+            thumbnail = f"https://roomimg.stream.highwebmedia.com/ri/{username}.jpg"
+        return thumbnail
+
+    @classmethod
+    def _parse_public_room_item(cls, room: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(room, dict):
+            return None
+
+        username = str(room.get("username") or room.get("room") or room.get("slug") or "").strip()
+        if not username:
+            return None
+
+        room_status = (
+            room.get("current_show")
+            or room.get("room_status")
+            or room.get("label")
+            or "public"
+        )
+        subject = room.get("room_subject")
+        if subject is None:
+            subject = room.get("subject", "")
+
+        return {
+            "username": username,
+            "display_name": str(room.get("display_name") or username),
+            "thumbnail": cls._normalize_thumbnail(
+                room.get("img") or room.get("thumbnail") or room.get("thumbnail_url"),
+                username,
+            ),
+            "viewers": cls._as_int(
+                room.get("num_users")
+                if room.get("num_users") is not None
+                else room.get("viewers", room.get("num_viewers", 0))
+            ),
+            "subject": str(subject or ""),
+            "age": cls._as_optional_int(
+                room.get("age") if room.get("age") is not None else room.get("display_age")
+            ),
+            "gender": str(room.get("gender") or ""),
+            "is_online": True,
+            "tags": cls._normalize_tags(room.get("tags", [])),
+            "room_status": str(room_status or "public"),
+        }
+
+    @classmethod
+    def _parse_roomlist_payload(
+        cls,
+        data: Any,
+        page: int,
+        limit: int,
+    ) -> Dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("roomlist payload is not an object")
+
+        rooms = data.get("rooms", [])
+        if isinstance(rooms, dict):
+            for key in ("rooms", "results", "items"):
+                nested = rooms.get(key)
+                if isinstance(nested, list):
+                    rooms = nested
+                    break
+            else:
+                rooms = list(rooms.values())
+        if not isinstance(rooms, list):
+            raise ValueError("roomlist rooms is not a list")
+
+        models = []
+        for room in rooms:
+            model = cls._parse_public_room_item(room)
+            if model:
+                models.append(model)
+
+        total = cls._as_int(data.get("total_count"), len(models))
+        total_pages = max(1, (total + limit - 1) // limit)
+
+        return {
+            "models": models,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
+        }
+
+    @classmethod
+    def _parse_roomlist_response(
+        cls,
+        resp: Any,
+        page: int,
+        limit: int,
+    ) -> Optional[Dict[str, Any]]:
+        content_type = str(getattr(resp, "content_type", "") or "").lower()
+        body_preview = resp.text().lstrip()[:120]
+        if "json" not in content_type and not body_preview.startswith(("{", "[")):
+            logger.debug(
+                "Chaturbate roomlist API returned non-JSON response",
+                content_type=content_type,
+            )
+            return None
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.debug(
+                "Chaturbate roomlist JSON decode failed",
+                error=str(e),
+                content_type=content_type,
+            )
+            return None
+
+        try:
+            return cls._parse_roomlist_payload(data, page, limit)
+        except Exception as e:
+            logger.debug("Chaturbate roomlist payload ignored", error=str(e))
+            return None
 
     async def _scrape_live_models(
         self,
