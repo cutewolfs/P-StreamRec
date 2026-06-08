@@ -83,29 +83,6 @@
           }
         })();
 
-        // Check Git status
-        (async function checkGitStatus() {
-          try {
-            const res = await fetch('/api/git/status');
-            if (res.ok) {
-              const data = await res.json();
-              const btn = document.getElementById('gitStatusBtn');
-              if (btn && data.isGitRepo) {
-                btn.style.display = 'inline-block';
-
-                if (data.hasUpdates) {
-                  document.getElementById('gitStatusIcon').textContent = '🆕';
-                  document.getElementById('gitStatusText').textContent = 'Update!';
-                  btn.style.borderColor = 'var(--accent)';
-                  btn.style.color = 'var(--accent)';
-                  showUpdateBadge(data);
-                }
-              }
-            }
-          } catch (e) {
-            console.error('Error checking git status:', e);
-          }
-        })();
       }
     })
     .catch(err => console.error('Error loading header:', err));

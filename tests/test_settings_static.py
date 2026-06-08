@@ -26,6 +26,17 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("settingsApiPill", html)
         self.assertNotIn("settingsApiDot", html)
 
+    def test_shared_header_does_not_show_gitops_button(self):
+        header = (ROOT / "static" / "header.html").read_text()
+        loader = (ROOT / "static" / "loader.js").read_text()
+
+        self.assertNotIn("GitOps", header)
+        self.assertNotIn("gitStatusBtn", header)
+        self.assertNotIn("gitStatusIcon", header)
+        self.assertNotIn("gitStatusText", header)
+        self.assertNotIn("/api/git/status", loader)
+        self.assertNotIn("checkGitStatus", loader)
+
     def test_settings_application_tab_is_removed(self):
         html = (ROOT / "static" / "settings.html").read_text()
         js = (ROOT / "static" / "settings.js").read_text()
