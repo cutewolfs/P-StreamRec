@@ -16,6 +16,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.original_db = app_main.db
         self.original_output_dir = app_main.OUTPUT_DIR
         self.original_profile_images_dir = app_main.PROFILE_IMAGES_DIR
+        self.original_range_chunk_size = app_main.RECORDING_RANGE_CHUNK_SIZE
 
         self.tmpdir = tempfile.TemporaryDirectory()
         self.output_dir = Path(self.tmpdir.name)
@@ -61,6 +62,7 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         app_main.db = self.original_db
         app_main.OUTPUT_DIR = self.original_output_dir
         app_main.PROFILE_IMAGES_DIR = self.original_profile_images_dir
+        app_main.RECORDING_RANGE_CHUNK_SIZE = self.original_range_chunk_size
         self.tmpdir.cleanup()
 
     async def test_lists_videos_and_photos_from_records_folder(self):
@@ -186,6 +188,23 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         delete_ts = self.client.delete("/api/media-library/model/raw.ts")
         self.assertEqual(delete_ts.status_code, 400)
         self.assertTrue(self.ts_file.exists())
+
+    async def test_initial_open_range_includes_large_mp4_metadata(self):
+        app_main.RECORDING_RANGE_CHUNK_SIZE = 64
+        ftyp = (32).to_bytes(4, "big") + b"ftyp" + b"isom" + (b"\0" * 20)
+        moov = (96).to_bytes(4, "big") + b"moov" + (b"\0" * 88)
+        mdat = (72).to_bytes(4, "big") + b"mdat" + (b"1" * 64)
+        large_metadata = self.records_dir / "large_metadata.mp4"
+        large_metadata.write_bytes(ftyp + moov + mdat)
+
+        response = self.client.head(
+            "/streams/library/model/large_metadata.mp4",
+            headers={"Range": "bytes=0-"},
+        )
+
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.headers["content-range"], "bytes 0-127/200")
+        self.assertEqual(response.headers["content-length"], "128")
 
     async def test_web_upload_endpoint_removed_and_direct_image_files_are_listed(self):
         upload = self.client.post(

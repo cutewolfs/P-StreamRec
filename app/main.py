@@ -92,6 +92,9 @@ PASSWORD = os.getenv("PASSWORD", "")  # Mot de passe optionnel
 CHATURBATE_USERNAME = os.getenv("CHATURBATE_USERNAME", "")
 CHATURBATE_PASSWORD = os.getenv("CHATURBATE_PASSWORD", "")
 RECORDING_RANGE_CHUNK_SIZE = int(os.getenv("RECORDING_RANGE_CHUNK_SIZE", str(8 * 1024 * 1024)))
+RECORDING_INITIAL_METADATA_MAX_BYTES = int(
+    os.getenv("RECORDING_INITIAL_METADATA_MAX_BYTES", str(128 * 1024 * 1024))
+)
 MEDIA_IMPORTS_ENABLED = os.getenv("PSTREAMREC_MEDIA_IMPORTS", "false").lower() in {"1", "true", "yes"}
 MEDIA_LIBRARY_METADATA_MIN_AGE_SECONDS = DEFAULT_MIN_AGE_SECONDS
 MEDIA_LIBRARY_VIDEO_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS
@@ -346,7 +349,69 @@ def _recording_headers(filename: str, file_size: int) -> dict:
     }
 
 
-def _parse_byte_range(range_header: str, file_size: int) -> Optional[tuple[int, int]]:
+def _mp4_faststart_metadata_end(file_path: Path, file_size: int) -> Optional[int]:
+    """Return the byte offset after an initial MP4 moov box, when it is before media data."""
+    max_metadata_bytes = max(RECORDING_INITIAL_METADATA_MAX_BYTES, 0)
+    if file_size <= 0 or max_metadata_bytes <= 0:
+        return None
+
+    probe_limit = min(file_size, max_metadata_bytes)
+    offset = 0
+    try:
+        with open(file_path, "rb") as f:
+            while offset + 8 <= probe_limit:
+                f.seek(offset)
+                header = f.read(16)
+                if len(header) < 8:
+                    return None
+
+                box_size = int.from_bytes(header[0:4], "big")
+                box_type = header[4:8]
+                header_size = 8
+                if box_size == 1:
+                    if len(header) < 16:
+                        return None
+                    box_size = int.from_bytes(header[8:16], "big")
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+
+                if box_size < header_size:
+                    return None
+
+                box_end = offset + box_size
+                if box_end > file_size:
+                    return None
+                if box_type == b"moov":
+                    return box_end if box_end <= max_metadata_bytes else None
+                if box_type in {b"mdat", b"moof"}:
+                    return None
+
+                offset = box_end
+    except OSError:
+        return None
+
+    return None
+
+
+def _initial_open_range_chunk_size(file_path: Path, filename: str, file_size: int, range_header: str) -> Optional[int]:
+    range_spec = range_header[len("bytes="):].strip() if range_header.startswith("bytes=") else ""
+    if range_spec != "0-":
+        return None
+    if Path(filename).suffix.lower() not in {".mp4", ".m4v", ".mov"}:
+        return None
+
+    metadata_end = _mp4_faststart_metadata_end(file_path, file_size)
+    if not metadata_end:
+        return None
+    return max(RECORDING_RANGE_CHUNK_SIZE, metadata_end)
+
+
+def _parse_byte_range(
+    range_header: str,
+    file_size: int,
+    open_ended_chunk_size: Optional[int] = None,
+) -> Optional[tuple[int, int]]:
     if file_size <= 0 or not range_header.startswith("bytes="):
         return None
 
@@ -370,7 +435,12 @@ def _parse_byte_range(range_header: str, file_size: int) -> Optional[tuple[int, 
                 # Browsers commonly request "bytes=N-" for video. Returning a
                 # bounded chunk keeps very long replays responsive and avoids a
                 # single multi-GB response through Docker/proxy layers.
-                end = start + max(RECORDING_RANGE_CHUNK_SIZE, 1) - 1
+                chunk_size = (
+                    open_ended_chunk_size
+                    if open_ended_chunk_size is not None
+                    else RECORDING_RANGE_CHUNK_SIZE
+                )
+                end = start + max(chunk_size, 1) - 1
             end = min(end, file_size - 1)
     except ValueError:
         return None
@@ -396,7 +466,17 @@ async def _serve_video_file_with_ranges(request: Request, file_path: Path, filen
     range_header = request.headers.get("range")
 
     if range_header:
-        byte_range = _parse_byte_range(range_header, file_size)
+        open_ended_chunk_size = _initial_open_range_chunk_size(
+            file_path,
+            filename,
+            file_size,
+            range_header,
+        )
+        byte_range = _parse_byte_range(
+            range_header,
+            file_size,
+            open_ended_chunk_size=open_ended_chunk_size,
+        )
         if not byte_range:
             return Response(
                 status_code=416,
