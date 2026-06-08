@@ -29,6 +29,10 @@
   };
 
   var searchTimer = null;
+  var mediaVolumeUsername = '';
+  var mediaPlaybackVolume = null;
+  var mediaVolumeSaveTimeout = null;
+  var mediaVolumeLoadRequestId = 0;
 
   function $(id) {
     return document.getElementById(id);
@@ -67,6 +71,133 @@
   function numberOrZero(value) {
     var num = Number(value);
     return Number.isFinite(num) && num > 0 ? num : 0;
+  }
+
+  function normalizeVolume(value) {
+    if (value === null || value === undefined || value === '') return null;
+    var volume = Number(value);
+    if (!Number.isFinite(volume)) return null;
+    return Math.min(1, Math.max(0, volume));
+  }
+
+  function getLocalVolume(key) {
+    var saved = localStorage.getItem(key);
+    return saved === null ? null : normalizeVolume(saved);
+  }
+
+  function persistMediaProfileVolume(username, volume) {
+    mediaVolumeSaveTimeout = null;
+    if (!username) return;
+
+    fetch('/api/models/' + encodeURIComponent(username) + '/volume', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ volume: volume }),
+      keepalive: true
+    }).catch(function(e) {
+      console.warn('Could not save media profile volume:', e);
+    });
+  }
+
+  function flushMediaProfileVolume() {
+    if (mediaVolumeSaveTimeout && mediaPlaybackVolume !== null) {
+      clearTimeout(mediaVolumeSaveTimeout);
+      persistMediaProfileVolume(mediaVolumeUsername, mediaPlaybackVolume);
+    }
+  }
+
+  function saveMediaProfileVolume(username, volume) {
+    var normalized = normalizeVolume(volume);
+    if (!username || normalized === null) return;
+
+    mediaVolumeUsername = username;
+    mediaPlaybackVolume = normalized;
+    localStorage.setItem('video_volume_' + username, String(normalized));
+
+    if (mediaVolumeSaveTimeout) {
+      clearTimeout(mediaVolumeSaveTimeout);
+    }
+    mediaVolumeSaveTimeout = setTimeout(function() {
+      persistMediaProfileVolume(username, normalized);
+    }, 250);
+  }
+
+  function getSavedMediaProfileVolume(username) {
+    if (mediaVolumeUsername === username && mediaPlaybackVolume !== null) {
+      return mediaPlaybackVolume;
+    }
+
+    var profileVolume = getLocalVolume('video_volume_' + username);
+    if (profileVolume !== null) return profileVolume;
+
+    var legacyGlobalVolume = getLocalVolume('video_volume_global');
+    if (legacyGlobalVolume !== null) return legacyGlobalVolume;
+
+    return 0.5;
+  }
+
+  function loadMediaProfileVolume(video, item) {
+    var username = item && item.username ? item.username : '';
+    if (!video || !username) return;
+
+    var pendingVolume = (
+      mediaVolumeSaveTimeout &&
+      mediaVolumeUsername === username &&
+      mediaPlaybackVolume !== null
+    ) ? mediaPlaybackVolume : null;
+    flushMediaProfileVolume();
+    if (pendingVolume !== null) {
+      mediaVolumeUsername = username;
+      mediaPlaybackVolume = pendingVolume;
+      video.volume = pendingVolume;
+      return;
+    }
+
+    mediaVolumeUsername = username;
+    mediaPlaybackVolume = null;
+
+    var requestId = ++mediaVolumeLoadRequestId;
+    fetch('/api/models/' + encodeURIComponent(username) + '/volume', { cache: 'no-store' })
+      .then(function(res) {
+        if (!res.ok) return null;
+        return res.json().catch(function() { return null; });
+      })
+      .then(function(data) {
+        if (requestId !== mediaVolumeLoadRequestId || state.currentViewerItem !== item || !video.isConnected) {
+          return;
+        }
+
+        var saved = normalizeVolume(data && data.volume);
+        if (saved !== null) {
+          mediaPlaybackVolume = saved;
+          localStorage.setItem('video_volume_' + username, String(saved));
+          video.volume = saved;
+          return;
+        }
+
+        var profileVolume = getLocalVolume('video_volume_' + username);
+        if (profileVolume !== null) {
+          video.volume = profileVolume;
+          saveMediaProfileVolume(username, profileVolume);
+        }
+      })
+      .catch(function(e) {
+        console.warn('Could not load media profile volume:', e);
+      });
+  }
+
+  function setupMediaProfileVolume(video, item) {
+    var username = item && item.username ? item.username : '';
+    if (!video || !username) return;
+
+    video.volume = getSavedMediaProfileVolume(username);
+    loadMediaProfileVolume(video, item);
+
+    video.addEventListener('volumechange', function() {
+      if (!video.muted || video.volume === 0) {
+        saveMediaProfileVolume(username, video.volume);
+      }
+    });
   }
 
   function mediaPlaybackDuration(item) {
@@ -718,6 +849,7 @@
       mediaNode.controls = true;
       mediaNode.autoplay = true;
       mediaNode.playsInline = true;
+      setupMediaProfileVolume(mediaNode, item);
       stage.appendChild(mediaNode);
       setupMediaVideoPlayback(mediaNode, item);
       if (!item.browserPlayable) {
@@ -743,6 +875,7 @@
     clearViewerNextPrompt();
     if (active && active.tagName && active.tagName.toLowerCase() === 'video') {
       saveMediaPlaybackPosition(active, state.currentViewerItem, { force: true });
+      flushMediaProfileVolume();
     }
     if (active) active.pause();
     stage.innerHTML = '';
@@ -1555,6 +1688,8 @@
         }
       }
     });
+
+    window.addEventListener('beforeunload', flushMediaProfileVolume);
   }
 
   document.addEventListener('DOMContentLoaded', function() {
