@@ -350,12 +350,14 @@ async def scan_media_imports(
                 or existing_created_at in {0, source_mtime}
                 or not _import_metadata_ready(existing or {})
             )
+            title = title_from_filename(source_path.name)
             created_at = existing_created_at or source_mtime
             if should_probe_created_at:
                 created_at = await get_media_created_at(
                     source_path,
                     ffmpeg_path,
                     fallback_timestamp=source_mtime,
+                    reference_texts=[title],
                 )
             if (
                 is_existing_import
@@ -424,7 +426,7 @@ async def scan_media_imports(
                 mp4_size=playable_size if playable_path and playable_path != source_path else None,
                 is_converted=bool(playable_path),
                 media_kind="import",
-                title=title_from_filename(source_path.name),
+                title=title,
                 import_status=import_status,
                 import_error=import_error,
                 source_mtime=source_mtime,

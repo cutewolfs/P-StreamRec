@@ -8,8 +8,9 @@ import json
 import re
 import subprocess
 import os
+import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 from datetime import datetime, timezone
 
 if TYPE_CHECKING:
@@ -389,6 +390,59 @@ _RECORDED_AT_TAG_KEYS = (
     "date",
 )
 
+_REFERENCE_MONTHS = {
+    "jan": 1,
+    "january": 1,
+    "janvier": 1,
+    "feb": 2,
+    "february": 2,
+    "fev": 2,
+    "fevr": 2,
+    "fevrier": 2,
+    "mar": 3,
+    "march": 3,
+    "mars": 3,
+    "apr": 4,
+    "april": 4,
+    "avr": 4,
+    "avril": 4,
+    "may": 5,
+    "mai": 5,
+    "jun": 6,
+    "june": 6,
+    "juin": 6,
+    "jul": 7,
+    "july": 7,
+    "juillet": 7,
+    "aug": 8,
+    "august": 8,
+    "aout": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "septembre": 9,
+    "oct": 10,
+    "october": 10,
+    "octobre": 10,
+    "nov": 11,
+    "november": 11,
+    "novembre": 11,
+    "dec": 12,
+    "december": 12,
+    "decembre": 12,
+}
+
+_REFERENCE_MONTH_PATTERN = "|".join(sorted(_REFERENCE_MONTHS, key=len, reverse=True))
+_REFERENCE_TIME_SUFFIX = (
+    r"(?:"
+    r"(?:[\s_t,.;@-]+|[\s_]*a[\s_]+|[\s_]*at[\s_]+|[\s_]*vers[\s_]+)"
+    r"([01]?\d|2[0-3])"
+    r"(?:[:h._-]?([0-5]\d))?"
+    r"(?:[:h._-]?([0-5]\d))?"
+    r"\s*(am|pm)?"
+    r")?"
+)
+
 
 def _normalize_metadata_key(key: object) -> str:
     return re.sub(r"[\s_-]+", "", str(key or "").strip().lower())
@@ -436,6 +490,170 @@ def _parse_metadata_timestamp(value: object) -> int | None:
         return int(parsed.timestamp())
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def _normalize_reference_text(value: object) -> str:
+    raw = str(value or "").strip().strip("\x00")
+    normalized = unicodedata.normalize("NFKD", raw)
+    return "".join(ch for ch in normalized if not unicodedata.combining(ch)).lower()
+
+
+def _reference_timestamp_from_parts(
+    year: object,
+    month: object,
+    day: object,
+    hour: object = None,
+    minute: object = None,
+    second: object = None,
+    meridiem: object = None,
+) -> int | None:
+    try:
+        hour_value = int(hour) if hour not in (None, "") else 0
+        minute_value = int(minute) if minute not in (None, "") else 0
+        second_value = int(second) if second not in (None, "") else 0
+        marker = str(meridiem or "").lower()
+        if marker == "pm" and hour_value < 12:
+            hour_value += 12
+        elif marker == "am" and hour_value == 12:
+            hour_value = 0
+
+        parsed = datetime(
+            int(year),
+            int(month),
+            int(day),
+            hour_value,
+            minute_value,
+            second_value,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    try:
+        return int(parsed.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def reference_timestamp_from_text(text: object) -> int | None:
+    """Extract a local timestamp from a content title or user-supplied filename."""
+    candidate = _normalize_reference_text(text)
+    if not candidate:
+        return None
+
+    compact_datetime = re.search(
+        r"(?<!\d)(\d{4})(\d{2})(\d{2})([01]\d|2[0-3])([0-5]\d)([0-5]\d)?(?!\d)",
+        candidate,
+    )
+    if compact_datetime:
+        parsed = _reference_timestamp_from_parts(
+            compact_datetime.group(1),
+            compact_datetime.group(2),
+            compact_datetime.group(3),
+            compact_datetime.group(4),
+            compact_datetime.group(5),
+            compact_datetime.group(6),
+        )
+        if parsed is not None:
+            return parsed
+
+    compact_date = re.search(
+        r"(?<!\d)(\d{4})(\d{2})(\d{2})"
+        + _REFERENCE_TIME_SUFFIX
+        + r"(?!\d)",
+        candidate,
+    )
+    if compact_date:
+        parsed = _reference_timestamp_from_parts(
+            compact_date.group(1),
+            compact_date.group(2),
+            compact_date.group(3),
+            compact_date.group(4),
+            compact_date.group(5),
+            compact_date.group(6),
+            compact_date.group(7),
+        )
+        if parsed is not None:
+            return parsed
+
+    year_first = re.search(
+        r"(?<!\d)(\d{4})[-_. /](\d{1,2})[-_. /](\d{1,2})"
+        + _REFERENCE_TIME_SUFFIX
+        + r"(?!\d)",
+        candidate,
+    )
+    if year_first:
+        parsed = _reference_timestamp_from_parts(
+            year_first.group(1),
+            year_first.group(2),
+            year_first.group(3),
+            year_first.group(4),
+            year_first.group(5),
+            year_first.group(6),
+            year_first.group(7),
+        )
+        if parsed is not None:
+            return parsed
+
+    day_first = re.search(
+        r"(?<!\d)(\d{1,2})[-_. /](\d{1,2})[-_. /](\d{4})"
+        + _REFERENCE_TIME_SUFFIX
+        + r"(?!\d)",
+        candidate,
+    )
+    if day_first:
+        parsed = _reference_timestamp_from_parts(
+            day_first.group(3),
+            day_first.group(2),
+            day_first.group(1),
+            day_first.group(4),
+            day_first.group(5),
+            day_first.group(6),
+            day_first.group(7),
+        )
+        if parsed is not None:
+            return parsed
+
+    day_month_name = re.search(
+        rf"(?<!\w)(\d{{1,2}})(?:st|nd|rd|th)?[\s._-]+({_REFERENCE_MONTH_PATTERN})"
+        rf"[\s._,-]+(\d{{4}})"
+        + _REFERENCE_TIME_SUFFIX
+        + r"(?!\d)",
+        candidate,
+    )
+    if day_month_name:
+        parsed = _reference_timestamp_from_parts(
+            day_month_name.group(3),
+            _REFERENCE_MONTHS.get(day_month_name.group(2)),
+            day_month_name.group(1),
+            day_month_name.group(4),
+            day_month_name.group(5),
+            day_month_name.group(6),
+            day_month_name.group(7),
+        )
+        if parsed is not None:
+            return parsed
+
+    month_name_first = re.search(
+        rf"(?<!\w)({_REFERENCE_MONTH_PATTERN})[\s._-]+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"[,]?[\s._-]+(\d{{4}})"
+        + _REFERENCE_TIME_SUFFIX
+        + r"(?!\d)",
+        candidate,
+    )
+    if month_name_first:
+        parsed = _reference_timestamp_from_parts(
+            month_name_first.group(3),
+            _REFERENCE_MONTHS.get(month_name_first.group(1)),
+            month_name_first.group(2),
+            month_name_first.group(4),
+            month_name_first.group(5),
+            month_name_first.group(6),
+            month_name_first.group(7),
+        )
+        if parsed is not None:
+            return parsed
+
+    return None
 
 
 def _parse_video_recorded_at(probe_data: dict[str, Any]) -> int | None:
@@ -494,27 +712,37 @@ async def get_video_recorded_at(file_path: Path, ffmpeg_path: str = "ffmpeg") ->
 
 
 def recording_timestamp_from_filename(filename: str) -> int | None:
-    match = re.match(r"^(\d{8})_(\d{6})", Path(filename).stem)
-    if not match:
-        return None
-    try:
-        parsed = datetime.strptime(f"{match.group(1)}_{match.group(2)}", "%Y%m%d_%H%M%S")
-    except ValueError:
-        return None
-    return int(parsed.timestamp())
+    path = Path(filename)
+    for value in (path.stem, path.name):
+        parsed = reference_timestamp_from_text(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _iter_reference_texts(file_path: Path, reference_texts: Iterable[object] | None = None):
+    seen: set[str] = set()
+    for value in (*tuple(reference_texts or ()), file_path.stem, file_path.name):
+        normalized = str(value or "").strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            yield normalized
 
 
 async def get_media_created_at(
     file_path: Path,
     ffmpeg_path: str = "ffmpeg",
     fallback_timestamp: int | None = None,
+    reference_texts: Iterable[object] | None = None,
 ) -> int:
+    for value in _iter_reference_texts(file_path, reference_texts):
+        reference_at = reference_timestamp_from_text(value)
+        if reference_at is not None:
+            return reference_at
+
     recorded_at = await get_video_recorded_at(file_path, ffmpeg_path)
     if recorded_at is not None:
         return recorded_at
-    filename_at = recording_timestamp_from_filename(file_path.name)
-    if filename_at is not None:
-        return filename_at
     if fallback_timestamp is not None:
         return int(fallback_timestamp)
     try:

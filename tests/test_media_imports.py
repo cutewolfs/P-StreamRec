@@ -57,6 +57,23 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec["duration_seconds"], 123)
         self.assertEqual(rec["created_at"], 1704164645)
 
+    async def test_scan_imports_uses_filename_title_as_date_reference(self):
+        self.write_old_file("records/model/premium_show_2024-05-06_21h30.mp4")
+        created_at_probe = AsyncMock(return_value=1704164645)
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=123)),
+            patch.object(media_imports, "get_media_created_at", new=created_at_probe),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["imported"], 1)
+        self.assertEqual(
+            created_at_probe.await_args.kwargs["reference_texts"],
+            ["premium show 2024 05 06 21h30"],
+        )
+
     async def test_rescan_is_idempotent_and_removes_missing_sources(self):
         source = self.write_old_file("records/model/clip.mp4")
         thumb = self.output_dir / "thumbnails" / "model" / "clip.jpg"

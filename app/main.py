@@ -1168,6 +1168,7 @@ async def _ensure_media_library_video_metadata(
     current_created_at = int(current.get("created_at") or 0)
     recording_id = current.get("recording_id") or stable_import_recording_id(username, relative_path)
     media_kind = (current.get("media_kind") or "import").strip().lower() or "import"
+    title = current.get("title") or title_from_filename(media_path.name)
     needs_playable_copy = (
         media_kind == "import"
         and media_path.suffix.lower() not in DIRECT_PLAYABLE_EXTENSIONS
@@ -1179,6 +1180,7 @@ async def _ensure_media_library_video_metadata(
             media_path,
             FFMPEG_PATH,
             fallback_timestamp=source_mtime,
+            reference_texts=[title],
         )
     if duration_seconds > 0 and thumbnail_url and current_created_at == created_at and not needs_playable_copy:
         return rec
@@ -1241,7 +1243,7 @@ async def _ensure_media_library_video_metadata(
         mp4_size=mp4_size,
         is_converted=bool(current.get("is_converted") or playable_path),
         media_kind=media_kind,
-        title=current.get("title") or title_from_filename(media_path.name),
+        title=title,
         import_status=import_status,
         import_error=import_error,
         source_mtime=source_mtime,
@@ -1263,7 +1265,7 @@ async def _ensure_media_library_video_metadata(
         "mp4_size": mp4_size,
         "is_converted": bool(current.get("is_converted") or playable_path),
         "media_kind": media_kind,
-        "title": current.get("title") or title_from_filename(media_path.name),
+        "title": title,
         "import_status": import_status,
         "import_error": import_error,
         "source_mtime": source_mtime,

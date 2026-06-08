@@ -9,12 +9,14 @@ from unittest.mock import AsyncMock, patch
 from app import main as app_main
 from app.core.database import Database
 from app.tasks.monitor import (
+    get_media_created_at,
     _parse_video_recorded_at,
+    reference_timestamp_from_text,
     recording_timestamp_from_filename,
 )
 
 
-class RecordingDateHelperTests(unittest.TestCase):
+class RecordingDateHelperTests(unittest.IsolatedAsyncioTestCase):
     def test_parses_ffprobe_creation_time_metadata(self):
         expected = int(datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp())
 
@@ -44,6 +46,48 @@ class RecordingDateHelperTests(unittest.TestCase):
             recording_timestamp_from_filename("20240102_030405_abcdef.ts"),
             expected,
         )
+
+    def test_extracts_reference_timestamp_from_uploaded_filename(self):
+        expected = int(datetime(2024, 5, 6, 21, 30).timestamp())
+
+        self.assertEqual(
+            recording_timestamp_from_filename("premium_show_2024-05-06_21h30.mp4"),
+            expected,
+        )
+
+    def test_extracts_reference_timestamp_from_day_first_title(self):
+        expected = int(datetime(2024, 5, 6, 20, 15).timestamp())
+
+        self.assertEqual(
+            reference_timestamp_from_text("Premium show 06-05-2024 20:15"),
+            expected,
+        )
+
+    def test_extracts_reference_timestamp_from_month_name_title(self):
+        expected = int(datetime(2024, 6, 8, 19, 45).timestamp())
+
+        self.assertEqual(
+            reference_timestamp_from_text("Show du 8 juin 2024 a 19h45"),
+            expected,
+        )
+
+    async def test_media_created_at_prefers_reference_text_date(self):
+        expected = int(datetime(2024, 7, 8, 19, 45).timestamp())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "uploaded.mp4"
+            path.write_bytes(b"video")
+
+            metadata_timestamp = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
+            probe = AsyncMock(return_value=metadata_timestamp)
+            with patch("app.tasks.monitor.get_video_recorded_at", new=probe):
+                created_at = await get_media_created_at(
+                    path,
+                    reference_texts=["Premium show 2024-07-08 19h45"],
+                )
+
+        self.assertEqual(created_at, expected)
+        probe.assert_not_awaited()
 
 
 class RecordingDateIndexingTests(unittest.IsolatedAsyncioTestCase):
