@@ -18,6 +18,8 @@ from .monitor import get_media_created_at, get_video_duration
 
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi"}
 DIRECT_PLAYABLE_EXTENSIONS = {".mp4", ".m4v", ".webm"}
+FASTSTART_REPAIR_EXTENSIONS = {".mp4", ".m4v"}
+FASTSTART_PROBE_MAX_BYTES = 128 * 1024 * 1024
 TEMP_FILE_SUFFIXES = (
     ".tmp",
     ".part",
@@ -67,6 +69,60 @@ def _file_exists(path_value: Optional[str]) -> bool:
 
 def _import_metadata_ready(rec: dict) -> bool:
     return int(rec.get("duration_seconds") or 0) > 0 and _file_exists(rec.get("thumbnail_path"))
+
+
+def mp4_needs_faststart_repair(
+    path: Path,
+    max_probe_bytes: int = FASTSTART_PROBE_MAX_BYTES,
+) -> bool:
+    """Return True when MP4 media data appears before the moov metadata box."""
+    if path.suffix.lower() not in FASTSTART_REPAIR_EXTENSIONS:
+        return False
+
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        return False
+    if file_size <= 0 or max_probe_bytes <= 0:
+        return False
+
+    offset = 0
+    probe_limit = min(file_size, max_probe_bytes)
+    try:
+        with open(path, "rb") as f:
+            while offset + 8 <= probe_limit:
+                f.seek(offset)
+                header = f.read(16)
+                if len(header) < 8:
+                    return False
+
+                box_size = int.from_bytes(header[0:4], "big")
+                box_type = header[4:8]
+                header_size = 8
+                if box_size == 1:
+                    if len(header) < 16:
+                        return False
+                    box_size = int.from_bytes(header[8:16], "big")
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+
+                if box_size < header_size:
+                    return False
+
+                if box_type == b"moov":
+                    return False
+                if box_type in {b"mdat", b"moof"}:
+                    return True
+
+                box_end = offset + box_size
+                if box_end <= offset or box_end > file_size:
+                    return False
+                offset = box_end
+    except OSError:
+        return False
+
+    return False
 
 
 async def _run_ffmpeg(cmd: list[str], timeout: int = 3600) -> tuple[bool, str]:
@@ -155,6 +211,8 @@ async def create_playable_mp4_copy(
         "-hide_banner",
         "-loglevel",
         "error",
+        "-fflags",
+        "+genpts+igndts",
         "-i",
         str(source_path),
         "-map",
@@ -163,6 +221,8 @@ async def create_playable_mp4_copy(
         "0:a:0?",
         "-c",
         "copy",
+        "-avoid_negative_ts",
+        "make_zero",
         "-movflags",
         "+faststart",
         "-y",
@@ -177,6 +237,8 @@ async def create_playable_mp4_copy(
             "-hide_banner",
             "-loglevel",
             "error",
+            "-fflags",
+            "+genpts+igndts",
             "-i",
             str(source_path),
             "-map",
@@ -193,6 +255,8 @@ async def create_playable_mp4_copy(
             "aac",
             "-b:a",
             "160k",
+            "-avoid_negative_ts",
+            "make_zero",
             "-movflags",
             "+faststart",
             "-y",
@@ -343,6 +407,28 @@ async def scan_media_imports(
             existing_source_mtime = int((existing or {}).get("source_mtime") or 0)
             existing_size = int((existing or {}).get("file_size") or 0)
             existing_created_at = int((existing or {}).get("created_at") or 0)
+            recording_id = (existing or {}).get("recording_id") or stable_import_recording_id(
+                username,
+                source_path.name,
+            )
+            cached_path = output_dir / "media_imports" / username / f"{recording_id}.mp4"
+            needs_faststart_repair = mp4_needs_faststart_repair(source_path)
+            source_changed = existing_source_mtime != source_mtime or existing_size != stat.st_size
+            playable_key = _path_key((existing or {}).get("playable_path"))
+            conversion_failed = (existing or {}).get("import_status") == "failed"
+            needs_playable_copy = (
+                (
+                    source_path.suffix.lower() not in DIRECT_PLAYABLE_EXTENSIONS
+                    or needs_faststart_repair
+                )
+                and not (conversion_failed and not source_changed)
+                and (
+                    not is_existing_import
+                    or source_changed
+                    or not playable_key
+                    or (needs_faststart_repair and playable_key == source_key)
+                )
+            )
             should_probe_created_at = (
                 not is_existing_import
                 or existing_source_mtime != source_mtime
@@ -366,16 +452,13 @@ async def scan_media_imports(
                 and existing_created_at == created_at
                 and (existing.get("playable_path") or existing.get("import_status") == "failed")
                 and _import_metadata_ready(existing)
+                and not needs_playable_copy
             ):
                 result["skipped"] += 1
                 continue
 
             await ensure_import_profile(db, username)
 
-            recording_id = (existing or {}).get("recording_id") or stable_import_recording_id(
-                username,
-                source_path.name,
-            )
             duration_seconds = await get_video_duration(source_path, ffmpeg_path)
             thumbnail_path = await generate_import_thumbnail(
                 source_path,
@@ -390,12 +473,15 @@ async def scan_media_imports(
             import_status = "ready"
             import_error = None
 
-            if source_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS:
+            if source_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS and not needs_faststart_repair:
                 playable_path = source_path
                 playable_size = stat.st_size
             else:
-                cached_path = output_dir / "media_imports" / username / f"{recording_id}.mp4"
-                if cached_path.exists() and existing_source_mtime == source_mtime:
+                if (
+                    cached_path.exists()
+                    and existing_source_mtime == source_mtime
+                    and existing_size == stat.st_size
+                ):
                     playable_path = cached_path
                     playable_size = cached_path.stat().st_size
                 else:

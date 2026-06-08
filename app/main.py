@@ -48,6 +48,7 @@ from .tasks.media_imports import (
     create_playable_mp4_copy,
     generate_import_thumbnail,
     media_imports_task,
+    mp4_needs_faststart_repair,
     remove_import_record,
     stable_import_recording_id,
     SUPPORTED_VIDEO_EXTENSIONS,
@@ -1169,10 +1170,28 @@ async def _ensure_media_library_video_metadata(
     recording_id = current.get("recording_id") or stable_import_recording_id(username, relative_path)
     media_kind = (current.get("media_kind") or "import").strip().lower() or "import"
     title = current.get("title") or title_from_filename(media_path.name)
+    needs_faststart_repair = media_kind == "import" and mp4_needs_faststart_repair(media_path)
+    playable_points_to_source = _resolved_path_key(current.get("playable_path")) == _resolved_path_key(str(media_path))
+    source_changed = (
+        int(current.get("source_mtime") or 0) != source_mtime
+        or int(current.get("file_size") or 0) != stat.st_size
+    )
     needs_playable_copy = (
         media_kind == "import"
-        and media_path.suffix.lower() not in DIRECT_PLAYABLE_EXTENSIONS
-        and not current.get("playable_path")
+        and (
+            (
+                media_path.suffix.lower() not in DIRECT_PLAYABLE_EXTENSIONS
+                and (not current.get("playable_path") or source_changed)
+            )
+            or (
+                needs_faststart_repair
+                and (
+                    not current.get("playable_path")
+                    or playable_points_to_source
+                    or source_changed
+                )
+            )
+        )
     )
     created_at = current_created_at or source_mtime
     if current_created_at in {0, source_mtime}:
@@ -1204,7 +1223,25 @@ async def _ensure_media_library_video_metadata(
     mp4_size = current.get("mp4_size")
     import_status = current.get("import_status") or ("ready" if media_kind == "import" else None)
     import_error = current.get("import_error")
-    if not playable_path and media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS:
+    if media_kind == "import" and source_changed:
+        playable_path = None
+        playable_size = None
+        mp4_path = None
+        mp4_size = None
+
+    if needs_faststart_repair and media_kind == "import":
+        cached_path = OUTPUT_DIR / "media_imports" / username / f"{recording_id}.mp4"
+        if cached_path.exists() and not source_changed:
+            playable_path = str(cached_path)
+            playable_size = cached_path.stat().st_size
+            mp4_path = str(cached_path)
+            mp4_size = playable_size
+            import_status = "ready"
+            import_error = None
+        else:
+            playable_path = None
+
+    if not playable_path and media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS and not needs_faststart_repair:
         playable_path = str(media_path)
         playable_size = stat.st_size
     elif not playable_path and media_kind == "import":

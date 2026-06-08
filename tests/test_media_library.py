@@ -11,6 +11,10 @@ from app import main as app_main
 from app.core.database import Database
 
 
+def mp4_box(box_type: bytes, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + box_type + payload
+
+
 class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.original_db = app_main.db
@@ -253,6 +257,43 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(33, recs[0]["duration_seconds"])
 
         self.assertEqual(recs[0]["recording_id"], item["recordingId"])
+        self.assertTrue(item["browserPlayable"])
+
+    async def test_non_faststart_mp4_file_creates_playable_copy(self):
+        media_file = self.empty_dir / "slow_start.mp4"
+        media_file.write_bytes(
+            mp4_box(b"ftyp", b"isom0000")
+            + mp4_box(b"mdat", b"1" * 16)
+            + mp4_box(b"moov", b"0" * 16)
+        )
+        old = time.time() - 120
+        os.utime(media_file, (old, old))
+        converted = self.output_dir / "media_imports" / "empty_model" / "converted.mp4"
+        converted.parent.mkdir(parents=True, exist_ok=True)
+        converted.write_bytes(b"mp4 copy")
+        thumb = self.output_dir / "thumbnails" / "empty_model" / "upload_thumb.jpg"
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        thumb.write_bytes(b"thumb")
+
+        with (
+            patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=44)),
+            patch.object(app_main, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
+            patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value=str(thumb))),
+            patch.object(
+                app_main,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(True, converted, None)),
+            ) as convert_mock,
+        ):
+            listing = self.client.get("/api/media-library?username=empty_model&kind=video")
+
+        convert_mock.assert_awaited_once()
+        rec = (await app_main.db.get_recordings("empty_model"))[0]
+        self.assertEqual(str(converted), rec["playable_path"])
+        self.assertEqual(str(converted), rec["mp4_path"])
+
+        item = listing.json()["items"][0]
+        self.assertTrue(item["url"].startswith("/streams/media/"))
         self.assertTrue(item["browserPlayable"])
 
     async def test_direct_mkv_file_creates_playable_mp4_copy(self):

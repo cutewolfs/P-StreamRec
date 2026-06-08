@@ -10,7 +10,15 @@ from fastapi.testclient import TestClient
 from app import main as app_main
 from app.core.database import Database
 from app.tasks import media_imports
-from app.tasks.media_imports import MediaImportManager, scan_media_imports
+from app.tasks.media_imports import (
+    MediaImportManager,
+    mp4_needs_faststart_repair,
+    scan_media_imports,
+)
+
+
+def mp4_box(box_type: bytes, payload: bytes) -> bytes:
+    return (len(payload) + 8).to_bytes(4, "big") + box_type + payload
 
 
 class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
@@ -30,6 +38,26 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         old = time.time() - 120
         os.utime(path, (old, old))
         return path
+
+    def test_mp4_faststart_detector_flags_media_before_metadata(self):
+        source = self.write_old_file(
+            "records/model/slow_start.mp4",
+            mp4_box(b"ftyp", b"isom0000")
+            + mp4_box(b"mdat", b"1" * 16)
+            + mp4_box(b"moov", b"0" * 16),
+        )
+
+        self.assertTrue(mp4_needs_faststart_repair(source))
+
+    def test_mp4_faststart_detector_accepts_metadata_before_media(self):
+        source = self.write_old_file(
+            "records/model/fast_start.mp4",
+            mp4_box(b"ftyp", b"isom0000")
+            + mp4_box(b"moov", b"0" * 16)
+            + mp4_box(b"mdat", b"1" * 16),
+        )
+
+        self.assertFalse(mp4_needs_faststart_repair(source))
 
     async def test_scan_imports_direct_mp4_and_creates_profile(self):
         source = self.write_old_file("records/new_profile/paid_clip.mp4")
@@ -56,6 +84,71 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(rec["protected_from_retention"]))
         self.assertEqual(rec["duration_seconds"], 123)
         self.assertEqual(rec["created_at"], 1704164645)
+
+    async def test_scan_imports_non_faststart_mp4_uses_playable_copy(self):
+        source = self.write_old_file(
+            "records/model/slow_start.mp4",
+            mp4_box(b"ftyp", b"isom0000")
+            + mp4_box(b"mdat", b"1" * 16)
+            + mp4_box(b"moov", b"0" * 16),
+        )
+        converted = self.output_dir / "media_imports/model/import_test.mp4"
+        converted.parent.mkdir(parents=True, exist_ok=True)
+        converted.write_bytes(b"mp4")
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=90)),
+            patch.object(media_imports, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+            patch.object(
+                media_imports,
+                "stable_import_recording_id",
+                return_value="import_test",
+            ),
+            patch.object(
+                media_imports,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(True, converted, None)),
+            ) as convert_mock,
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        self.assertEqual(result["imported"], 1)
+        convert_mock.assert_awaited_once()
+        rec = (await self.db.get_recordings("model"))[0]
+        self.assertEqual(rec["file_path"], str(source))
+        self.assertEqual(rec["playable_path"], str(converted))
+        self.assertEqual(rec["mp4_path"], str(converted))
+        self.assertEqual(rec["import_status"], "ready")
+
+    async def test_playable_mp4_copy_normalizes_timestamps(self):
+        source = self.write_old_file("records/model/clip.mkv")
+        commands = []
+
+        async def fake_run_ffmpeg(cmd, timeout=3600):
+            commands.append(cmd)
+            tmp_path = self.output_dir / "media_imports/model/import_test.tmp.mp4"
+            tmp_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_bytes(b"mp4")
+            return True, ""
+
+        with patch.object(media_imports, "_run_ffmpeg", new=fake_run_ffmpeg):
+            ok, converted_path, error = await media_imports.create_playable_mp4_copy(
+                source,
+                self.output_dir,
+                "model",
+                "import_test",
+                "ffmpeg",
+            )
+
+        self.assertTrue(ok)
+        self.assertIsNone(error)
+        self.assertTrue(converted_path.exists())
+        remux_cmd = commands[0]
+        self.assertIn("-fflags", remux_cmd)
+        self.assertIn("+genpts+igndts", remux_cmd)
+        self.assertIn("-avoid_negative_ts", remux_cmd)
+        self.assertIn("make_zero", remux_cmd)
 
     async def test_scan_imports_uses_filename_title_as_date_reference(self):
         self.write_old_file("records/model/premium_show_2024-05-06_21h30.mp4")
