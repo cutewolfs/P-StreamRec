@@ -172,6 +172,7 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("profile.thumbnail", js)
         self.assertIn("unwatchedOnly", js)
         self.assertIn("params.set('watched', 'unwatched')", js)
+        self.assertIn("params.set('metadata', 'lazy')", js)
         self.assertIn("toLocaleString('en-US'", js)
         self.assertIn("Unwatched videos", js)
         self.assertIn("Watched", js)

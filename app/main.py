@@ -1408,18 +1408,53 @@ def _attach_media_playback_state(
     })
 
 
-async def _scan_media_library_items() -> list[dict]:
+def _media_library_lazy_record(
+    username: str,
+    relative_path: str,
+    media_path: Path,
+    stat: os.stat_result,
+) -> dict:
+    """Return enough recording-like metadata for listing without probing media."""
+    return {
+        "username": username,
+        "filename": media_path.name,
+        "file_path": str(media_path),
+        "file_size": stat.st_size,
+        "recording_id": stable_import_recording_id(username, relative_path),
+        "duration_seconds": 0,
+        "media_kind": "library",
+        "title": title_from_filename(media_path.name),
+        "source_mtime": int(stat.st_mtime),
+        "playable_path": str(media_path)
+        if media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS
+        else None,
+        "playable_size": stat.st_size
+        if media_path.suffix.lower() in DIRECT_PLAYABLE_EXTENSIONS
+        else None,
+        "created_at": int(stat.st_mtime),
+    }
+
+
+async def _scan_media_library_items(
+    profile_username: Optional[str] = None,
+    refresh_metadata: bool = True,
+) -> list[dict]:
     from .core.utils import format_bytes
 
     records_root = OUTPUT_DIR / "records"
     if not records_root.exists():
         return []
 
-    profile_dirs = [
-        profile_dir
-        for profile_dir in sorted(records_root.iterdir(), key=lambda p: p.name.lower())
-        if profile_dir.is_dir() and not profile_dir.name.startswith(".")
-    ]
+    if profile_username:
+        selected_username = _validate_media_profile_username(profile_username)
+        selected_dir = records_root / selected_username
+        profile_dirs = [selected_dir] if selected_dir.is_dir() else []
+    else:
+        profile_dirs = [
+            profile_dir
+            for profile_dir in sorted(records_root.iterdir(), key=lambda p: p.name.lower())
+            if profile_dir.is_dir() and not profile_dir.name.startswith(".")
+        ]
     recordings_by_username = await db.get_recordings_for_usernames([profile_dir.name for profile_dir in profile_dirs])
 
     items: list[dict] = []
@@ -1462,7 +1497,7 @@ async def _scan_media_library_items() -> list[dict]:
             rec = recordings_by_path.get(str(resolved))
             if rec is None and len(Path(relative_path).parts) == 1:
                 rec = recordings_by_filename.get(media_path.name)
-            if kind == "video":
+            if kind == "video" and refresh_metadata:
                 rec = await _ensure_media_library_video_metadata(
                     username,
                     relative_path,
@@ -1470,9 +1505,12 @@ async def _scan_media_library_items() -> list[dict]:
                     rec,
                     stat,
                 )
+            elif kind == "video" and rec is None:
+                rec = _media_library_lazy_record(username, relative_path, media_path, stat)
 
             imported_recording_id = (rec or {}).get("recording_id")
-            is_imported = bool(rec and rec.get("media_kind") == "import")
+            media_kind = (rec or {}).get("media_kind")
+            is_imported = bool(rec and media_kind == "import")
             if kind == "video" and is_imported and imported_recording_id:
                 url = f"/streams/media/{quote(imported_recording_id, safe='')}"
                 download_url = f"{url}?download=1"
@@ -1513,7 +1551,7 @@ async def _scan_media_library_items() -> list[dict]:
                 "thumbnail": thumbnail,
                 "browserPlayable": browser_playable,
                 "isImported": is_imported,
-                "isRecording": bool(rec and (rec.get("media_kind") or "recording") != "import"),
+                "isRecording": bool(rec and (media_kind or "recording") == "recording"),
             })
 
     return items
@@ -4394,13 +4432,20 @@ async def get_media_library(
     search: str = "",
     sort: str = "newest",
     watched: str = "all",
+    metadata: str = "full",
     limit: int = 1000,
     offset: int = 0,
 ):
     """Liste les médias présents dans les dossiers records."""
     from .core.utils import format_bytes
 
-    all_items = await _scan_media_library_items()
+    metadata_mode = (metadata or "full").strip().lower()
+    refresh_metadata = metadata_mode not in {"lazy", "fast", "0", "false", "no"}
+    scan_username = username if refresh_metadata and username else None
+    all_items = await _scan_media_library_items(
+        profile_username=scan_username,
+        refresh_metadata=refresh_metadata,
+    )
     folder_profiles = _list_media_profile_folders()
     media_profiles = await db.get_all_media_profiles()
     all_models = await db.get_all_models()

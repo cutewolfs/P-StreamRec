@@ -126,6 +126,40 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(indexed["thumbnail_path"], str(thumb))
         self.assertEqual(indexed["created_at"], 1704164645)
 
+    async def test_lazy_media_library_listing_does_not_probe_manual_video(self):
+        manual = self.empty_dir / "lazy_manual.mp4"
+        manual.write_bytes(b"manual video")
+        old = time.time() - 120
+        os.utime(manual, (old, old))
+
+        with (
+            patch.object(app_main, "get_video_duration", new=AsyncMock(return_value=61)) as duration_mock,
+            patch.object(app_main, "get_media_created_at", new=AsyncMock(return_value=1704164645)) as created_mock,
+            patch.object(app_main, "generate_import_thumbnail", new=AsyncMock(return_value="thumb")) as thumb_mock,
+            patch.object(
+                app_main,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(True, manual, None)),
+            ) as convert_mock,
+        ):
+            response = self.client.get("/api/media-library?metadata=lazy&kind=video&search=lazy_manual")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertEqual(data["total"], 1)
+        item = data["items"][0]
+        self.assertEqual(item["filename"], "lazy_manual.mp4")
+        self.assertEqual(item["duration"], 0)
+        self.assertTrue(item["recordingId"])
+        self.assertTrue(item["url"].startswith("/streams/library/empty_model/"))
+        self.assertFalse(item["isImported"])
+        self.assertFalse(item["isRecording"])
+        duration_mock.assert_not_awaited()
+        created_mock.assert_not_awaited()
+        thumb_mock.assert_not_awaited()
+        convert_mock.assert_not_awaited()
+        self.assertEqual([], await app_main.db.get_recordings("empty_model"))
+
     async def test_filters_media_library(self):
         response = self.client.get("/api/media-library?kind=image&search=photo")
         self.assertEqual(response.status_code, 200)

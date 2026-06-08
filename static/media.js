@@ -350,6 +350,7 @@
     var params = new URLSearchParams();
     params.set('kind', state.unwatchedOnly ? 'video' : state.kind);
     params.set('sort', state.sort);
+    params.set('metadata', 'lazy');
     params.set('limit', '1000');
     if (state.unwatchedOnly) params.set('watched', 'unwatched');
     if (state.filterProfile) params.set('username', state.filterProfile);
