@@ -16,8 +16,8 @@ services:
     container_name: p-streamrec
     # Startup race against FlareSolverr is handled by the Python-side retry
     # loop in app/main.py — the docker healthcheck approach was blocking
-    # Umbrel updates on slower hardware where FlareSolverr can take 90s+ to
-    # boot Chromium. Keep the dependency ordering but don't gate on health.
+    # container startup on slower hardware where FlareSolverr can take 90s+ to
+    # boot Chromium. Keep the dependency ordering but do not gate on health.
     depends_on:
       - flaresolverr
     environment:

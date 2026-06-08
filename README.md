@@ -72,17 +72,6 @@ PSTREAMREC_IMAGE=p-streamrec:local HOST_PORT=2727 docker compose up -d p-streamr
 
 Open the local test instance at `http://127.0.0.1:2727`.
 
-### UmbrelOS
-
-P-StreamRec ships as an Umbrel Community App Store app.
-
-1. Open the **App Store**.
-2. Open the store menu, then **Community App Stores -> Add**.
-3. Paste `https://github.com/raccommode/P-StreamRec`.
-4. Install **P-StreamRec**.
-
-FlareSolverr is bundled with the app and recordings are stored in the app data folder.
-
 ## App Configuration
 
 Most day-to-day configuration is handled from the web UI:

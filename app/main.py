@@ -298,7 +298,7 @@ async def log_requests(request: Request, call_next):
     
     return response
 
-# Configuration CORS permissive pour Umbrel
+# Configuration CORS permissive pour Docker/self-hosted deployments
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Autoriser toutes les origines
@@ -2939,7 +2939,7 @@ async def restart_application():
         except Exception:
             pass
 
-    # Prod (Docker/Umbrel): on quitte proprement. Le container manager relance
+    # Prod (Docker): on quitte proprement. Le container manager relance
     # l'app via sa restart policy (unless-stopped).
     os._exit(0)
 
