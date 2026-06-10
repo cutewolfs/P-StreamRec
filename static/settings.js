@@ -80,25 +80,65 @@ function renderProviders(providers) {
     var source = provider.sourceType;
     var caps = provider.capabilities || {};
     var status = provider.status || {};
+    var enabled = provider.enabled !== false;
     var supportsAccount = caps.can_login === true;
     var connected = supportsAccount && status.isLoggedIn === true;
     var capabilities = providerCapabilityChecks(caps);
     var accountControls = supportsAccount ? providerAccountControls(source, status, caps) : '';
     var statusClass = supportsAccount ? providerStatusClass(status) : 'available';
     var statusText = supportsAccount ? providerStatusText(status) : 'Local';
+    var enabledControl = providerEnabledControl(source, enabled);
 
-    return '<div class="provider-card">' +
+    return '<div class="provider-card ' + (enabled ? '' : 'is-provider-disabled') + '">' +
       '<div class="provider-card-main">' +
         '<div>' +
           '<div class="provider-title">' + escapeHtml(provider.displayName || source) + '</div>' +
           '<div class="provider-muted">' + escapeHtml(providerAvailabilityText(caps)) + '</div>' +
         '</div>' +
-        '<span class="status-indicator ' + statusClass + '">' + escapeHtml(statusText) + '</span>' +
+        '<div class="provider-card-actions">' +
+          enabledControl +
+          '<span class="status-indicator ' + statusClass + '">' + escapeHtml(statusText) + '</span>' +
+        '</div>' +
       '</div>' +
       '<div class="provider-capability-list">' + capabilities.join('') + '</div>' +
       accountControls +
     '</div>';
   }).join('');
+}
+
+function providerEnabledControl(source, enabled) {
+  return '<div class="provider-enabled-control">' +
+    '<span>Enabled</span>' +
+    '<label class="toggle-switch">' +
+      '<input type="checkbox" ' + (enabled ? 'checked' : '') +
+        ' onchange="toggleProviderEnabled(\'' + escapeHtml(source) + '\', this.checked, this)">' +
+      '<span class="toggle-slider"></span>' +
+    '</label>' +
+  '</div>';
+}
+
+async function toggleProviderEnabled(source, enabled, input) {
+  if (input) input.disabled = true;
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(source) + '/enabled', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !!enabled })
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) {
+      if (input) input.checked = !enabled;
+      showNotification(data.detail || 'Failed to update provider', 'error');
+      return;
+    }
+    showNotification(data.enabled ? 'Provider enabled' : 'Provider disabled', 'success');
+    loadProviders();
+  } catch (e) {
+    if (input) input.checked = !enabled;
+    showNotification('Connection error', 'error');
+  } finally {
+    if (input) input.disabled = false;
+  }
 }
 
 function providerStatusClass(status) {

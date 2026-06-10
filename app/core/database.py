@@ -1649,6 +1649,36 @@ class Database:
         """Set blacklisted tags list"""
         await self.set_setting("blacklisted_tags", json.dumps(tags))
 
+    async def get_disabled_providers(self) -> List[str]:
+        """Get provider source types hidden from Discover."""
+        value = await self.get_setting("disabled_providers")
+        if not value:
+            return []
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        seen = set()
+        providers = []
+        for item in parsed:
+            source_type = str(item or "").strip().lower()
+            if not source_type or source_type in seen:
+                continue
+            seen.add(source_type)
+            providers.append(source_type)
+        return providers
+
+    async def set_disabled_providers(self, providers: List[str]):
+        """Set provider source types hidden from Discover."""
+        normalized = sorted({
+            str(source_type or "").strip().lower()
+            for source_type in providers
+            if str(source_type or "").strip()
+        })
+        await self.set_setting("disabled_providers", json.dumps(normalized))
+
     # ==========================================
     # Playback Positions CRUD
     # ==========================================

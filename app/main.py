@@ -2549,6 +2549,10 @@ class ProviderSessionBody(BaseModel):
     xbc: Optional[str] = None
 
 
+class ProviderEnabledBody(BaseModel):
+    enabled: bool
+
+
 class ModelVolumeBody(BaseModel):
     volume: float
 
@@ -3217,14 +3221,42 @@ async def _ensure_saved_provider_login(provider, source_type: str) -> None:
         raise HTTPException(status_code=401, detail=f"{provider.display_name}: connexion requise")
 
 
+async def _disabled_provider_sources() -> set[str]:
+    try:
+        return set(await db.get_disabled_providers())
+    except Exception:
+        return set()
+
+
 @app.get("/api/providers")
 async def list_providers():
+    disabled_sources = await _disabled_provider_sources()
     providers = []
     for meta in provider_registry.metadata():
         source_type = meta["sourceType"]
+        meta["enabled"] = source_type not in disabled_sources
         meta["status"] = await _provider_login_state(source_type)
         providers.append(meta)
     return {"providers": providers, "sourceTypes": sorted(_available_source_types())}
+
+
+@app.put("/api/providers/{source_type}/enabled")
+async def provider_set_enabled(source_type: str, body: ProviderEnabledBody):
+    source_type = _normalize_source_type(source_type) or ""
+    if source_type not in _available_source_types():
+        raise HTTPException(status_code=404, detail=f"Source '{source_type}' non disponible")
+
+    disabled_sources = await _disabled_provider_sources()
+    if body.enabled:
+        disabled_sources.discard(source_type)
+    else:
+        disabled_sources.add(source_type)
+    await db.set_disabled_providers(sorted(disabled_sources))
+    return {
+        "sourceType": source_type,
+        "enabled": source_type not in disabled_sources,
+        "disabledProviders": sorted(disabled_sources),
+    }
 
 
 @app.get("/api/providers/{source_type}/status")

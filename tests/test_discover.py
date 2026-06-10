@@ -83,6 +83,17 @@ class _Registry:
         return self.providers[source_type]
 
 
+class _SettingsDB:
+    def __init__(self, disabled=None):
+        self.disabled = list(disabled or [])
+
+    async def get_disabled_providers(self):
+        return list(self.disabled)
+
+    async def get_blacklisted_tags(self):
+        return []
+
+
 class _UnstableTotalProvider(_Provider):
     async def list_live_models(self, **kwargs):
         page = int(kwargs.get("page", 1) or 1)
@@ -135,6 +146,49 @@ class DiscoverProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(["stripchat"], [item["source_type"] for item in result["models"]])
+
+    async def test_discover_filters_gender_after_provider_results(self):
+        registry = _Registry()
+        registry.providers = {
+            "camsoda": _Provider("camsoda", models=[
+                {
+                    "username": "male_model",
+                    "is_online": True,
+                    "room_status": "public",
+                    "viewers": 50,
+                    "gender": "male",
+                    "tags": ["men", "public"],
+                },
+                {
+                    "username": "trans_model",
+                    "is_online": True,
+                    "room_status": "public",
+                    "viewers": 500,
+                    "gender": "trans",
+                    "tags": ["trans", "public"],
+                },
+            ]),
+        }
+        discover.init(None, None, registry)
+
+        result = await discover.discover_models(
+            page=1, limit=6, source=None, gender="male", search=None, tags=None, sort="viewers"
+        )
+
+        self.assertEqual(["male_model"], [item["username"] for item in result["models"]])
+
+    async def test_discover_excludes_disabled_providers_from_all_sources(self):
+        registry = _Registry()
+        discover.init(None, _SettingsDB(disabled=["camsoda"]), registry)
+
+        result = await discover.discover_models(
+            page=1, limit=6, source=None, gender=None, search=None, tags=None, sort="viewers"
+        )
+
+        self.assertEqual(
+            {"chaturbate", "stripchat"},
+            {item["source_type"] for item in result["models"]},
+        )
 
     async def test_discover_returns_provider_status_for_empty_source(self):
         registry = _Registry()

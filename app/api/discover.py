@@ -1,6 +1,7 @@
 """API Router: Discover live models across registered providers."""
 
 import asyncio
+import json
 import time
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,35 @@ _db = None
 _provider_registry = None
 _pagination_total_cache: dict[tuple, tuple[float, int, int]] = {}
 _PAGINATION_TOTAL_TTL_SECONDS = 300
+_PROVIDER_DISABLED_SETTING = "disabled_providers"
+_GENDER_ALIASES = {
+    "female": "female",
+    "f": "female",
+    "females": "female",
+    "girl": "female",
+    "girls": "female",
+    "woman": "female",
+    "women": "female",
+    "male": "male",
+    "m": "male",
+    "males": "male",
+    "man": "male",
+    "men": "male",
+    "guy": "male",
+    "guys": "male",
+    "couple": "couple",
+    "couples": "couple",
+    "cpl": "couple",
+    "maleFemale": "couple",
+    "malefemale": "couple",
+    "trans": "trans",
+    "transgender": "trans",
+    "ts": "trans",
+    "tranny": "trans",
+    "femaleTranny": "trans",
+    "femaletranny": "trans",
+    "transsexual": "trans",
+}
 
 
 def init(chaturbate_api, db, provider_registry=None):
@@ -25,9 +55,32 @@ def init(chaturbate_api, db, provider_registry=None):
     _pagination_total_cache.clear()
 
 
-def _discover_providers(source: Optional[str]) -> list:
+async def _disabled_provider_sources() -> set[str]:
+    if _db is None:
+        return set()
+    try:
+        if hasattr(_db, "get_disabled_providers"):
+            return set(await _db.get_disabled_providers())
+        raw_value = await _db.get_setting(_PROVIDER_DISABLED_SETTING)
+    except Exception:
+        return set()
+    try:
+        parsed = json.loads(raw_value or "[]")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    return {
+        str(source_type or "").strip().lower()
+        for source_type in parsed
+        if str(source_type or "").strip()
+    }
+
+
+def _discover_providers(source: Optional[str], disabled_sources: Optional[set[str]] = None) -> list:
     if _provider_registry is None:
         return []
+    disabled_sources = disabled_sources or set()
     requested = [
         item.strip().lower()
         for item in (source or "").split(",")
@@ -36,6 +89,8 @@ def _discover_providers(source: Optional[str]) -> list:
     if requested:
         providers = []
         for source_type in requested:
+            if source_type in disabled_sources:
+                continue
             if _provider_registry.has(source_type):
                 providers.append(_provider_registry.get(source_type))
         return providers
@@ -43,6 +98,7 @@ def _discover_providers(source: Optional[str]) -> list:
         provider
         for provider in _provider_registry.all()
         if getattr(provider.capabilities, "can_discover", False)
+        and provider.source_type not in disabled_sources
     ]
 
 
@@ -53,6 +109,7 @@ def _pagination_cache_key(
     tags: List[str],
     sort_mode: str,
     limit: int,
+    disabled_sources: set[str],
 ) -> tuple:
     requested_sources = tuple(
         item.strip().lower()
@@ -66,6 +123,7 @@ def _pagination_cache_key(
         tuple(tags),
         sort_mode,
         int(limit),
+        tuple(sorted(disabled_sources)),
     )
 
 
@@ -87,6 +145,57 @@ def _stable_pagination_totals(
         return stable
 
     return cached[1], cached[2]
+
+
+def _canonical_gender(value: object) -> Optional[str]:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    compact = token.replace("_", "").replace("-", "").replace(" ", "")
+    lowered = token.lower().replace("_", "-").strip()
+    return (
+        _GENDER_ALIASES.get(token)
+        or _GENDER_ALIASES.get(compact)
+        or _GENDER_ALIASES.get(lowered)
+        or _GENDER_ALIASES.get(lowered.replace("-", ""))
+    )
+
+
+def _gender_tokens(values: List[object]) -> set[str]:
+    tokens: set[str] = set()
+    for value in values:
+        canonical = _canonical_gender(value)
+        if canonical:
+            tokens.add(canonical)
+    return tokens
+
+
+def _matches_gender_filter(
+    item: Dict[str, Any],
+    item_tags: List[str],
+    requested_gender: Optional[str],
+) -> bool:
+    requested = _canonical_gender(requested_gender)
+    if not requested:
+        return True
+
+    primary_tokens = _gender_tokens([
+        item.get("gender"),
+        item.get("gender_group"),
+        item.get("genderGroup"),
+        item.get("broadcastGender"),
+        item.get("category"),
+        item.get("main_category"),
+    ])
+    if primary_tokens:
+        return requested in primary_tokens
+
+    tag_tokens = _gender_tokens(item_tags)
+    if "trans" in tag_tokens and requested != "trans":
+        return False
+    if "couple" in tag_tokens and requested != "couple":
+        return False
+    return requested in tag_tokens
 
 
 async def _fetch_provider(
@@ -140,7 +249,8 @@ async def discover_models(
     search_lower = (search or "").strip().lower()
     sort_mode = (sort or "viewers").strip().lower()
 
-    providers = _discover_providers(source)
+    disabled_sources = await _disabled_provider_sources()
+    providers = _discover_providers(source, disabled_sources)
     if not providers:
         return {"models": [], "total": 0, "page": page, "limit": limit, "total_pages": 1}
     explicit_source = bool((source or "").strip())
@@ -221,6 +331,8 @@ async def discover_models(
             if not item_tags:
                 item_tags = _fallback_tags(item)
             item_tags_lower = [t.lower() for t in item_tags]
+            if not _matches_gender_filter(item, item_tags_lower, gender):
+                continue
             if blacklisted_set and any(bt in item_tags_lower for bt in blacklisted_set):
                 continue
             # Filtrage strict: tous les tags demandés doivent être présents.
@@ -322,7 +434,7 @@ async def discover_models(
         total_combined = len(ranked_items)
         total_pages = max(1, (total_combined + limit - 1) // limit)
     total_combined, total_pages = _stable_pagination_totals(
-        _pagination_cache_key(source, gender, search_lower, included_tags, sort_mode, limit),
+        _pagination_cache_key(source, gender, search_lower, included_tags, sort_mode, limit, disabled_sources),
         page,
         total_combined,
         total_pages,

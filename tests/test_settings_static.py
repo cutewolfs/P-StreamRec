@@ -220,6 +220,17 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn('RedirectResponse(url="/media", status_code=307)', main)
         self.assertNotIn('return FileResponse(str(STATIC_DIR / "recordings.html"))', main)
 
+    def test_discover_preserves_filter_state_in_url(self):
+        js = (ROOT / "static" / "discover.js").read_text()
+        html = (ROOT / "static" / "discover.html").read_text()
+
+        self.assertIn("function readDiscoverStateFromUrl", js)
+        self.assertIn("function syncDiscoverStateToUrl", js)
+        self.assertIn("applyDiscoverStateToControls", js)
+        self.assertIn("window.history.replaceState", js)
+        self.assertIn("window.addEventListener('popstate'", js)
+        self.assertIn("discover.js?v=9", html)
+
     def test_provider_settings_has_account_controls_for_sync_capable_providers(self):
         js = (ROOT / "static" / "settings.js").read_text()
         css = (ROOT / "static" / "styles.css").read_text()
@@ -266,12 +277,17 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn("providerCapabilityCheck('Follow / Unfollow', !!caps.can_follow)", js)
         self.assertIn("providerCapabilityCheck('Sync', !!caps.can_sync_following)", js)
         self.assertIn("provider-capability-icon", js)
+        self.assertIn("function providerEnabledControl", js)
+        self.assertIn("function toggleProviderEnabled", js)
+        self.assertIn("/api/providers/' + encodeURIComponent(source) + '/enabled", js)
+        self.assertIn("provider-enabled-control", js)
         self.assertIn("&#10003;", js)
         self.assertIn("&#10005;", js)
         self.assertIn(".provider-capability-list", css)
         self.assertIn(".provider-capability-icon", css)
         self.assertIn(".provider-capability.is-enabled .provider-capability-icon", css)
         self.assertIn(".provider-capability.is-disabled .provider-capability-icon", css)
+        self.assertIn(".provider-enabled-control", css)
         self.assertNotIn(".provider-capability:has(input:checked)", css)
         self.assertIn(".status-indicator.available", css)
         self.assertIn("<h3>Providers</h3>", html)

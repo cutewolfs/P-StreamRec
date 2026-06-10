@@ -3697,11 +3697,33 @@ body.watch-recording-open {
   padding: 1rem;
 }
 
+.provider-card.is-provider-disabled {
+  opacity: 0.72;
+}
+
 .provider-card-main {
   display: flex;
   justify-content: space-between;
   gap: 1rem;
   align-items: flex-start;
+}
+
+.provider-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.provider-enabled-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .provider-title {

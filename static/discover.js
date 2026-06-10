@@ -30,6 +30,72 @@ const DISCOVER_PAGE_LIMIT = 24;
 // mis à jour par toggleFollowOnCard après chaque action.
 let followedSet = new Set();
 
+function normalizePositiveInt(value, fallback) {
+  var parsed = parseInt(value, 10);
+  return parsed > 0 ? parsed : fallback;
+}
+
+function parseTagParam(value) {
+  return String(value || '')
+    .split(',')
+    .map(function(tag) { return tag.trim().toLowerCase(); })
+    .filter(Boolean)
+    .filter(function(tag, index, tags) { return tags.indexOf(tag) === index; });
+}
+
+function readDiscoverStateFromUrl() {
+  var params = new URLSearchParams(window.location.search || '');
+  var gender = String(params.get('gender') || '').trim().toLowerCase();
+  var validGenders = ['', 'female', 'male', 'couple', 'trans'];
+  currentPage = normalizePositiveInt(params.get('page'), 1);
+  currentSource = String(params.get('source') || '').trim().toLowerCase();
+  currentGender = validGenders.indexOf(gender) !== -1 ? gender : '';
+  currentSearch = String(params.get('search') || '').trim();
+  activeTags = parseTagParam(params.get('tags'));
+  paginationQueryKey = '';
+  lockedTotalPages = null;
+}
+
+function discoverStateParams() {
+  var params = new URLSearchParams();
+  if (currentPage > 1) params.set('page', String(currentPage));
+  if (currentSource) params.set('source', currentSource);
+  if (currentGender) params.set('gender', currentGender);
+  if (currentSearch) params.set('search', currentSearch);
+  if (activeTags.length) params.set('tags', activeTags.join(','));
+  return params;
+}
+
+function syncDiscoverStateToUrl() {
+  if (!window.history || !window.location) return;
+  var params = discoverStateParams();
+  var nextUrl = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+  var currentUrl = window.location.pathname + window.location.search;
+  if (nextUrl !== currentUrl) {
+    window.history.replaceState({}, '', nextUrl);
+  }
+}
+
+function applyDiscoverStateToControls() {
+  var searchInput = document.getElementById('searchInput');
+  if (searchInput) searchInput.value = currentSearch;
+
+  var sourceFilter = document.getElementById('sourceFilter');
+  if (sourceFilter) {
+    sourceFilter.value = currentSource;
+    if (currentSource && sourceFilter.value !== currentSource) {
+      currentSource = '';
+      sourceFilter.value = '';
+    }
+  }
+
+  var pills = document.querySelectorAll('.filter-pill');
+  pills.forEach(function(pill) {
+    pill.classList.toggle('active', (pill.getAttribute('data-gender') || '') === currentGender);
+  });
+  renderActiveTagFilters();
+}
+
 function sourceKey(username, sourceType) {
   return (sourceType || 'chaturbate') + ':' + (username || '');
 }
@@ -82,7 +148,7 @@ async function loadDiscoverProviders() {
     if (!res.ok) return;
     var data = await res.json();
     discoverProviders = (data.providers || []).filter(function(provider) {
-      return provider.capabilities && provider.capabilities.can_discover;
+      return provider.enabled !== false && provider.capabilities && provider.capabilities.can_discover;
     });
     providerCapsBySource = {};
     discoverProviders.forEach(function(provider) {
@@ -94,6 +160,10 @@ async function loadDiscoverProviders() {
       return '<option value="' + escapeHtml(provider.sourceType) + '">' + escapeHtml(provider.displayName || provider.sourceType) + '</option>';
     }).join('');
     select.value = current;
+    if (current && select.value !== current) {
+      currentSource = '';
+      select.value = '';
+    }
   } catch (e) {
     // Discover reste utilisable avec les defaults serveur.
   }
@@ -127,6 +197,7 @@ function buildDiscoverParams(page) {
 async function fetchDiscover() {
   var requestSeq = ++discoverRequestSeq;
   var queryKey = discoverQueryKey();
+  syncDiscoverStateToUrl();
   setPaginationLoading(true);
   var grid = document.getElementById('discoverGrid');
   grid.innerHTML = '<div class="empty-message"><div class="icon">&#9203;</div><p>Loading models...</p></div>';
@@ -512,6 +583,7 @@ window.addEventListener('DOMContentLoaded', function() {
   var style = document.createElement('style');
   style.textContent = '@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }';
   document.head.appendChild(style);
+  readDiscoverStateFromUrl();
 
   // Set up search with debounce
   var searchInput = document.getElementById('searchInput');
@@ -545,7 +617,16 @@ window.addEventListener('DOMContentLoaded', function() {
 
   // Charger la liste des follows avant le premier render pour que les cœurs
   // soient coloriés correctement dès l'affichage.
-  Promise.all([loadFollowedSet(), loadDiscoverProviders()]).finally(fetchDiscover);
+  Promise.all([loadFollowedSet(), loadDiscoverProviders()]).finally(function() {
+    applyDiscoverStateToControls();
+    fetchDiscover();
+  });
+
+  window.addEventListener('popstate', function() {
+    readDiscoverStateFromUrl();
+    applyDiscoverStateToControls();
+    fetchDiscover();
+  });
 
   // Refresh live thumbnails toutes les 30s
   setInterval(refreshLiveThumbnails, 30000);

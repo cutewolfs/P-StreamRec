@@ -92,6 +92,30 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(400, ctx.exception.status_code)
 
+    async def test_provider_enabled_setting_can_be_toggled(self):
+        disabled = await app_main.provider_set_enabled(
+            "camsoda",
+            app_main.ProviderEnabledBody(enabled=False),
+        )
+
+        self.assertFalse(disabled["enabled"])
+        self.assertIn("camsoda", await app_main.db.get_disabled_providers())
+
+        providers = await app_main.list_providers()
+        camsoda = next(
+            provider for provider in providers["providers"]
+            if provider["sourceType"] == "camsoda"
+        )
+        self.assertFalse(camsoda["enabled"])
+
+        enabled = await app_main.provider_set_enabled(
+            "camsoda",
+            app_main.ProviderEnabledBody(enabled=True),
+        )
+
+        self.assertTrue(enabled["enabled"])
+        self.assertNotIn("camsoda", await app_main.db.get_disabled_providers())
+
     async def test_existing_model_without_record_path_keeps_legacy_folder(self):
         await app_main.db.add_or_update_model(username="model")
 
