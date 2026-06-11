@@ -68,7 +68,10 @@ class ChaturbateProvider(BaseProvider):
     async def resolve_stream(
         self, target: str, max_height: Optional[int] = None
     ) -> ResolvedStream:
-        from ..resolvers.chaturbate import resolve_m3u8_async
+        from ..resolvers.chaturbate import (
+            resolve_llhls_master_playlist,
+            resolve_m3u8_async,
+        )
 
         status = ProviderStatus(False, source_type=self.source_type)
         if self.api:
@@ -76,13 +79,29 @@ class ChaturbateProvider(BaseProvider):
                 status = await self.check_status(target)
             except Exception:
                 status = ProviderStatus(False, source_type=self.source_type)
+        headers = self._headers(target)
         url = await resolve_m3u8_async(target, max_height=max_height)
         if not url:
             raise ProviderOfflineError(f"Aucun flux Chaturbate pour {target}")
+        hls_master = await resolve_llhls_master_playlist(
+            url,
+            max_height=max_height,
+            headers=headers,
+        )
+        ffmpeg_video_stream_index = (
+            hls_master.get("video_stream_index") if hls_master else None
+        )
         return ResolvedStream(
             url=url,
-            headers=self._headers(target),
+            headers=headers,
             source_type=self.source_type,
+            ffmpeg_video_stream_index=(
+                int(ffmpeg_video_stream_index)
+                if ffmpeg_video_stream_index is not None else None
+            ),
+            hls_playlist_text=hls_master.get("text") if hls_master else None,
+            hls_playlist_base_url=hls_master.get("base_url") if hls_master else None,
+            hls_playlist_content_type=hls_master.get("content_type") if hls_master else None,
             is_live=True,
             room_status="public",
             viewers=int(status.viewers or 0),

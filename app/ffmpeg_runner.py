@@ -18,9 +18,6 @@ from .recording_names import (
     recording_base_name,
 )
 
-# Chaturbate LL-HLS master playlists multiplex all quality levels into one stream.
-# Each entry maps a max_height ceiling to the ffmpeg video stream index.
-_LLHLS_QUALITY_LADDER = [(360, 0), (480, 1), (540, 2), (720, 3), (1080, 4)]
 _TS_PACKET_SIZE = 188
 _CHATURBATE_HLS_HOST_SUFFIXES = ("chaturbate.com", "highwebmedia.com", "mmcdn.com")
 _CHATURBATE_HLS_HEADERS = (
@@ -29,16 +26,6 @@ _CHATURBATE_HLS_HEADERS = (
     "Connection: keep-alive\r\n"
 )
 _FINISHED_SESSION_GRACE_SECONDS = 300
-
-
-def _llhls_video_stream_index(max_height: Optional[int]) -> int:
-    """Return the ffmpeg 0:v:N index for the desired quality on an LL-HLS master."""
-    if not max_height or max_height <= 0:
-        return _LLHLS_QUALITY_LADDER[-1][1]
-    for height, idx in _LLHLS_QUALITY_LADDER:
-        if max_height <= height:
-            return idx
-    return _LLHLS_QUALITY_LADDER[-1][1]
 
 
 def _is_chaturbate_hls_url(input_url: str) -> bool:
@@ -130,6 +117,7 @@ def _build_ffmpeg_command(
     max_height: Optional[int] = None,
     input_headers: Optional[Dict[str, str]] = None,
     source_url: Optional[str] = None,
+    ffmpeg_video_stream_index: Optional[int] = None,
 ) -> List[str]:
     cmd = [
         ffmpeg_path,
@@ -180,7 +168,12 @@ def _build_ffmpeg_command(
         and _is_chaturbate_hls_url(stream_identity_url)
     )
     if is_chaturbate_llhls:
-        v_idx = _llhls_video_stream_index(max_height)
+        try:
+            v_idx = int(ffmpeg_video_stream_index) if ffmpeg_video_stream_index is not None else 0
+        except (TypeError, ValueError):
+            v_idx = 0
+        if v_idx < 0:
+            v_idx = 0
         map_args = ["-map", f"0:v:{v_idx}", "-map", "0:a:0"]
     else:
         map_args = ["-map", "0"]
@@ -207,6 +200,7 @@ class FFmpegSession:
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
+        ffmpeg_video_stream_index: Optional[int] = None,
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
         source_type: Optional[str] = None,
         target: Optional[str] = None,
@@ -215,6 +209,7 @@ class FFmpegSession:
         self.id = session_id
         self.input_url = input_url
         self.source_url = source_url or input_url
+        self.ffmpeg_video_stream_index = ffmpeg_video_stream_index
         self.source_type = (source_type or "").strip().lower()
         self.target = (target or "").strip()
         self.input_headers = dict(input_headers or {})
@@ -569,6 +564,7 @@ class FFmpegManager:
         segment_size_bytes: int = 0,
         input_headers: Optional[Dict[str, str]] = None,
         source_url: Optional[str] = None,
+        ffmpeg_video_stream_index: Optional[int] = None,
         filename_format: str = FILENAME_FORMAT_TIMESTAMP,
         records_dir_for_person: Optional[str] = None,
         source_type: Optional[str] = None,
@@ -612,6 +608,7 @@ class FFmpegManager:
                 segment_size_bytes=segment_size_bytes,
                 input_headers=input_headers,
                 source_url=source_url,
+                ffmpeg_video_stream_index=ffmpeg_video_stream_index,
                 filename_format=filename_format,
                 source_type=source_type,
                 target=target,
@@ -637,6 +634,7 @@ class FFmpegManager:
                 max_height=max_height,
                 input_headers=sess.input_headers,
                 source_url=sess.source_url,
+                ffmpeg_video_stream_index=sess.ffmpeg_video_stream_index,
             )
 
             safe_cmd = _redact_ffmpeg_command(cmd)

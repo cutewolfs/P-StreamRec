@@ -231,6 +231,40 @@ class HlsProxyTests(unittest.TestCase):
         self.assertIsNone(headers)
         self.assertEqual(stream.url, source_url)
 
+    def test_ffmpeg_input_uses_preloaded_chaturbate_master_playlist(self):
+        stream = main.ResolvedStream(
+            url="https://edge.mmcdn.com/live/llhls.m3u8?token=one",
+            headers={"Referer": "https://chaturbate.com/"},
+            source_type="chaturbate",
+            hls_playlist_text=(
+                "#EXTM3U\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=3096000,RESOLUTION=1280x720\n"
+                "chunklist_3_video_llhls.m3u8?session=abc\n"
+            ),
+            hls_playlist_base_url="https://edge.mmcdn.com/live/llhls.m3u8?token=one",
+            hls_playlist_content_type="application/vnd.apple.mpegurl",
+        )
+
+        url, headers, source_url = main._ffmpeg_stream_input(stream)
+
+        self.assertTrue(url.startswith("http://127.0.0.1:"))
+        self.assertTrue(url.endswith(".m3u8"))
+        self.assertIsNone(headers)
+        self.assertEqual(stream.url, source_url)
+        master_token = url.split("/api/proxy/hls/", 1)[1].split(".", 1)[0]
+        master_entry = main._HLS_PROXY_CACHE[master_token]
+        self.assertIn("body", master_entry)
+        body = master_entry["body"].decode("utf-8")
+        self.assertIn("/api/proxy/hls/", body)
+        variant_urls = {
+            entry["url"] for token, entry in main._HLS_PROXY_CACHE.items()
+            if token != master_token
+        }
+        self.assertIn(
+            "https://edge.mmcdn.com/live/chunklist_3_video_llhls.m3u8?session=abc",
+            variant_urls,
+        )
+
     def test_watch_stream_payload_proxies_hls_by_default(self):
         stream = main.ResolvedStream(
             url="https://edge.example.test/live/channel.m3u8",

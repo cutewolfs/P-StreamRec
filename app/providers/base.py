@@ -43,6 +43,10 @@ class ResolvedStream:
     url: str
     headers: dict[str, str] = field(default_factory=dict)
     source_type: str = ""
+    ffmpeg_video_stream_index: Optional[int] = None
+    hls_playlist_text: Optional[str] = None
+    hls_playlist_base_url: Optional[str] = None
+    hls_playlist_content_type: Optional[str] = None
     is_live: bool = True
     room_status: Optional[str] = None
     viewers: int = 0

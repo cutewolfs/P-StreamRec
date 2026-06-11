@@ -2041,7 +2041,12 @@ def _register_hls_proxy_url(
     return f"/api/proxy/hls/{token}{resolved_suffix}"
 
 
-def _register_cached_hls_body(url: str, body: bytes, content_type: str = "") -> str:
+def _register_cached_hls_body(
+    url: str,
+    body: bytes,
+    content_type: str = "",
+    suffix: str = ".mp4",
+) -> str:
     _prune_hls_proxy_cache()
     token = secrets.token_urlsafe(24)
     now = time.time()
@@ -2053,7 +2058,7 @@ def _register_cached_hls_body(url: str, body: bytes, content_type: str = "") -> 
         "created_at": now,
         "expires_at": now + max(60, _HLS_PROXY_TTL_SECONDS),
     }
-    return f"/api/proxy/hls/{token}.mp4"
+    return f"/api/proxy/hls/{token}{suffix}"
 
 
 def _hls_segment_header_variants(headers: Optional[dict[str, str]]) -> list[dict[str, str]]:
@@ -2260,6 +2265,20 @@ def _rewrite_hls_playlist(
 
 def _proxied_stream_url(stream: ResolvedStream) -> str:
     lower = (stream.url or "").lower()
+    if stream.hls_playlist_text and ".m3u8" in lower:
+        # Chaturbate LL-HLS master tokens can reject an immediate second fetch.
+        # Reuse the resolver-fetched master and proxy its rewritten variants.
+        rewritten = _rewrite_hls_playlist(
+            stream.hls_playlist_text,
+            stream.hls_playlist_base_url or stream.url,
+            headers=stream.headers,
+        )
+        return _register_cached_hls_body(
+            stream.url,
+            rewritten.encode("utf-8"),
+            stream.hls_playlist_content_type or "application/vnd.apple.mpegurl",
+            suffix=".m3u8",
+        )
     if stream.source_type == "livejasmin":
         return _register_hls_proxy_url(stream.url, headers=stream.headers, suffix=".m3u8")
     if ".m3u8" in lower or ".mpd" in lower:
@@ -3589,6 +3608,7 @@ async def api_start(body: StartBody):
     m3u8_url: Optional[str] = None
     stream_headers: Optional[dict[str, str]] = None
     source_url: Optional[str] = None
+    ffmpeg_video_stream_index: Optional[int] = None
     person: Optional[str] = (body.person or "").strip() or None
     record_quality = body.record_quality or body.recordQuality
     session_key = body.session_key or body.sessionKey
@@ -3680,6 +3700,7 @@ async def api_start(body: StartBody):
         logger.subsection(f"Résolution via source '{effective_source}'")
         try:
             resolved = await _resolve_stream(effective_source, target, max_height)
+            ffmpeg_video_stream_index = resolved.ffmpeg_video_stream_index
             m3u8_url, stream_headers, source_url = _ffmpeg_stream_input(resolved)
             if not m3u8_url:
                 raise HTTPException(
@@ -3726,6 +3747,7 @@ async def api_start(body: StartBody):
             segment_size_bytes=segment_size_bytes,
             input_headers=stream_headers,
             source_url=source_url,
+            ffmpeg_video_stream_index=ffmpeg_video_stream_index,
             filename_format=filename_format,
             records_dir_for_person=str(records_dir_for_person),
             source_type=stype,
@@ -6792,6 +6814,7 @@ async def auto_record_task():
                     try:
                         hls_source = None
                         hls_source_url = None
+                        ffmpeg_video_stream_index = None
                         stream_headers = None
                         filename_format = await _get_recording_filename_format()
                         max_height = await _get_recording_height_for_quality(
@@ -6849,6 +6872,7 @@ async def auto_record_task():
                                 resolved = await _resolve_stream(
                                     source_type, target_username, max_height
                                 )
+                                ffmpeg_video_stream_index = resolved.ffmpeg_video_stream_index
                                 hls_source, stream_headers, hls_source_url = _ffmpeg_stream_input(resolved)
                             except Exception as e:
                                 logger.debug(
@@ -6873,6 +6897,7 @@ async def auto_record_task():
                                     segment_size_bytes=segment_size_bytes,
                                     input_headers=stream_headers,
                                     source_url=hls_source_url,
+                                    ffmpeg_video_stream_index=ffmpeg_video_stream_index,
                                     filename_format=filename_format,
                                     records_dir_for_person=str(record_dir),
                                     source_type=source_type,

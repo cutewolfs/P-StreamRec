@@ -179,6 +179,7 @@ def _parse_master_playlist(text: str):
     Variants without RESOLUTION info keep height=0 (sorted last).
     """
     variants = []
+    variant_index = 0
     lines = text.splitlines()
     i = 0
     while i < len(lines):
@@ -198,6 +199,8 @@ def _parse_master_playlist(text: str):
                 j += 1
             if j < len(lines):
                 attrs["url"] = lines[j].strip()
+                attrs["index"] = variant_index
+                variant_index += 1
                 variants.append(attrs)
                 i = j + 1
                 continue
@@ -205,8 +208,8 @@ def _parse_master_playlist(text: str):
     return variants
 
 
-def _pick_variant(variants, max_height: Optional[int]):
-    """Pick a variant URL given a max height constraint.
+def _pick_variant_info(variants, max_height: Optional[int]):
+    """Pick a variant entry given a max height constraint.
 
     - max_height None or <=0: highest resolution, highest bandwidth.
     - max_height set: best variant whose height <= max_height. Fallback to the
@@ -220,13 +223,83 @@ def _pick_variant(variants, max_height: Optional[int]):
         return (v.get("height", 0), v.get("bandwidth", 0))
 
     if not max_height or max_height <= 0:
-        return sorted(variants, key=sort_key, reverse=True)[0]["url"]
+        return sorted(variants, key=sort_key, reverse=True)[0]
 
     eligible = [v for v in variants if v.get("height", 0) <= max_height]
     if eligible:
-        return sorted(eligible, key=sort_key, reverse=True)[0]["url"]
+        return sorted(eligible, key=sort_key, reverse=True)[0]
     # Nothing fits — return the smallest to save bandwidth
-    return sorted(variants, key=sort_key)[0]["url"]
+    return sorted(variants, key=sort_key)[0]
+
+
+def _pick_variant(variants, max_height: Optional[int]):
+    picked = _pick_variant_info(variants, max_height)
+    return picked["url"] if picked else None
+
+
+async def resolve_llhls_master_playlist(
+    m3u8_url: str,
+    max_height: Optional[int] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> Optional[dict[str, object]]:
+    """Fetch a Chaturbate LL-HLS master once and return playlist metadata."""
+    if "llhls.m3u8" not in (m3u8_url or "").lower():
+        return None
+
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://chaturbate.com/",
+        "Origin": "https://chaturbate.com",
+    }
+    request_headers.update(headers or {})
+
+    try:
+        async with aiohttp_client_session() as session:
+            async with session.get(
+                m3u8_url,
+                headers=request_headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=False,
+                **aiohttp_request_kwargs(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.debug(
+                        "Chaturbate LL-HLS master fetch failed",
+                        status=resp.status,
+                    )
+                    return None
+                text = await resp.text()
+                content_type = resp.headers.get("Content-Type", "")
+                base_url = str(resp.url)
+    except Exception as e:
+        logger.debug("Could not fetch Chaturbate LL-HLS master", error=str(e))
+        return None
+
+    variants = _parse_master_playlist(text)
+    picked = _pick_variant_info(variants, max_height)
+    return {
+        "video_stream_index": int(picked.get("index", 0)) if picked else None,
+        "text": text,
+        "base_url": base_url,
+        "content_type": content_type,
+    }
+
+
+async def resolve_llhls_video_stream_index(
+    m3u8_url: str,
+    max_height: Optional[int] = None,
+    headers: Optional[dict[str, str]] = None,
+) -> Optional[int]:
+    """Return the FFmpeg 0:v:N index for a Chaturbate LL-HLS master playlist."""
+    metadata = await resolve_llhls_master_playlist(
+        m3u8_url,
+        max_height=max_height,
+        headers=headers,
+    )
+    if not metadata:
+        return None
+    value = metadata.get("video_stream_index")
+    return int(value) if value is not None else None
 
 
 async def _resolve_variant(m3u8_url: str, max_height: Optional[int] = None) -> str:

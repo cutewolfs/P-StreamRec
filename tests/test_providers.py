@@ -890,6 +890,32 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ebony", items[0]["tags"])
 
 class BuiltinProviderDiscoverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_chaturbate_resolve_stream_carries_llhls_video_index(self):
+        provider = ChaturbateProvider()
+
+        with (
+            patch(
+                "app.resolvers.chaturbate.resolve_m3u8_async",
+                AsyncMock(return_value="https://edge.example.test/live/llhls.m3u8"),
+            ) as resolve,
+            patch(
+                "app.resolvers.chaturbate.resolve_llhls_master_playlist",
+                AsyncMock(return_value={
+                    "video_stream_index": 3,
+                    "text": "#EXTM3U\n",
+                    "base_url": "https://edge.example.test/live/llhls.m3u8",
+                    "content_type": "application/vnd.apple.mpegurl",
+                }),
+            ) as pick_index,
+        ):
+            stream = await provider.resolve_stream("alice", max_height=None)
+
+        self.assertEqual("https://edge.example.test/live/llhls.m3u8", stream.url)
+        self.assertEqual(3, stream.ffmpeg_video_stream_index)
+        self.assertEqual("#EXTM3U\n", stream.hls_playlist_text)
+        resolve.assert_awaited_once_with("alice", max_height=None)
+        pick_index.assert_awaited_once()
+
     async def test_chaturbate_discover_filters_generic_kwargs(self):
         class FakeAPI:
             def __init__(self):

@@ -23,7 +23,10 @@ class FFmpegCommandTests(unittest.TestCase):
         return [cmd[index + 1] for index, value in enumerate(cmd) if value == "-map"]
 
     def test_chaturbate_cdn_uses_persistent_http_before_input(self):
-        cmd = self._build("https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8")
+        cmd = self._build(
+            "https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+            ffmpeg_video_stream_index=3,
+        )
         input_index = cmd.index("-i")
 
         self.assertLess(cmd.index("-http_persistent"), input_index)
@@ -37,9 +40,9 @@ class FFmpegCommandTests(unittest.TestCase):
         self.assertIn("Referer: https://chaturbate.com/", headers)
         self.assertIn("Origin: https://chaturbate.com", headers)
         self.assertIn("Connection: keep-alive", headers)
-        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
 
-    def test_chaturbate_llhls_720p_uses_single_capped_variant(self):
+    def test_chaturbate_llhls_uses_resolved_video_stream_index(self):
         with (
             patch("app.ffmpeg_runner.ffmpeg_http_proxy_url", return_value=None),
             patch("app.ffmpeg_runner.get_outbound_proxy_url", return_value=None),
@@ -50,9 +53,10 @@ class FFmpegCommandTests(unittest.TestCase):
                 "https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
                 "tee-output",
                 max_height=720,
+                ffmpeg_video_stream_index=2,
             )
 
-        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
+        self.assertEqual(["0:v:2", "0:a:0"], self._maps(cmd))
 
     def test_proxied_chaturbate_llhls_uses_source_url_for_mapping(self):
         with (
@@ -65,9 +69,10 @@ class FFmpegCommandTests(unittest.TestCase):
                 "http://127.0.0.1:8080/api/proxy/hls/token.m3u8",
                 "tee-output",
                 source_url="https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+                ffmpeg_video_stream_index=3,
             )
 
-        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
         self.assertNotIn("-reconnect_at_eof", cmd)
 
     def test_non_chaturbate_hls_keeps_default_http_behavior(self):
@@ -99,17 +104,18 @@ class FFmpegCommandTests(unittest.TestCase):
         cmd = self._build(
             "http://127.0.0.1:8080/api/proxy/hls/token.m3u8",
             source_url="https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
+            ffmpeg_video_stream_index=3,
         )
 
-        self.assertEqual(["0:v:4", "0:a:0"], self._maps(cmd))
+        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
 
-    def test_chaturbate_llhls_height_cap_selects_matching_video_stream(self):
+    def test_chaturbate_llhls_without_resolved_index_falls_back_to_first_video(self):
         cmd = self._build(
             "https://edge30-ash.live.mmcdn.com/live/test/llhls.m3u8",
             max_height=720,
         )
 
-        self.assertEqual(["0:v:3", "0:a:0"], self._maps(cmd))
+        self.assertEqual(["0:v:0", "0:a:0"], self._maps(cmd))
 
     def test_provider_headers_are_passed_before_input(self):
         with (
