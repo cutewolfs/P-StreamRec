@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 from ..logger import logger
 from ..core.config import (
     AUTO_RECORD_INTERVAL,
+    CHATURBATE_REQUEST_TIMEOUT_SECONDS,
     MIN_RECORDING_BYTES,
     MIN_RECORDING_SECONDS,
     OUTPUT_DIR,
@@ -79,7 +80,7 @@ async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> 
         async with session.get(
             url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
             ssl=False,
             **aiohttp_request_kwargs(),
         ) as resp:
@@ -149,7 +150,7 @@ async def check_model_status(
         async with session.get(
             url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=15),
+            timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
             ssl=False,
             **aiohttp_request_kwargs(),
         ) as response:

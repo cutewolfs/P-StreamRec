@@ -6,15 +6,32 @@ Authenticated API calls for model discovery, following, and stream resolution
 import asyncio
 import re
 import time
+from html import unescape
 from typing import Optional, List, Dict, Any
 
 import aiohttp
 
 from ..logger import logger
-from ..core.config import CB_REQUEST_DELAY
+from ..core.config import (
+    CB_REQUEST_DELAY,
+    CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+    PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS,
+)
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .chaturbate_auth import ChaturbateAuthService
 from .flaresolverr import FlareSolverrClient
+
+
+class FollowedSyncResult(list):
+    def __init__(
+        self,
+        values=(),
+        trusted: bool = True,
+        skipped_reason: Optional[str] = None,
+    ):
+        super().__init__(values)
+        self.trusted = trusted
+        self.skipped_reason = skipped_reason
 
 
 class ChaturbateAPI:
@@ -70,7 +87,7 @@ class ChaturbateAPI:
                 try:
                     async with session.request(
                         method, url, headers=headers, ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=15),
+                        timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                         **aiohttp_request_kwargs(),
                         **kwargs
                     ) as resp:
@@ -93,7 +110,7 @@ class ChaturbateAPI:
                                 await self._rate_limit()
                                 async with session.request(
                                     method, url, headers=headers, ssl=False,
-                                    timeout=aiohttp.ClientTimeout(total=15),
+                                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                                     **aiohttp_request_kwargs(),
                                     **kwargs
                                 ) as retry_resp:
@@ -448,86 +465,198 @@ class ChaturbateAPI:
 
     async def get_followed_models(self) -> List[Dict[str, Any]]:
         """
-        Fetch all followed models using Chaturbate's roomlist API.
-        Uses follow=true for online models, follow=true&offline=true for offline.
+        Fetch followed models from Chaturbate's authenticated followed-cams page.
+
+        The roomlist API's ``follow=true`` filter has returned non-followed
+        global rooms before. Treat only the HTML followed-cams surface as trusted
+        enough to mutate ``followed_models``.
         """
         if not self.auth.get_cookies().get("sessionid"):
-            return []
+            return FollowedSyncResult(
+                [],
+                trusted=False,
+                skipped_reason="Chaturbate session is not verified",
+            )
 
         models = []
         seen = set()
-
         headers = self._get_headers()
-        headers["Accept"] = "application/json"
-        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         headers["Referer"] = "https://chaturbate.com/followed-cams/"
 
-        # Fetch online followed models
-        online_models = await self._fetch_followed_page(headers, offline=False)
-        for item in online_models:
-            username = item.get("username", "")
-            if username and username not in seen:
-                seen.add(username)
-                models.append(self._parse_room_item(item, is_online=True))
-
-        # Fetch offline followed models (with pagination)
-        offline_models = await self._fetch_followed_page(headers, offline=True)
-        for item in offline_models:
-            username = item.get("username", "")
-            if username and username not in seen:
-                seen.add(username)
-                models.append(self._parse_room_item(item, is_online=False))
-
-        logger.debug("Fetched followed models",
-                     total=len(models),
-                     online=len(online_models),
-                     offline=len(offline_models))
-        return models
-
-    async def _fetch_followed_page(
-        self, headers: Dict[str, str], offline: bool = False
-    ) -> List[Dict[str, Any]]:
-        """Fetch one category (online or offline) of followed models with pagination."""
-        all_rooms = []
-        limit = 90
-        offset = 0
-
+        page = 1
         while True:
-            params = f"limit={limit}&offset={offset}&follow=true"
-            if offline:
-                params += "&offline=true"
-            url = f"https://chaturbate.com/api/ts/roomlist/room-list/?{params}"
+            url = "https://chaturbate.com/followed-cams/"
+            if page > 1:
+                url = f"{url}?page={page}"
 
-            resp = await self._request("GET", url, headers=headers)
-            if not resp or resp.status != 200:
-                logger.debug("Followed roomlist API failed",
-                            offline=offline,
-                            status=resp.status if resp else None)
+            resp = await self._request("GET", url, headers=headers, allow_redirects=False)
+            if not resp:
+                return self._untrusted_followed_result("Chaturbate followed-cams request failed")
+            if resp.status in {301, 302, 303, 307, 308}:
+                return self._untrusted_followed_result("Chaturbate followed-cams redirected to login")
+            if resp.status == 403:
+                return self._untrusted_followed_result("Chaturbate followed-cams returned 403")
+            if resp.status != 200:
+                return self._untrusted_followed_result(f"Chaturbate followed-cams returned HTTP {resp.status}")
+
+            html = resp.text()
+            if self._looks_like_login_or_challenge(html):
+                return self._untrusted_followed_result("Chaturbate followed-cams returned a login or challenge page")
+
+            page_items = self._parse_followed_html(html)
+            if not page_items and page == 1 and not self._looks_like_empty_followed_page(html):
+                return self._untrusted_followed_result("Chaturbate followed-cams page shape is not recognized")
+
+            for item in page_items:
+                username = item.get("username", "")
+                key = username.lower()
+                if username and key not in seen:
+                    seen.add(key)
+                    models.append(item)
+                    if len(models) > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
+                        return self._untrusted_followed_result(
+                            f"Chaturbate followed-cams exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
+                        )
+
+            if not self._has_next_followed_page(html):
                 break
+            page += 1
+            if page > 200:
+                return self._untrusted_followed_result("Chaturbate followed-cams pagination exceeded safety limit")
 
-            try:
-                data = resp.json()
-            except Exception:
-                break
+        logger.debug("Fetched followed models", total=len(models), source="followed-cams")
+        return FollowedSyncResult(models, trusted=True)
 
-            rooms = data.get("rooms", [])
-            total_count = data.get("total_count", 0)
+    @staticmethod
+    def _untrusted_followed_result(reason: str) -> FollowedSyncResult:
+        logger.warning("Chaturbate following sync skipped", reason=reason)
+        return FollowedSyncResult([], trusted=False, skipped_reason=reason)
 
-            all_rooms.extend(rooms)
+    @staticmethod
+    def _html_attr(fragment: str, name: str) -> str:
+        match = re.search(
+            rf'\b{name}\s*=\s*(["\'])(.*?)\1',
+            fragment or "",
+            re.IGNORECASE | re.DOTALL,
+        )
+        return unescape(match.group(2)).strip() if match else ""
 
-            offset += limit
-            if not rooms or offset >= total_count:
-                break
+    @staticmethod
+    def _looks_like_login_or_challenge(html: str) -> bool:
+        lower = (html or "").lower()
+        if "cloudflare" in lower and ("challenge" in lower or "cf-browser-verification" in lower):
+            return True
+        if "/auth/login" in lower or ("name=\"password\"" in lower and "csrfmiddlewaretoken" in lower):
+            return True
+        return "login_required" in lower or "please log in" in lower
 
-            await self._rate_limit()
+    @staticmethod
+    def _looks_like_empty_followed_page(html: str) -> bool:
+        lower = (html or "").lower()
+        empty_markers = (
+            "not following anyone",
+            "no followed",
+            "no favorites",
+            "you have not followed",
+            "you aren't following",
+        )
+        return any(marker in lower for marker in empty_markers)
 
-        return all_rooms
+    @classmethod
+    def _has_next_followed_page(cls, html: str) -> bool:
+        lower = (html or "").lower()
+        if 'rel="next"' in lower or "rel='next'" in lower:
+            return True
+        next_link = re.search(
+            r'<a\b[^>]*href=["\'][^"\']*(?:\?|&)page=\d+[^"\']*["\'][^>]*>\s*(?:next|&rsaquo;|›)',
+            html or "",
+            re.IGNORECASE | re.DOTALL,
+        )
+        return bool(next_link)
+
+    @classmethod
+    def _parse_followed_html(cls, html: str) -> List[Dict[str, Any]]:
+        models: List[Dict[str, Any]] = []
+        for match in re.finditer(r"<li\b(?P<attrs>[^>]*)>(?P<body>.*?)</li>", html or "", re.IGNORECASE | re.DOTALL):
+            attrs = match.group("attrs") or ""
+            if "room_list_room" not in attrs:
+                continue
+            body = match.group("body") or ""
+            username = (
+                cls._html_attr(attrs, "data-room")
+                or cls._html_attr(attrs, "data-room-name")
+                or cls._html_attr(attrs, "data-username")
+            )
+            if not username:
+                href_match = re.search(r'href=["\']/([A-Za-z0-9_]+)/?["\']', body, re.IGNORECASE)
+                username = href_match.group(1) if href_match else ""
+            username = username.strip().strip("/")
+            if not username or not re.match(r"^[A-Za-z0-9_]+$", username):
+                continue
+
+            img_attrs = ""
+            img_match = re.search(r"<img\b([^>]*)>", body, re.IGNORECASE | re.DOTALL)
+            if img_match:
+                img_attrs = img_match.group(1)
+            thumbnail = cls._normalize_thumbnail(
+                cls._html_attr(img_attrs, "src")
+                or cls._html_attr(img_attrs, "data-src")
+                or cls._html_attr(img_attrs, "data-original")
+                or cls._html_attr(img_attrs, "data-image")
+                or cls._html_attr(attrs, "data-image"),
+                username,
+            )
+            display_name = (
+                cls._html_attr(img_attrs, "alt")
+                or cls._html_attr(attrs, "title")
+                or username
+            )
+            viewers_match = re.search(
+                r'class=["\'][^"\']*\bcams\b[^"\']*["\'][^>]*>\s*([0-9,]+)',
+                body,
+                re.IGNORECASE | re.DOTALL,
+            ) or re.search(r"\b([0-9,]+)\s+(?:viewers|cams)\b", body, re.IGNORECASE)
+            viewers = cls._as_int(viewers_match.group(1).replace(",", "")) if viewers_match else 0
+            room_status = (
+                cls._html_attr(attrs, "data-room-status")
+                or cls._html_attr(attrs, "data-current-show")
+                or None
+            )
+            classes = cls._html_attr(attrs, "class").lower()
+            is_offline = "offline" in classes or (room_status or "").lower() == "offline"
+            is_private = "private" in classes or (room_status or "").lower() in {"private", "group"}
+            is_online = not is_offline and not is_private
+            if not room_status:
+                room_status = "offline" if is_offline else "private" if is_private else "public"
+
+            models.append({
+                "username": username,
+                "display_name": display_name,
+                "is_online": is_online,
+                "viewers": viewers if is_online else 0,
+                "thumbnail_url": thumbnail,
+                "room_status": room_status,
+                "tags": [],
+                "subject": "",
+                "gender": "",
+                "num_followers": 0,
+            })
+        return models
 
     @staticmethod
     def _parse_room_item(item: Dict[str, Any], is_online: bool = True) -> Dict[str, Any]:
         """Parse a room item from the roomlist API into our model format."""
         username = item.get("username", "")
-        thumb = item.get("img", "")
+        thumb = (
+            item.get("img")
+            or item.get("thumbnail")
+            or item.get("thumbnail_url")
+            or item.get("thumbnailUrl")
+            or item.get("image_url")
+            or item.get("imageUrl")
+            or ""
+        )
         if thumb and thumb.startswith("//"):
             thumb = "https:" + thumb
         if not thumb:

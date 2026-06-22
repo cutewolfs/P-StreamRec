@@ -8,6 +8,7 @@ from typing import Optional
 from urllib.parse import urljoin
 from .base import ResolveError
 from ..logger import logger
+from ..core.config import CHATURBATE_REQUEST_TIMEOUT_SECONDS
 from ..core.http_client import (
     aiohttp_client_session,
     aiohttp_request_kwargs,
@@ -115,7 +116,7 @@ async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] 
                 async with session.get(
                     api_url,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                     ssl=False,
                     **aiohttp_request_kwargs(),
                 ) as api_resp:
@@ -139,7 +140,7 @@ async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] 
             async with session.get(
                 f"https://chaturbate.com/{username}/",
                 headers=html_headers,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                 ssl=False,
                 **aiohttp_request_kwargs(),
             ) as resp:
@@ -258,7 +259,7 @@ async def resolve_llhls_master_playlist(
             async with session.get(
                 m3u8_url,
                 headers=request_headers,
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                 ssl=False,
                 **aiohttp_request_kwargs(),
             ) as resp:
@@ -321,7 +322,7 @@ async def _resolve_variant(m3u8_url: str, max_height: Optional[int] = None) -> s
             }
             async with session.get(
                 m3u8_url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10), ssl=False,
+                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS), ssl=False,
                 **aiohttp_request_kwargs(),
             ) as resp:
                 if resp.status == 200:
@@ -373,7 +374,7 @@ def resolve_m3u8(username: str) -> str:
         api_resp = requests.get(
             api_url,
             headers=headers,
-            timeout=10,
+            timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
             **requests_proxy_kwargs(),
         )
         if api_resp.status_code == 200:
@@ -403,7 +404,7 @@ def resolve_m3u8(username: str) -> str:
                         playlist_resp = requests.get(
                             best_m3u8,
                             headers=headers,
-                            timeout=10,
+                            timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
                             **requests_proxy_kwargs(),
                         )
                         if playlist_resp.status_code == 200:
@@ -438,7 +439,7 @@ def resolve_m3u8(username: str) -> str:
         resp = requests.get(
             url,
             headers=headers,
-            timeout=10,
+            timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
             **requests_proxy_kwargs(),
         )
         logger.debug("Réponse HTTP reçue", username=username, status_code=resp.status_code)

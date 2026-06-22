@@ -1004,6 +1004,17 @@ class BuiltinProviderDiscoverTests(unittest.IsolatedAsyncioTestCase):
         api.unfollow_model.assert_not_awaited()
         api.is_following.assert_not_awaited()
 
+    async def test_chaturbate_import_session_requires_sessionid_cookie(self):
+        class FakeAuth:
+            pass
+
+        provider = ChaturbateProvider(auth=FakeAuth())
+
+        result = await provider.import_session(cookie_header="csrftoken=csrf")
+
+        self.assertFalse(result["success"])
+        self.assertIn("sessionid", result["error"])
+
     async def test_cam4_discover_filters_generic_kwargs(self):
         provider = CAM4Provider()
         mocked = AsyncMock(return_value={"models": [{"username": "bob"}]})

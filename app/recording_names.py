@@ -18,7 +18,7 @@ def normalize_filename_format(value: object) -> str:
 
 def safe_filename_part(value: object, fallback: str = "session") -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
-    cleaned = cleaned.strip("._-")
+    cleaned = cleaned.strip(".-")
     return cleaned or fallback
 
 

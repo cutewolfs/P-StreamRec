@@ -8,6 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
+from ..following_sync import store_provider_following
 from ..logger import logger
 from ..providers.base import ProviderError
 
@@ -384,12 +385,15 @@ async def sync_following():
             display_name = _provider_display_name(provider, source_type)
             try:
                 items = await asyncio.wait_for(provider.sync_following(), timeout=60)
-                synced = await _store_provider_following(source_type, items or [])
+                stored = await _store_provider_following(source_type, items)
+                synced = stored["synced"]
                 total_synced += synced
                 results.append({
                     "sourceType": source_type,
                     "displayName": display_name,
                     "synced": synced,
+                    "trusted": stored["trusted"],
+                    "skippedReason": stored["skippedReason"],
                     "success": True,
                 })
             except asyncio.TimeoutError:
@@ -444,39 +448,28 @@ async def sync_following():
     except Exception as exc:
         logger.error("Chaturbate following sync failed", error=str(exc), exc_info=True)
         raise HTTPException(status_code=502, detail=f"Chaturbate sync failed: {exc}")
-    synced = await _store_provider_following("chaturbate", items or [])
+    stored = await _store_provider_following("chaturbate", items)
+    synced = stored["synced"]
     await _db.reconcile_model_sources_from_followed()
     return {
         "synced": synced,
-        "results": [{"sourceType": "chaturbate", "displayName": "Chaturbate", "synced": synced, "success": True}],
+        "trusted": stored["trusted"],
+        "skippedReason": stored["skippedReason"],
+        "results": [{
+            "sourceType": "chaturbate",
+            "displayName": "Chaturbate",
+            "synced": synced,
+            "trusted": stored["trusted"],
+            "skippedReason": stored["skippedReason"],
+            "success": True,
+        }],
         "localOnly": False,
         "message": f"Chaturbate: {synced} follows synced",
     }
 
 
-async def _store_provider_following(source_type: str, items: list[dict]) -> int:
-    synced_usernames = set()
-    for item in items:
-        username = item.get("username")
-        if not username:
-            continue
-        thumbnail = item.get("thumbnail_url") or item.get("thumbnail")
-        is_online = bool(item.get("is_online", item.get("isOnline", False)))
-        if source_type == "chaturbate" and not is_online and thumbnail and "roomimg.stream.highwebmedia.com" in thumbnail:
-            thumbnail = None
-        await _db.upsert_followed_model(
-            username=username,
-            display_name=item.get("display_name") or username,
-            is_online=is_online,
-            viewers=int(item.get("viewers") or 0),
-            thumbnail_url=thumbnail,
-            source_type=source_type,
-            room_status=item.get("room_status") or item.get("roomStatus"),
-        )
-        synced_usernames.add(username)
-
-    await _db.remove_unfollowed(synced_usernames, source_type=source_type)
-    return len(synced_usernames)
+async def _store_provider_following(source_type: str, items: list[dict]) -> dict:
+    return await store_provider_following(_db, source_type, items)
 
 
 @router.post("/following/{username}/track")

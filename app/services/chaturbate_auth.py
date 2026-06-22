@@ -14,7 +14,12 @@ import aiohttp
 import bcrypt
 
 from ..logger import logger
-from ..core.config import OUTPUT_DIR, CHATURBATE_CSRFTOKEN, CHATURBATE_SESSIONID
+from ..core.config import (
+    OUTPUT_DIR,
+    CHATURBATE_CSRFTOKEN,
+    CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+    CHATURBATE_SESSIONID,
+)
 from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .flaresolverr import FlareSolverrClient
 
@@ -33,6 +38,7 @@ class ChaturbateAuthService:
         self._is_logged_in: bool = False
         self._username: Optional[str] = None
         self._last_error: Optional[str] = None
+        self._last_validation_error: Optional[str] = None
         self._cookies_file = OUTPUT_DIR / "cookies" / "chaturbate.json"
         self._lock = asyncio.Lock()
 
@@ -337,8 +343,16 @@ class ChaturbateAuthService:
 
     async def _validate_session(self) -> bool:
         """Test if session is still valid with Chaturbate's authenticated APIs."""
+        valid, reason = await self._validate_session_detail()
+        self._last_validation_error = reason
+        if not valid and reason:
+            self._last_error = reason
+        return valid
+
+    async def _validate_session_detail(self) -> tuple[bool, Optional[str]]:
+        """Validate the current cookie jar and explain common failure modes."""
         if not self._cookies.get("sessionid"):
-            return False
+            return False, "Chaturbate sessionid cookie is missing"
 
         try:
             headers = {
@@ -352,23 +366,33 @@ class ChaturbateAuthService:
                     headers=headers,
                     allow_redirects=False,
                     ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                     **aiohttp_request_kwargs(),
                 ) as resp:
                     if resp.status == 200:
-                        return True
+                        return True, None
+                    if resp.status in {301, 302, 303, 307, 308}:
+                        return False, "Chaturbate session validation redirected to login"
+                    if resp.status == 403:
+                        return False, "Chaturbate returned 403 while validating the imported session"
                 async with session.get(
                     "https://chaturbate.com/followed-cams/",
                     headers=headers,
                     allow_redirects=False,
                     ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
                     **aiohttp_request_kwargs(),
                 ) as resp:
-                    return resp.status == 200
+                    if resp.status == 200:
+                        return True, None
+                    if resp.status in {301, 302, 303, 307, 308}:
+                        return False, "Chaturbate followed-cams redirected to login"
+                    if resp.status == 403:
+                        return False, "Chaturbate returned 403 on followed-cams; import the same browser cookies and User-Agent"
+                    return False, f"Chaturbate session validation failed with HTTP {resp.status}"
         except Exception as e:
             logger.debug("Session validation error", error=str(e))
-            return False
+            return False, f"Chaturbate session validation error: {e}"
 
     async def logout(self):
         """Clear session and saved state"""

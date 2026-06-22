@@ -24,7 +24,7 @@ class Database:
     @staticmethod
     def _default_record_path(username: str) -> str:
         model_folder = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(username or "").strip())
-        model_folder = model_folder.strip("._-") or "model"
+        model_folder = model_folder.strip(".-") or "model"
         return f"{model_folder}/videos/record"
 
     def _connect(self):
@@ -786,6 +786,40 @@ class Database:
 
         profile = await self.get_media_profile(username)
         return profile or {"username": username}
+
+    async def rename_media_profile(self, old_username: str, new_username: str) -> bool:
+        """Rename local media-profile metadata without merging conflicting rows."""
+        await self.initialize()
+        old_username = str(old_username or "").strip()
+        new_username = str(new_username or "").strip()
+        if not old_username or not new_username or old_username == new_username:
+            return False
+
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT 1 FROM media_profiles WHERE username = ? LIMIT 1",
+                (old_username,),
+            )
+            if not await cursor.fetchone():
+                return False
+            cursor = await db.execute(
+                "SELECT 1 FROM media_profiles WHERE username = ? LIMIT 1",
+                (new_username,),
+            )
+            if await cursor.fetchone():
+                return False
+            now = int(datetime.now().timestamp())
+            await db.execute(
+                "UPDATE media_profiles SET username = ?, updated_at = ? WHERE username = ?",
+                (new_username, now, old_username),
+            )
+            await db.execute(
+                "UPDATE media_profile_sources SET profile_username = ? WHERE profile_username = ?",
+                (new_username, old_username),
+            )
+            await db.commit()
+            return True
 
     async def get_media_profile_sources(self, profile_username: str) -> List[Dict[str, Any]]:
         """Liste les sources d'enregistrement liées à un profil média."""

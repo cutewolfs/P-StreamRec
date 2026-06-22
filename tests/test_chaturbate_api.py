@@ -12,6 +12,11 @@ class _FakeAuth:
         return {}
 
 
+class _CookieAuth(_FakeAuth):
+    def get_cookies(self):
+        return {"sessionid": "abc", "csrftoken": "csrf"}
+
+
 def _json_response(payload):
     return _FakeResponse(
         200,
@@ -48,6 +53,20 @@ class _RoomlistAPI(ChaturbateAPI):
         result["page"] = page
         result["limit"] = limit
         return result
+
+
+class _FollowedAPI(ChaturbateAPI):
+    def __init__(self, responses):
+        super().__init__(_CookieAuth())
+        self.responses = list(responses)
+        self.requests = []
+
+    async def _rate_limit(self):
+        return None
+
+    async def _request(self, method, url, headers=None, **kwargs):
+        self.requests.append({"method": method, "url": url, "headers": headers or {}, "kwargs": kwargs})
+        return self.responses.pop(0)
 
 
 class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
@@ -126,6 +145,53 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         result = await api.get_live_models(page=1, limit=10)
 
         self.assertEqual(["valid"], [item["username"] for item in result["models"]])
+
+    async def test_followed_models_parse_followed_cams_html(self):
+        html = """
+        <html><body>
+          <li class="room_list_room" data-room="_alice_">
+            <a href="/_alice_/"><img data-src="//thumb.example.test/alice.jpg" alt="Alice"></a>
+            <span class="cams">1,234</span>
+          </li>
+        </body></html>
+        """
+        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertEqual("_alice_", result[0]["username"])
+        self.assertTrue(result[0]["is_online"])
+        self.assertEqual(1234, result[0]["viewers"])
+        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
+        self.assertFalse(api.requests[0]["kwargs"].get("allow_redirects", True))
+
+    async def test_followed_models_skip_untrusted_login_redirect(self):
+        api = _FollowedAPI([_FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html")])
+
+        result = await api.get_followed_models()
+
+        self.assertFalse(result.trusted)
+        self.assertEqual([], list(result))
+        self.assertIn("redirected", result.skipped_reason)
+
+    async def test_followed_models_skip_when_safety_limit_is_exceeded(self):
+        import app.services.chaturbate_api as cb_api
+
+        html = """
+        <li class="room_list_room" data-room="alice"><img src="//thumb/a.jpg"></li>
+        <li class="room_list_room" data-room="bella"><img src="//thumb/b.jpg"></li>
+        """
+        original = cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS
+        cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = 1
+        try:
+            api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+            result = await api.get_followed_models()
+        finally:
+            cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = original
+
+        self.assertFalse(result.trusted)
+        self.assertIn("safety limit", result.skipped_reason)
 
 
 if __name__ == "__main__":

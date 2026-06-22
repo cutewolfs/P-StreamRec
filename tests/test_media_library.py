@@ -616,6 +616,23 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         missing = self.client.get("/api/media-profiles/empty_model")
         self.assertEqual(missing.status_code, 404)
 
+    async def test_repairs_media_profile_truncated_edge_underscores(self):
+        profile_dir = self.output_dir / "records" / "_edgeuser_"
+        profile_dir.mkdir(parents=True)
+        await app_main.db.upsert_media_profile("edgeuser", {"display_name": "Edge User"})
+        await app_main.db.add_or_update_model("_edgeuser_", source_type="chaturbate")
+
+        response = self.client.get("/api/media-library")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(await app_main.db.get_media_profile("edgeuser"))
+        repaired = await app_main.db.get_media_profile("_edgeuser_")
+        self.assertIsNotNone(repaired)
+        self.assertEqual("Edge User", repaired["display_name"])
+        profiles = {item["username"]: item for item in response.json()["profiles"]}
+        self.assertIn("_edgeuser_", profiles)
+        self.assertNotIn("edgeuser", profiles)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -178,7 +178,9 @@ class ChaturbateProvider(BaseProvider):
             raise ProviderAuthError("Chaturbate auth service non initialise")
         cookie_map = _cookies_to_dict(cookies, cookie_header)
         if not cookie_map:
-            return {"success": False, "error": "Chaturbate cookies are required"}
+            return {"success": False, "error": "Chaturbate cookies are required; include sessionid and csrftoken from the same browser session"}
+        if not cookie_map.get("sessionid"):
+            return {"success": False, "error": "Chaturbate sessionid cookie is required for session import"}
         if user_agent:
             self.auth._user_agent = user_agent
         self.auth._cookies = cookie_map
@@ -190,7 +192,11 @@ class ChaturbateProvider(BaseProvider):
         row = await self.auth.db.get_auth_state()
         saved_username = self.auth._username or (row or {}).get("username") or ""
         password_hash = (row or {}).get("password_hash") or ""
-        last_error = None if verified else "Imported Chaturbate session is not verified"
+        validation_error = getattr(self.auth, "_last_validation_error", None) or getattr(self.auth, "_last_error", None)
+        last_error = None if verified else (
+            validation_error
+            or "Imported Chaturbate session is not verified; include the same browser cookies and User-Agent"
+        )
         if not verified:
             self.auth._last_error = last_error
         await self.auth.db.save_auth_state(

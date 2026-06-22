@@ -6,6 +6,17 @@ import os
 from pathlib import Path
 from typing import Optional
 
+
+def _env_int(name: str, default: int, minimum: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
 # Chemins de base
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 STATIC_DIR = BASE_DIR / "static"
@@ -30,6 +41,8 @@ CHATURBATE_SESSIONID: Optional[str] = os.getenv("CHATURBATE_SESSIONID")
 
 # Chaturbate request settings
 CB_REQUEST_DELAY: float = float(os.getenv("CB_REQUEST_DELAY", "1.0"))
+CHATURBATE_REQUEST_TIMEOUT_SECONDS = _env_int("CHATURBATE_REQUEST_TIMEOUT_SECONDS", 30, minimum=5)
+PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = _env_int("PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS", 5000, minimum=1)
 
 # Outbound proxy for provider requests (HTTP(S) or SOCKS).
 # Standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars are also honored.

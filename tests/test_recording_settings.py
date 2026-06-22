@@ -6,6 +6,7 @@ from fastapi import HTTPException
 
 from app import main as app_main
 from app.core.database import Database
+from app.recording_names import safe_filename_part
 from app.tasks.monitor import get_check_interval_seconds
 
 
@@ -131,6 +132,11 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
         saved = await app_main.db.get_model("model")
 
         self.assertEqual("model/videos/record", saved["record_path"])
+
+    async def test_edge_underscores_are_preserved_in_record_names(self):
+        self.assertEqual("_username_", safe_filename_part("_username_"))
+        self.assertEqual("_username_/videos/record", app_main._default_record_path("_username_"))
+        self.assertEqual("_username_/videos/record", Database._default_record_path("_username_"))
 
     async def test_model_record_path_can_be_saved_with_zero_retention(self):
         await app_main.db.add_or_update_model(username="model")

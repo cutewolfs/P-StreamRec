@@ -2,6 +2,8 @@ import asyncio
 import unittest
 from pathlib import Path
 
+from fastapi.testclient import TestClient
+
 from app import main
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -277,6 +279,73 @@ class HlsProxyTests(unittest.TestCase):
         self.assertNotIn("streamType", payload)
         self.assertTrue(payload["streamUrl"].startswith("/api/proxy/hls/"))
         self.assertEqual(1, len(main._HLS_PROXY_CACHE))
+
+    def test_hls_proxy_is_public_when_password_is_enabled(self):
+        original_password = main.PASSWORD
+        main.PASSWORD = "secret"
+        try:
+            url = main._register_cached_hls_body(
+                "https://edge.example.test/live/master.m3u8",
+                b"#EXTM3U\n",
+                "application/vnd.apple.mpegurl",
+                suffix=".m3u8",
+            )
+            response = TestClient(main.app).get(url)
+        finally:
+            main.PASSWORD = original_password
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("#EXTM3U\n", response.text)
+
+    def test_hls_proxy_retries_upstream_without_cookie_on_403(self):
+        class FakeResp:
+            def __init__(self, status, body=b"segment", url="https://edge.example.test/seg.ts"):
+                self.status = status
+                self._body = body
+                self.url = url
+                self.headers = {"Content-Type": "video/mp2t"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def read(self):
+                return self._body
+
+        class FakeSession:
+            def __init__(self):
+                self.calls = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url, headers=None, **kwargs):
+                self.calls.append(dict(headers or {}))
+                if "Cookie" in (headers or {}):
+                    return FakeResp(403)
+                return FakeResp(200)
+
+        fake_session = FakeSession()
+        original_session_factory = main.aiohttp_client_session
+        main.aiohttp_client_session = lambda *args, **kwargs: fake_session
+        try:
+            token_url = main._register_hls_proxy_url(
+                "https://edge.example.test/seg.ts",
+                headers={"Cookie": "session=bad", "Referer": "https://chaturbate.com/"},
+            )
+            token_path = token_url.split("/api/proxy/hls/", 1)[1]
+            request = type("Request", (), {"method": "GET"})()
+            response = asyncio.run(main.hls_proxy(token_path, request))
+        finally:
+            main.aiohttp_client_session = original_session_factory
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual([True, False], ["Cookie" in headers for headers in fake_session.calls])
 
     def test_watch_player_loads_ivs_script_from_local_vendor_route(self):
         js = (ROOT / "static" / "watch.js").read_text()

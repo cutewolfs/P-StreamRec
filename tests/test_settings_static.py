@@ -18,6 +18,13 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn("data.filename_format || 'timestamp'", js)
         self.assertIn("updateRecordingSetting('filename_format', this.value)", html)
 
+    def test_auto_record_uses_configured_interval_and_cooldown(self):
+        main = (ROOT / "app" / "main.py").read_text()
+
+        self.assertNotIn("await asyncio.sleep(180)", main)
+        self.assertIn("check_interval = await get_check_interval_seconds(db)", main)
+        self.assertIn("failure_cooldowns", main)
+
     def test_settings_header_status_badge_is_removed(self):
         html = (ROOT / "static" / "settings.html").read_text()
 

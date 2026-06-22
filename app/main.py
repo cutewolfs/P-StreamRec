@@ -31,6 +31,7 @@ from .logger import logger
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.utils import format_bytes
+from .following_sync import store_provider_following
 from .core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .tasks.monitor import (
     CHECK_INTERVAL_SETTING_KEY,
@@ -256,7 +257,7 @@ def is_authenticated(session_token: Optional[str]) -> bool:
 async def auth_middleware(request: Request, call_next):
     # Routes publiques (pas besoin d'authentification)
     public_paths = ["/login", "/api/login", "/favicon.ico"]
-    public_prefixes = ["/static/", "/api/chaturbate/status"]
+    public_prefixes = ["/static/", "/api/chaturbate/status", "/api/proxy/hls/"]
 
     if request.url.path in public_paths or any(
         request.url.path.startswith(p) for p in public_prefixes
@@ -621,6 +622,50 @@ def _list_media_profile_folders() -> set[str]:
     return profiles
 
 
+async def _repair_truncated_media_profile_usernames() -> int:
+    try:
+        profiles = await db.get_all_media_profiles()
+        profile_names = {
+            profile["username"]
+            for profile in profiles
+            if profile.get("username")
+        }
+        if not profile_names:
+            return 0
+        model_names = {
+            model["username"]
+            for model in await db.get_all_models()
+            if model.get("username")
+        }
+        folder_names = _list_media_profile_folders()
+        candidate_names = model_names | folder_names
+        repaired = 0
+        for profile_name in sorted(profile_names):
+            candidates = [
+                candidate
+                for candidate in candidate_names
+                if candidate != profile_name
+                and candidate not in profile_names
+                and (candidate.startswith("_") or candidate.endswith("_"))
+                and candidate.strip("_") == profile_name
+            ]
+            if len(candidates) != 1:
+                continue
+            if await db.rename_media_profile(profile_name, candidates[0]):
+                repaired += 1
+                profile_names.discard(profile_name)
+                profile_names.add(candidates[0])
+                logger.info(
+                    "Profil media repare apres troncature underscore",
+                    old_username=profile_name,
+                    new_username=candidates[0],
+                )
+        return repaired
+    except Exception as exc:
+        logger.debug("Reparation profils media tronques ignoree", error=str(exc))
+        return 0
+
+
 def _media_library_url(username: str, relative_path: str, download: bool = False) -> str:
     url = f"/streams/library/{quote(username, safe='')}/{_quote_url_path(relative_path)}"
     if download:
@@ -893,7 +938,7 @@ def _normalize_birth_date(value: object) -> Optional[str]:
 
 def _babepedia_slug(value: str) -> str:
     raw = re.sub(r"\s+", "_", str(value or "").strip())
-    raw = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
+    raw = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip(".-")
     return raw
 
 
@@ -2597,7 +2642,7 @@ def _legacy_record_path(username: str) -> str:
 
 def _clean_record_path_part(part: object) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(part or "").strip())
-    cleaned = cleaned.strip("._-")
+    cleaned = cleaned.strip(".-")
     if not cleaned or cleaned in {".", ".."}:
         raise HTTPException(status_code=400, detail="Invalid record path")
     return cleaned
@@ -3071,46 +3116,57 @@ async def hls_proxy(token_path: str, request: Request):
         )
     try:
         async with aiohttp_client_session(timeout=aiohttp.ClientTimeout(total=30)) as session:
-            async with session.get(
-                url,
-                headers=headers,
-                allow_redirects=True,
-                **aiohttp_request_kwargs(),
-            ) as resp:
-                if resp.status >= 400:
-                    raise HTTPException(status_code=resp.status, detail=f"Provider HTTP {resp.status}")
-                content_type = resp.headers.get("Content-Type", "")
-                if request.method == "HEAD":
-                    return Response(status_code=200, media_type=content_type or None)
-                body = await resp.read()
-                lower_url = str(resp.url).lower()
-                is_playlist = (
-                    ".m3u8" in lower_url
-                    or "mpegurl" in content_type.lower()
-                    or body.startswith(b"#EXTM3U")
-                )
-                if is_playlist:
-                    text = body.decode("utf-8", errors="replace")
-                    if "flags=segment" in text and "#EXT-X-ENDLIST" in text:
-                        rewritten = await _rewrite_prefetched_single_segment_playlist(
-                            text,
-                            str(resp.url),
-                            headers=headers,
-                            entry=entry,
-                            session=session,
+            last_status = None
+            for attempt_headers in _hls_segment_header_variants(headers):
+                async with session.get(
+                    url,
+                    headers=attempt_headers,
+                    allow_redirects=True,
+                    **aiohttp_request_kwargs(),
+                ) as resp:
+                    last_status = resp.status
+                    if resp.status in {401, 403} and "Cookie" in attempt_headers:
+                        logger.debug(
+                            "Proxy HLS upstream rejected cookies, retrying without them",
+                            url=url,
+                            status=resp.status,
                         )
-                    else:
-                        rewritten = _rewrite_hls_playlist(text, str(resp.url), headers=headers)
+                        continue
+                    if resp.status >= 400:
+                        raise HTTPException(status_code=resp.status, detail=f"Provider HTTP {resp.status}")
+                    content_type = resp.headers.get("Content-Type", "")
+                    if request.method == "HEAD":
+                        return Response(status_code=200, media_type=content_type or None)
+                    body = await resp.read()
+                    lower_url = str(resp.url).lower()
+                    is_playlist = (
+                        ".m3u8" in lower_url
+                        or "mpegurl" in content_type.lower()
+                        or body.startswith(b"#EXTM3U")
+                    )
+                    if is_playlist:
+                        text = body.decode("utf-8", errors="replace")
+                        if "flags=segment" in text and "#EXT-X-ENDLIST" in text:
+                            rewritten = await _rewrite_prefetched_single_segment_playlist(
+                                text,
+                                str(resp.url),
+                                headers=attempt_headers,
+                                entry=entry,
+                                session=session,
+                            )
+                        else:
+                            rewritten = _rewrite_hls_playlist(text, str(resp.url), headers=attempt_headers)
+                        return Response(
+                            content=rewritten,
+                            media_type="application/vnd.apple.mpegurl",
+                            headers={"Cache-Control": "no-store"},
+                        )
                     return Response(
-                        content=rewritten,
-                        media_type="application/vnd.apple.mpegurl",
+                        content=body,
+                        media_type=content_type or "application/octet-stream",
                         headers={"Cache-Control": "no-store"},
                     )
-                return Response(
-                    content=body,
-                    media_type=content_type or "application/octet-stream",
-                    headers={"Cache-Control": "no-store"},
-                )
+            raise HTTPException(status_code=last_status or 502, detail=f"Provider HTTP {last_status or 502}")
     except HTTPException:
         raise
     except Exception as exc:
@@ -3430,30 +3486,19 @@ async def provider_sync_following(source_type: str):
     except ProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    synced_usernames = set()
-    for item in items or []:
-        username = item.get("username")
-        if not username:
-            continue
-        thumbnail = item.get("thumbnail_url") or item.get("thumbnail")
-        await db.upsert_followed_model(
-            username=username,
-            display_name=item.get("display_name") or username,
-            is_online=bool(item.get("is_online", item.get("isOnline", False))),
-            viewers=int(item.get("viewers") or 0),
-            thumbnail_url=thumbnail,
-            source_type=source_type,
-            room_status=item.get("room_status") or item.get("roomStatus"),
-        )
-        synced_usernames.add(username)
-
-    await db.remove_unfollowed(synced_usernames, source_type=source_type)
+    stored = await store_provider_following(db, source_type, items)
     repaired_sources = await db.reconcile_model_sources_from_followed()
     return {
-        "synced": len(synced_usernames),
+        "synced": stored["synced"],
         "sourceType": source_type,
+        "trusted": stored["trusted"],
+        "skippedReason": stored["skippedReason"],
         "repairedSources": repaired_sources,
-        "message": f"{provider.display_name}: {len(synced_usernames)} follows synced",
+        "message": (
+            f"{provider.display_name}: {stored['synced']} follows synced"
+            if stored["trusted"]
+            else f"{provider.display_name}: following sync skipped"
+        ),
     }
 
 
@@ -4500,6 +4545,7 @@ async def get_media_library(
         profile_username=scan_username,
         refresh_metadata=refresh_metadata,
     )
+    await _repair_truncated_media_profile_usernames()
     folder_profiles = _list_media_profile_folders()
     media_profiles = await db.get_all_media_profiles()
     all_models = await db.get_all_models()
@@ -6732,9 +6778,12 @@ async def ffmpeg_watchdog_task():
 
 async def auto_record_task():
     """Vérifie automatiquement les modèles et lance les enregistrements (utilise SQLite)"""
+    failure_cooldowns: dict[str, float] = {}
     while True:
         try:
-            await asyncio.sleep(180)  # Vérifier toutes les 3 minutes
+            check_interval = await get_check_interval_seconds(db)
+            failure_cooldown_seconds = max(60, min(check_interval, 300))
+            await asyncio.sleep(check_interval)
 
             media_sources = await db.get_media_profile_sources_for_auto_record()
             models = await db.get_models_for_auto_record()
@@ -6788,6 +6837,9 @@ async def auto_record_task():
                 target_username = job["target_username"]
                 source_hint = job["source_type"]
                 session_key = job["session_key"]
+                cooldown_until = failure_cooldowns.get(session_key, 0)
+                if cooldown_until > time.time():
+                    continue
 
                 # Vérifier si déjà en enregistrement
                 is_recording = any(
@@ -6862,11 +6914,13 @@ async def auto_record_task():
                                              task="auto-record",
                                              username=target_username,
                                              error=str(e))
+                                failure_cooldowns[session_key] = time.time() + failure_cooldown_seconds
                             except ProviderError as e:
                                 logger.warning("Browser capture refusee",
                                              task="auto-record",
                                              username=target_username,
                                              error=str(e))
+                                failure_cooldowns[session_key] = time.time() + failure_cooldown_seconds
                         else:
                             try:
                                 resolved = await _resolve_stream(
@@ -6881,6 +6935,7 @@ async def auto_record_task():
                                     username=target_username,
                                     error=str(e),
                                 )
+                                failure_cooldowns[session_key] = time.time() + failure_cooldown_seconds
 
                         if hls_source:
                             # Lancer l'enregistrement
@@ -6907,16 +6962,18 @@ async def auto_record_task():
 
                                 if sess:
                                     logger.success("Auto-enregistrement démarré",
-                                                 task="auto-record",
-                                                 username=target_username,
-                                                 profile=profile_username,
-                                                 session_id=sess.id)
+                                                   task="auto-record",
+                                                   username=target_username,
+                                                   profile=profile_username,
+                                                   session_id=sess.id)
+                                    failure_cooldowns.pop(session_key, None)
                                     active_sessions = _all_recording_statuses()
                             except RuntimeError as e:
                                 logger.warning("Impossible démarrer enregistrement",
                                              task="auto-record",
                                              username=target_username,
                                              error=str(e))
+                                failure_cooldowns[session_key] = time.time() + failure_cooldown_seconds
                                 continue
 
                     except Exception as e:
@@ -6924,6 +6981,7 @@ async def auto_record_task():
                                    task="auto-record",
                                    username=target_username,
                                    error=str(e))
+                        failure_cooldowns[session_key] = time.time() + failure_cooldown_seconds
                         continue
                 
         except Exception as e:
@@ -7052,29 +7110,38 @@ async def cleanup_old_recordings_task():
             await asyncio.sleep(3600)
 
 
-async def sync_following_task(chaturbate_api, auth_service):
-    """Background task: sync followed models every 5 minutes"""
+async def sync_following_task(source_type: str = "chaturbate"):
+    """Background task: sync provider follows through the provider abstraction."""
+    source_type = _normalize_source_type(source_type) or "chaturbate"
     while True:
         try:
             await asyncio.sleep(300)  # 5 minutes
 
-            status = auth_service.get_status()
-            if not status.get("isLoggedIn"):
+            if source_type not in _available_source_types():
+                continue
+            provider = _provider_for(source_type)
+            if not getattr(provider.capabilities, "can_sync_following", False):
                 continue
 
-            models = await chaturbate_api.get_followed_models()
-            if models:
-                for model in models:
-                    await db.upsert_followed_model(
-                        username=model["username"],
-                        display_name=model.get("display_name"),
-                        is_online=model.get("is_online", False),
-                        viewers=model.get("viewers", 0),
-                        thumbnail_url=model.get("thumbnail_url"),
-                        source_type="chaturbate",
-                        room_status=model.get("room_status"),
-                    )
-                logger.debug("Following synced", count=len(models), task="following-sync")
+            models = await provider.sync_following()
+            stored = await store_provider_following(db, source_type, models)
+            if not stored["trusted"]:
+                logger.warning(
+                    "Following sync skipped",
+                    task="following-sync",
+                    source_type=source_type,
+                    reason=stored["skippedReason"],
+                )
+                continue
+            if stored["synced"]:
+                repaired = await db.reconcile_model_sources_from_followed()
+                logger.debug(
+                    "Following synced",
+                    count=stored["synced"],
+                    repaired_sources=repaired,
+                    source_type=source_type,
+                    task="following-sync",
+                )
         except Exception as e:
             logger.error("Following sync error", task="following-sync", error=str(e))
             await asyncio.sleep(60)
@@ -7221,7 +7288,7 @@ async def startup_event():
     ))
     asyncio.create_task(ffmpeg_watchdog_task())
     asyncio.create_task(auto_record_task())
-    asyncio.create_task(sync_following_task(cb_api, cb_auth))
+    asyncio.create_task(sync_following_task("chaturbate"))
     asyncio.create_task(sync_cam4_following_task(cam4_auth_service))
     asyncio.create_task(cleanup_old_recordings_task())
     asyncio.create_task(auto_convert_recordings_task(db, OUTPUT_DIR, manager, FFMPEG_PATH))

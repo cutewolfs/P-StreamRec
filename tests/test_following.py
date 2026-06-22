@@ -2,6 +2,7 @@ import unittest
 
 from app.api import following
 from app.providers.base import ProviderCapabilities
+from app.services.chaturbate_api import FollowedSyncResult
 
 
 class _Provider:
@@ -131,6 +132,26 @@ class FollowingSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["localOnly"])
         self.assertEqual([], db.upserts)
         self.assertEqual([], db.removed)
+
+    async def test_untrusted_remote_sync_does_not_mutate_followed_cache(self):
+        db = _DB()
+        registry = _Registry([
+            _Provider(
+                "chaturbate",
+                FollowedSyncResult([], trusted=False, skipped_reason="login page"),
+                can_login=True,
+                can_sync_following=True,
+            ),
+        ])
+        following.init(None, None, db, registry)
+
+        result = await following.sync_following()
+
+        self.assertEqual(0, result["synced"])
+        self.assertEqual([], db.upserts)
+        self.assertEqual([], db.removed)
+        self.assertFalse(result["results"][0]["trusted"])
+        self.assertEqual("login page", result["results"][0]["skippedReason"])
 
     async def test_get_following_includes_provider_summaries(self):
         db = _FollowingDB()
