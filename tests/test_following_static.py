@@ -7,16 +7,25 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FollowingStaticTests(unittest.TestCase):
-    def test_following_page_uses_single_mixed_viewer_sorted_grid(self):
+    def test_following_page_uses_single_manageable_list(self):
         js = (ROOT / "static" / "following.js").read_text()
+        css = (ROOT / "static" / "styles.css").read_text()
 
-        self.assertIn("renderGlobalFollowingSection(models)", js)
-        self.assertIn("renderProviderStatusGroup('Live online', liveModels, 'online')", js)
-        self.assertIn("renderProviderStatusGroup('Offline', offlineModels, 'offline')", js)
+        self.assertIn("renderGlobalFollowingSection(models, filterFollowingModels(models))", js)
+        self.assertIn("function renderFollowingManagementToolbar(models, filteredModels)", js)
+        self.assertIn("function renderFollowingList(models)", js)
+        self.assertIn("function renderFollowingRow(model)", js)
         self.assertIn("All providers", js)
+        self.assertIn("following-list-row", js)
+        self.assertIn("unfollowFollowingModel", js)
+        self.assertIn("updateFollowingFilter", js)
+        self.assertIn("\\'search\\'", js)
+        self.assertIn("\\'source\\'", js)
+        self.assertIn("\\'status\\'", js)
+        self.assertIn(".following-management-toolbar", css)
+        self.assertIn(".following-list-row", css)
         self.assertNotIn("providersForFollowing(models).map", js)
         self.assertRegex(js, r"return viewersB - viewersA")
-        self.assertRegex(js, r"var liveModels = models\.filter\(isLiveFollowingModel\)")
 
     def test_following_meta_shows_local_provider_online_counts(self):
         js = (ROOT / "static" / "following.js").read_text()
@@ -65,6 +74,13 @@ class FollowingStaticTests(unittest.TestCase):
         self.assertNotIn("<h1", html)
         self.assertNotIn("renderFollowingSyncControls", js)
         self.assertIn("No follows saved yet.", html)
+
+    def test_following_sync_surfaces_skipped_reason_as_error(self):
+        js = (ROOT / "static" / "following.js").read_text()
+
+        self.assertIn("data.trusted === false", js)
+        self.assertIn("data.skippedReason || data.message || 'Following sync skipped'", js)
+        self.assertIn("showNotification(data.skippedReason || data.message || 'Following sync skipped', 'error')", js)
 
 
 if __name__ == "__main__":

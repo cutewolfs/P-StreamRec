@@ -250,6 +250,8 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn("provider-login", js)
         self.assertIn("supportsAccount = caps.can_login === true", js)
         self.assertIn("providerAccountControls(source, status, caps)", js)
+        self.assertIn("data.trusted === false", js)
+        self.assertIn("data.skippedReason || data.message || 'Following sync skipped'", js)
         self.assertIn(".provider-session-import", css)
         self.assertIn(".provider-login", css)
 

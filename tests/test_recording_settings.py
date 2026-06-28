@@ -74,6 +74,26 @@ class RecordingSettingsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("http://flaresolverr:8191", settings["flaresolverrUrl"])
 
+    async def test_add_model_infers_bongacams_from_url(self):
+        result = await app_main.add_model({
+            "username": "https://bongacams.com/alice",
+            "autoRecord": True,
+            "recordQuality": "720p",
+        })
+
+        model = await app_main.db.get_model("alice", source_type="bongacams")
+        self.assertTrue(result["success"])
+        self.assertIsNotNone(model)
+        self.assertEqual("bongacams", model["source_type"])
+        self.assertEqual("720p", model["record_quality"])
+        self.assertTrue(model["auto_record"])
+
+    async def test_bongacams_canonical_stream_url_uses_provider_template(self):
+        self.assertEqual(
+            "https://bongacams.com/alice",
+            app_main._canonical_stream_url("bongacams", "alice"),
+        )
+
     async def test_flaresolverr_url_can_be_saved_and_applied(self):
         settings = await app_main.update_flaresolverr_settings(
             {"url": "http://flaresolve:8191/"}

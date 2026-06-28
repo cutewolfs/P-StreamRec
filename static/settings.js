@@ -396,6 +396,8 @@ async function syncProviderFollowing(source) {
     var data = await res.json().catch(function() { return {}; });
     if (!res.ok) {
       showNotification(data.detail || 'Sync failed', 'error');
+    } else if (data.trusted === false) {
+      showNotification(data.skippedReason || data.message || 'Following sync skipped', 'error');
     } else {
       showNotification(data.message || 'Following synced', 'success');
     }

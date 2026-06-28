@@ -50,6 +50,12 @@ function sourceKey(username, sourceType) {
 let trackedModels = new Set();
 let followingProviders = [];
 let followingProviderMap = {};
+let currentFollowingModels = [];
+let followingFilters = {
+  search: '',
+  source: 'all',
+  status: 'all'
+};
 
 // ============================================
 // Load provider capabilities
@@ -141,6 +147,7 @@ function renderFollowing(models) {
   var emptyFollowing = document.getElementById('emptyFollowing');
 
   models = sortFollowingModels(models || []);
+  currentFollowingModels = models;
 
   if (models.length === 0) {
     providerSections.style.display = 'none';
@@ -150,7 +157,7 @@ function renderFollowing(models) {
 
   emptyFollowing.style.display = 'none';
   providerSections.style.display = 'block';
-  providerSections.innerHTML = renderGlobalFollowingSection(models);
+  providerSections.innerHTML = renderGlobalFollowingSection(models, filterFollowingModels(models));
 }
 
 function normalizeSourceType(sourceType) {
@@ -283,12 +290,8 @@ function renderConnectedProviderMeta(models) {
   }).join(' ');
 }
 
-function renderGlobalFollowingSection(models) {
-  var liveModels = models.filter(isLiveFollowingModel);
-  var offlineModels = models.filter(function(model) { return !isLiveFollowingModel(model); });
+function renderGlobalFollowingSection(models, filteredModels) {
   var meta = renderConnectedProviderMeta(models);
-  var body = renderProviderStatusGroup('Live online', liveModels, 'online') +
-    renderProviderStatusGroup('Offline', offlineModels, 'offline');
 
   return '<section class="following-provider-section following-global-section">' +
     '<div class="following-provider-header">' +
@@ -300,8 +303,126 @@ function renderGlobalFollowingSection(models) {
         (meta ? '<div class="following-provider-meta following-provider-counters">' + meta + '</div>' : '') +
       '</div>' +
     '</div>' +
-    body +
+    renderFollowingManagementToolbar(models, filteredModels) +
+    renderFollowingList(filteredModels) +
   '</section>';
+}
+
+function filterFollowingModels(models) {
+  var search = (followingFilters.search || '').trim().toLowerCase();
+  var source = normalizeSourceType(followingFilters.source || 'all');
+  var status = (followingFilters.status || 'all').toLowerCase();
+  return sortFollowingModels(models || []).filter(function(model) {
+    var username = (model.username || model.name || '').toLowerCase();
+    var displayName = (model.display_name || model.displayName || '').toLowerCase();
+    var sourceType = modelSourceType(model);
+    var tracked = trackedModels.has(sourceKey(model.username || model.name || '', sourceType));
+    if (search && username.indexOf(search) === -1 && displayName.indexOf(search) === -1) return false;
+    if (source && source !== 'all' && sourceType !== source) return false;
+    if (status === 'live' && !isPubliclyOnline(model)) return false;
+    if (status === 'private' && !isPrivateModel(model)) return false;
+    if (status === 'offline' && isLiveFollowingModel(model)) return false;
+    if (status === 'tracked' && !tracked) return false;
+    if (status === 'untracked' && tracked) return false;
+    return true;
+  });
+}
+
+function renderFollowingManagementToolbar(models, filteredModels) {
+  var sourceOptions = [{ value: 'all', label: 'All providers' }];
+  connectedFollowingProviders(models).forEach(function(provider) {
+    var sourceType = normalizeSourceType(provider.sourceType || provider.source_type);
+    var count = modelsMatchingSource(models, sourceType).length;
+    sourceOptions.push({ value: sourceType, label: providerLabel(sourceType) + ' (' + count + ')' });
+  });
+  var statusOptions = [
+    { value: 'all', label: 'All statuses' },
+    { value: 'live', label: 'Live' },
+    { value: 'private', label: 'Private' },
+    { value: 'offline', label: 'Offline' },
+    { value: 'tracked', label: 'Tracked' },
+    { value: 'untracked', label: 'Untracked' }
+  ];
+  return '<div class="following-management-toolbar">' +
+    '<label class="following-filter-field following-filter-search">' +
+      '<span>Search</span>' +
+      '<input id="followingSearchInput" type="search" value="' + escapeHtml(followingFilters.search) + '" oninput="updateFollowingFilter(\'search\', this.value)" placeholder="Username">' +
+    '</label>' +
+    '<label class="following-filter-field">' +
+      '<span>Provider</span>' +
+      '<select id="followingSourceFilter" onchange="updateFollowingFilter(\'source\', this.value)">' +
+        sourceOptions.map(function(option) {
+          return '<option value="' + escapeHtml(option.value) + '"' + (followingFilters.source === option.value ? ' selected' : '') + '>' + escapeHtml(option.label) + '</option>';
+        }).join('') +
+      '</select>' +
+    '</label>' +
+    '<label class="following-filter-field">' +
+      '<span>Status</span>' +
+      '<select id="followingStatusFilter" onchange="updateFollowingFilter(\'status\', this.value)">' +
+        statusOptions.map(function(option) {
+          return '<option value="' + escapeHtml(option.value) + '"' + (followingFilters.status === option.value ? ' selected' : '') + '>' + escapeHtml(option.label) + '</option>';
+        }).join('') +
+      '</select>' +
+    '</label>' +
+    '<div class="following-filter-count">' + filteredModels.length + ' shown</div>' +
+  '</div>';
+}
+
+function updateFollowingFilter(key, value) {
+  if (key === 'search') followingFilters.search = value || '';
+  if (key === 'source') followingFilters.source = normalizeSourceType(value || 'all') || 'all';
+  if (key === 'status') followingFilters.status = (value || 'all').toLowerCase();
+  renderFollowing(currentFollowingModels);
+}
+
+function renderFollowingList(models) {
+  if (!models.length) {
+    return '<div class="following-provider-empty">No follows match the current filters.</div>';
+  }
+  return '<div class="following-list">' + models.map(renderFollowingRow).join('') + '</div>';
+}
+
+function renderFollowingRow(model) {
+  var username = model.username || model.name || '';
+  var thumbUrl = model.thumbnail_url || model.thumbnail || ('https://roomimg.stream.highwebmedia.com/ri/' + username + '.jpg');
+  var sourceType = modelSourceType(model);
+  var tracked = trackedModels.has(sourceKey(username, sourceType));
+  var status = followingStatusLabel(model);
+  var statusClass = isPubliclyOnline(model) ? 'is-live' : (isPrivateModel(model) ? 'is-private' : 'is-offline');
+  var viewers = modelViewers(model);
+  var watchHref = '/watch/' + encodeURIComponent(username) + '?source=' + encodeURIComponent(sourceType);
+  var trackAction = tracked
+    ? '<span class="following-row-tracked">Tracked</span>'
+    : '<button type="button" class="following-row-btn" onclick="trackFollowedModel(\'' + escapeHtml(username) + '\', \'' + escapeHtml(sourceType) + '\', this)">Track</button>';
+  return '<div class="following-list-row ' + statusClass + '" data-username="' + escapeHtml(username) + '" data-source="' + escapeHtml(sourceType) + '">' +
+    '<a class="following-row-thumb" href="' + escapeHtml(watchHref) + '">' +
+      '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(username) + '" loading="lazy" ' +
+        'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2296%22 height=%2254%22%3E%3Crect fill=%22%231a1f3a%22 width=%2296%22 height=%2254%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2211%22%3E' + escapeHtml(username) + '%3C/text%3E%3C/svg%3E\'" />' +
+    '</a>' +
+    '<div class="following-row-main">' +
+      '<div class="following-row-title">' +
+        '<span class="following-row-username">' + escapeHtml(username) + '</span>' +
+        renderProviderBadge(sourceType) +
+      '</div>' +
+      '<div class="following-row-meta">' +
+        '<span class="following-row-status ' + statusClass + '">' + escapeHtml(status) + '</span>' +
+        (viewers ? '<span>' + viewers.toLocaleString() + ' viewers</span>' : '') +
+        (model.last_seen_online_at && !isLiveFollowingModel(model) ? '<span>' + escapeHtml(formatLastSeen(model.last_seen_online_at)) + '</span>' : '') +
+      '</div>' +
+    '</div>' +
+    '<div class="following-row-actions">' +
+      '<a class="following-row-btn" href="' + escapeHtml(watchHref) + '">Watch</a>' +
+      trackAction +
+      '<button type="button" class="following-row-btn danger" onclick="unfollowFollowingModel(\'' + escapeHtml(username) + '\', \'' + escapeHtml(sourceType) + '\', this)">Unfollow</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function followingStatusLabel(model) {
+  if (model.isRecording || model.is_recording) return 'Recording';
+  if (isPubliclyOnline(model)) return 'Live';
+  if (isPrivateModel(model)) return 'Private';
+  return 'Offline';
 }
 
 function syncCapableFollowingProviders() {
@@ -480,6 +601,7 @@ async function trackFollowedModel(username, sourceType, btn) {
       btn.textContent = 'Tracked';
       btn.classList.add('tracked');
       btn.disabled = false;
+      renderFollowing(currentFollowingModels);
       showNotification(username + ' added to tracking!', 'success');
     } else {
       btn.textContent = 'Track';
@@ -491,6 +613,43 @@ async function trackFollowedModel(username, sourceType, btn) {
     btn.textContent = 'Track';
     btn.disabled = false;
     showNotification('Connection error', 'error');
+  }
+}
+
+async function unfollowFollowingModel(username, sourceType, btn) {
+  sourceType = normalizeSourceType(sourceType || 'chaturbate');
+  var originalText = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Removing...';
+  }
+  try {
+    var res = await fetch('/api/providers/' + encodeURIComponent(sourceType) + '/unfollow/' + encodeURIComponent(username), {
+      method: 'POST'
+    });
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok || data.success === false) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = originalText;
+      }
+      showNotification(data.detail || data.error || 'Failed to unfollow ' + username, 'error');
+      return false;
+    }
+    currentFollowingModels = currentFollowingModels.filter(function(model) {
+      return !(modelSourceType(model) === sourceType && (model.username || model.name || '') === username);
+    });
+    renderFollowing(currentFollowingModels);
+    showNotification('Unfollowed ' + username, 'success');
+    return true;
+  } catch (e) {
+    console.error('Error unfollowing model:', e);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+    showNotification('Connection error', 'error');
+    return false;
   }
 }
 
@@ -541,7 +700,13 @@ async function syncSingleProvider(sourceType, button, silent) {
     await loadFollowingProviders();
     var models = await loadFollowing();
     renderFollowing(models);
-    if (!silent) showNotification(data.message || 'Following synced', 'success');
+    if (!silent) {
+      if (data.trusted === false) {
+        showNotification(data.skippedReason || data.message || 'Following sync skipped', 'error');
+      } else {
+        showNotification(data.message || 'Following synced', 'success');
+      }
+    }
     return true;
   } catch (e) {
     console.error('Error syncing provider:', e);

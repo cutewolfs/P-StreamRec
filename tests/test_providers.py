@@ -306,6 +306,25 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(".bongacams.com", by_name["sessionid"]["domain"])
         self.assertTrue(by_name["sessionid"]["secure"])
 
+    async def test_bongacams_ytdlp_respects_quality_cap(self):
+        provider = YtDlpProvider(
+            "bongacams",
+            "BongaCams",
+            "https://bongacams.com/{username}",
+            ("bongacams.com",),
+        )
+        info = {
+            "formats": [
+                {"url": "https://cdn.test/480.m3u8", "height": 480, "tbr": 900, "protocol": "m3u8_native"},
+                {"url": "https://cdn.test/720.m3u8", "height": 720, "tbr": 1800, "protocol": "m3u8_native"},
+                {"url": "https://cdn.test/1080.m3u8", "height": 1080, "tbr": 3200, "protocol": "m3u8_native"},
+            ],
+        }
+
+        url, _headers = provider._select_media_url(info, max_height=720)
+
+        self.assertEqual("https://cdn.test/720.m3u8", url)
+
     def test_stripchat_json_payload_adds_viewers_and_tags(self):
         provider = BrowserCaptureProvider(
             source_type="stripchat",
@@ -400,7 +419,7 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
             "_stripchat_probe_hls_playlist",
             AsyncMock(return_value=True),
         ) as probe:
-            stream = await provider.resolve_stream("alice", max_height=720)
+            stream = await provider.resolve_stream("alice")
 
         api.assert_awaited_once()
         self.assertEqual("/v2/models/username/alice/cam", api.await_args.args[1])
@@ -415,6 +434,59 @@ class ProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Referer", stream.headers)
         self.assertIn("Origin", stream.headers)
         self.assertIn("User-Agent", stream.headers)
+
+    async def test_stripchat_public_api_caps_hls_manifest_to_configured_height(self):
+        provider = BrowserCaptureProvider(
+            source_type="stripchat",
+            display_name="Stripchat",
+            url_templates=("https://stripchat.com/{username}",),
+            domains=("stripchat.com",),
+            discover_templates=("https://stripchat.com/girls",),
+        )
+        payload = {
+            "user": {
+                "user": {
+                    "id": 42,
+                    "username": "alice",
+                    "status": "public",
+                    "isOnline": True,
+                    "isLive": True,
+                    "viewersCount": 77,
+                }
+            },
+            "cam": {
+                "isCamAvailable": True,
+                "isCamActive": True,
+                "streamName": "42",
+                "streamStatus": "public",
+            },
+        }
+        master = "\n".join([
+            "#EXTM3U",
+            "#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=854x480",
+            "480p/index.m3u8",
+            "#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720",
+            "720p/index.m3u8",
+            "#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080",
+            "1080p/index.m3u8",
+        ])
+
+        with patch.object(
+            provider,
+            "_stripchat_api_json",
+            AsyncMock(return_value=payload),
+        ), patch.object(
+            provider,
+            "_stripchat_fetch_hls_playlist",
+            AsyncMock(return_value=master),
+        ) as fetch:
+            stream = await provider.resolve_stream("alice", max_height=720)
+
+        fetch.assert_awaited_once()
+        self.assertEqual(
+            "https://edge-hls.doppiocdn.net/hls/42/master/720p/index.m3u8",
+            stream.url,
+        )
 
     async def test_stripchat_public_resolver_rejects_offline_payload_without_hls_probe(self):
         provider = BrowserCaptureProvider(

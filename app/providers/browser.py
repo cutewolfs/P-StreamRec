@@ -1955,7 +1955,6 @@ class BrowserCaptureProvider(BaseProvider):
         target: str,
         max_height: Optional[int] = None,
     ) -> Optional[ResolvedStream]:
-        del max_height
         username = self._stripchat_username_from_target(target)
         if not username:
             return None
@@ -1983,10 +1982,11 @@ class BrowserCaptureProvider(BaseProvider):
                 f"https://edge-hls.{host}/hls/{model_id}/master/{model_id}_auto.m3u8"
                 f"{self._stripchat_master_playlist_query()}"
             )
-            if await self._stripchat_probe_hls_playlist(playlist_url, headers):
+            stream_url = await self._stripchat_validated_hls_url(playlist_url, headers, max_height)
+            if stream_url:
                 item = self._stripchat_model_item(model) or {}
                 return ResolvedStream(
-                    url=playlist_url,
+                    url=stream_url,
                     headers=headers,
                     source_type=self.source_type,
                     is_live=True,
@@ -1998,6 +1998,58 @@ class BrowserCaptureProvider(BaseProvider):
                 )
 
         raise ProviderOfflineError(f"Aucun HLS Stripchat public valide pour {username}")
+
+    async def _stripchat_validated_hls_url(
+        self,
+        playlist_url: str,
+        headers: dict[str, str],
+        max_height: Optional[int],
+    ) -> Optional[str]:
+        if not max_height or max_height <= 0:
+            return playlist_url if await self._stripchat_probe_hls_playlist(playlist_url, headers) else None
+
+        playlist_text = await self._stripchat_fetch_hls_playlist(playlist_url, headers)
+        if not playlist_text:
+            return None
+        return self._stripchat_variant_url_for_height(playlist_url, playlist_text, max_height) or playlist_url
+
+    @staticmethod
+    def _stripchat_variant_url_for_height(
+        playlist_url: str,
+        playlist_text: str,
+        max_height: Optional[int],
+    ) -> Optional[str]:
+        if not max_height or max_height <= 0:
+            return None
+
+        variants: list[dict[str, object]] = []
+        pending_height = 0
+        for raw_line in (playlist_text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#EXT-X-STREAM-INF"):
+                match = re.search(r"RESOLUTION=\d+x(\d+)", line, re.IGNORECASE)
+                pending_height = int(match.group(1)) if match else 0
+                continue
+            if line.startswith("#"):
+                continue
+            if pending_height:
+                variants.append({
+                    "height": pending_height,
+                    "url": urljoin(playlist_url, line),
+                })
+            pending_height = 0
+
+        if not variants:
+            return None
+
+        eligible = [item for item in variants if int(item["height"]) <= max_height]
+        if eligible:
+            selected = max(eligible, key=lambda item: int(item["height"]))
+        else:
+            selected = min(variants, key=lambda item: int(item["height"]))
+        return str(selected["url"])
 
     def _stripchat_master_playlist_query(self) -> str:
         params = {
@@ -2089,7 +2141,7 @@ class BrowserCaptureProvider(BaseProvider):
             hosts.append(host)
         return hosts
 
-    async def _stripchat_probe_hls_playlist(self, playlist_url: str, headers: dict[str, str]) -> bool:
+    async def _stripchat_fetch_hls_playlist(self, playlist_url: str, headers: dict[str, str]) -> Optional[str]:
         try:
             timeout = aiohttp.ClientTimeout(total=int(os.getenv("PSTREAMREC_STRIPCHAT_HLS_PROBE_TIMEOUT", "12") or "12"))
             async with aiohttp_client_session(timeout=timeout) as session:
@@ -2102,14 +2154,17 @@ class BrowserCaptureProvider(BaseProvider):
                     if resp.status in (401, 403):
                         raise ProviderAuthError("Flux Stripchat refuse ou session requise")
                     if resp.status >= 400:
-                        return False
-                    head = await resp.content.read(512)
+                        return None
+                    text = await resp.text(errors="ignore")
         except ProviderError:
             raise
         except Exception as exc:
             logger.debug("Stripchat HLS probe failed", url=playlist_url, error=str(exc))
-            return False
-        return head.lstrip().startswith(b"#EXTM3U")
+            return None
+        return text if text.lstrip().startswith("#EXTM3U") else None
+
+    async def _stripchat_probe_hls_playlist(self, playlist_url: str, headers: dict[str, str]) -> bool:
+        return bool(await self._stripchat_fetch_hls_playlist(playlist_url, headers))
 
     async def _stripchat_user_by_username(self, username: str) -> dict[str, object]:
         payload = await self._stripchat_api_json(

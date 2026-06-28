@@ -29,12 +29,14 @@ COPY app ./app
 COPY static ./static
 COPY README.md ./
 COPY docker/entrypoint.sh /usr/local/bin/pstreamrec-entrypoint
-RUN chmod +x /usr/local/bin/pstreamrec-entrypoint
+RUN chmod +x /usr/local/bin/pstreamrec-entrypoint && \
+    test -x /usr/local/bin/pstreamrec-entrypoint && \
+    PSTREAMREC_ENTRYPOINT_TESTING=1 /usr/local/bin/pstreamrec-entrypoint
 
 # Create data volume for recordings
 VOLUME ["/data"]
 
 EXPOSE 8080
 
-ENTRYPOINT ["pstreamrec-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/pstreamrec-entrypoint"]
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers"]

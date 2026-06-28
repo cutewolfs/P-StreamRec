@@ -4,6 +4,7 @@ Authenticated API calls for model discovery, following, and stream resolution
 """
 
 import asyncio
+import json
 import re
 import time
 from html import unescape
@@ -642,7 +643,125 @@ class ChaturbateAPI:
                 "gender": "",
                 "num_followers": 0,
             })
+        models.extend(cls._parse_followed_embedded_json(html))
+        return cls._dedupe_followed_items(models)
+
+    @classmethod
+    def _parse_followed_embedded_json(cls, html: str) -> List[Dict[str, Any]]:
+        models: List[Dict[str, Any]] = []
+        scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html or "", re.IGNORECASE | re.DOTALL)
+        for script in scripts:
+            text = unescape(script or "").strip()
+            if not text or len(text) > 2_000_000:
+                continue
+            json_values = cls._extract_json_values(text)
+            for value in json_values:
+                cls._collect_followed_json_models(value, models)
         return models
+
+    @classmethod
+    def _extract_json_values(cls, text: str) -> List[Any]:
+        values: List[Any] = []
+        decoder = json.JSONDecoder()
+        candidates = []
+        stripped = text.strip()
+        if stripped.startswith(("{", "[")):
+            candidates.append(stripped)
+        for match in re.finditer(r"=\s*({.*?});", text, re.DOTALL):
+            candidates.append(match.group(1))
+
+        for candidate in candidates:
+            try:
+                value, _ = decoder.raw_decode(candidate)
+            except Exception:
+                continue
+            values.append(value)
+        return values
+
+    @classmethod
+    def _collect_followed_json_models(cls, value: Any, models: List[Dict[str, Any]]) -> None:
+        if isinstance(value, list):
+            for item in value:
+                cls._collect_followed_json_models(item, models)
+            return
+        if not isinstance(value, dict):
+            return
+
+        item = cls._followed_json_item(value)
+        if item:
+            models.append(item)
+
+        for child in value.values():
+            if isinstance(child, (dict, list)):
+                cls._collect_followed_json_models(child, models)
+
+    @classmethod
+    def _followed_json_item(cls, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        username = str(
+            item.get("username")
+            or item.get("room")
+            or item.get("room_slug")
+            or item.get("slug")
+            or ""
+        ).strip().strip("/")
+        if not username or not re.match(r"^[A-Za-z0-9_]+$", username):
+            return None
+
+        has_followed_shape = any(
+            key in item
+            for key in (
+                "is_online",
+                "isOnline",
+                "current_show",
+                "room_status",
+                "num_users",
+                "viewers",
+                "thumbnail",
+                "thumbnail_url",
+                "img",
+            )
+        )
+        if not has_followed_shape:
+            return None
+
+        room_status = str(
+            item.get("room_status")
+            or item.get("roomStatus")
+            or item.get("current_show")
+            or item.get("status")
+            or ""
+        ).strip().lower()
+        is_private = room_status in {"private", "group", "ticket", "hidden"}
+        is_online = bool(item.get("is_online", item.get("isOnline", room_status == "public"))) and not is_private
+        thumbnail = cls._normalize_thumbnail(
+            item.get("thumbnail_url") or item.get("thumbnail") or item.get("img"),
+            username,
+        )
+        return {
+            "username": username,
+            "display_name": str(item.get("display_name") or item.get("displayName") or username),
+            "is_online": is_online,
+            "viewers": cls._as_int(item.get("viewers", item.get("num_users", 0))) if is_online else 0,
+            "thumbnail_url": thumbnail,
+            "room_status": room_status or ("public" if is_online else "offline"),
+            "tags": cls._normalize_tags(item.get("tags", [])),
+            "subject": str(item.get("subject") or item.get("room_subject") or ""),
+            "gender": str(item.get("gender") or ""),
+            "num_followers": cls._as_int(item.get("num_followers"), 0),
+        }
+
+    @staticmethod
+    def _dedupe_followed_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for item in items:
+            username = str(item.get("username") or "").strip()
+            key = username.lower()
+            if not username or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
 
     @staticmethod
     def _parse_room_item(item: Dict[str, Any], is_online: bool = True) -> Dict[str, Any]:

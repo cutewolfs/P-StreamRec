@@ -2,7 +2,7 @@ import re
 import mimetypes
 from pathlib import Path
 from typing import Any, Optional, Tuple
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 import os
 import asyncio
 import aiohttp
@@ -805,6 +805,11 @@ def _canonical_stream_url(source_type: str, channel_username: str, channel_url: 
         return f"https://www.cam4.com/{channel}"
     if normalized_source == "chaturbate":
         return f"https://chaturbate.com/{channel}/"
+    try:
+        if provider_registry.has(normalized_source):
+            return provider_registry.get(normalized_source).canonical_url(channel_username)
+    except Exception:
+        pass
     return raw_url
 
 
@@ -5428,12 +5433,18 @@ async def update_model_volume(username: str, body: ModelVolumeBody):
 @app.post("/api/models")
 async def add_model(model: dict):
     """Ajoute un modèle dans SQLite"""
-    username = model.get('username')
+    raw_username = str(model.get('username') or "").strip()
+    source_from_url = _source_type_from_url(raw_username)
+    username = (
+        _normalize_live_channel_username(raw_username, raw_username)
+        if raw_username.startswith(("http://", "https://"))
+        else raw_username
+    )
     if not username:
         raise HTTPException(status_code=400, detail="Username requis")
 
     requested_source = _normalize_source_type(
-        model.get("sourceType") or model.get("source_type")
+        model.get("sourceType") or model.get("source_type") or source_from_url
     )
     source_type = requested_source or await _infer_source_type(username)
     if source_type not in _available_source_types():

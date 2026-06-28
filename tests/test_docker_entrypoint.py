@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINT = ROOT / "docker" / "entrypoint.sh"
+DOCKERFILE = ROOT / "Dockerfile"
 
 
 class DockerEntrypointTests(unittest.TestCase):
@@ -26,6 +27,15 @@ class DockerEntrypointTests(unittest.TestCase):
 
     def test_entrypoint_has_valid_shell_syntax(self):
         subprocess.run(["sh", "-n", str(ENTRYPOINT)], check=True)
+
+    def test_dockerfile_uses_absolute_verified_entrypoint(self):
+        dockerfile = DOCKERFILE.read_text()
+
+        self.assertIn("COPY docker/entrypoint.sh /usr/local/bin/pstreamrec-entrypoint", dockerfile)
+        self.assertIn("test -x /usr/local/bin/pstreamrec-entrypoint", dockerfile)
+        self.assertIn("PSTREAMREC_ENTRYPOINT_TESTING=1 /usr/local/bin/pstreamrec-entrypoint", dockerfile)
+        self.assertIn('ENTRYPOINT ["/usr/local/bin/pstreamrec-entrypoint"]', dockerfile)
+        self.assertNotIn('ENTRYPOINT ["pstreamrec-entrypoint"]', dockerfile)
 
     def test_dns_cache_resolv_conf_uses_local_cache_and_preserves_options(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -166,6 +166,29 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
         self.assertFalse(api.requests[0]["kwargs"].get("allow_redirects", True))
 
+    async def test_followed_models_parse_embedded_json_payload(self):
+        html = """
+        <html><body>
+          <script type="application/json">
+            {"props":{"followed":[
+              {"username":"_alice_","display_name":"Alice","is_online":true,
+               "viewers":"123","thumbnail_url":"//thumb.example.test/alice.jpg",
+               "room_status":"public","tags":["French"]}
+            ]}}
+          </script>
+        </body></html>
+        """
+        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertEqual("_alice_", result[0]["username"])
+        self.assertEqual("Alice", result[0]["display_name"])
+        self.assertEqual(123, result[0]["viewers"])
+        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
+        self.assertEqual(["French"], result[0]["tags"])
+
     async def test_followed_models_skip_untrusted_login_redirect(self):
         api = _FollowedAPI([_FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html")])
 
