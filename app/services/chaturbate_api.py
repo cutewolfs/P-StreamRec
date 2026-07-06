@@ -23,6 +23,9 @@ from .chaturbate_auth import ChaturbateAuthService
 from .flaresolverr import FlareSolverrClient
 
 
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
 class FollowedSyncResult(list):
     def __init__(
         self,
@@ -45,6 +48,38 @@ class ChaturbateAPI:
         self.flaresolverr = flaresolverr
         self._semaphore = asyncio.Semaphore(2)
         self._last_request_time: float = 0
+
+    def _apply_flaresolverr_solution(
+        self,
+        headers: Dict[str, str],
+        solution: Dict[str, Any],
+    ) -> bool:
+        cookies = solution.get("cookies") or {}
+        user_agent = solution.get("user_agent") or ""
+        if user_agent:
+            headers["User-Agent"] = user_agent
+            if hasattr(self.auth, "_user_agent"):
+                self.auth._user_agent = user_agent
+
+        merged_cookies = self.auth.get_cookies()
+        merged_cookies.update({str(k): str(v) for k, v in cookies.items()})
+        if merged_cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in merged_cookies.items())
+            if hasattr(self.auth, "_cookies"):
+                self.auth._cookies = dict(merged_cookies)
+        return bool(cookies or user_agent)
+
+    async def _prepare_flaresolverr_retry_headers(
+        self,
+        url: str,
+        headers: Dict[str, str],
+    ) -> bool:
+        if not self.flaresolverr:
+            return False
+        solution = await self.flaresolverr.solve_challenge(url)
+        if not solution:
+            return False
+        return self._apply_flaresolverr_solution(headers, solution)
 
     async def _rate_limit(self):
         """Apply rate limiting between requests"""
@@ -92,37 +127,32 @@ class ChaturbateAPI:
                         **aiohttp_request_kwargs(),
                         **kwargs
                     ) as resp:
-                        if resp.status == 403 and self.flaresolverr:
+                        if resp.status == 403 or resp.status in _REDIRECT_STATUSES:
                             # Cloudflare block - try FlareSolverr
-                            logger.info("403 detected, attempting FlareSolverr bypass")
-                            solution = await self.flaresolverr.solve_challenge(url)
-                            if solution:
-                                cookies = solution.get("cookies", {})
-                                new_ua = solution.get("user_agent", "")
-                                headers["User-Agent"] = new_ua
-                                cookie_parts = []
-                                for k, v in self.auth.get_cookies().items():
-                                    cookie_parts.append(f"{k}={v}")
-                                for k, v in cookies.items():
-                                    cookie_parts.append(f"{k}={v}")
-                                headers["Cookie"] = "; ".join(cookie_parts)
+                            if self.flaresolverr:
+                                logger.info(
+                                    "Chaturbate protection detected, attempting FlareSolverr bypass",
+                                    status=resp.status,
+                                )
+                                solved = await self._prepare_flaresolverr_retry_headers(url, headers)
 
                                 # Retry
-                                await self._rate_limit()
-                                async with session.request(
-                                    method, url, headers=headers, ssl=False,
-                                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                                    **aiohttp_request_kwargs(),
-                                    **kwargs
-                                ) as retry_resp:
-                                    # Read body before response context exits
-                                    body = await retry_resp.read()
-                                    return _FakeResponse(
-                                        retry_resp.status,
-                                        body,
-                                        retry_resp.headers,
-                                        retry_resp.content_type
-                                    )
+                                if solved:
+                                    await self._rate_limit()
+                                    async with session.request(
+                                        method, url, headers=headers, ssl=False,
+                                        timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
+                                        **aiohttp_request_kwargs(),
+                                        **kwargs
+                                    ) as retry_resp:
+                                        # Read body before response context exits
+                                        body = await retry_resp.read()
+                                        return _FakeResponse(
+                                            retry_resp.status,
+                                            body,
+                                            retry_resp.headers,
+                                            retry_resp.content_type
+                                        )
 
                         # Read body before context exits
                         body = await resp.read()
@@ -214,7 +244,7 @@ class ChaturbateAPI:
             headers["Accept"] = "application/json"
             headers["X-Requested-With"] = "XMLHttpRequest"
 
-            resp = await self._request("GET", api_url, headers=headers)
+            resp = await self._request("GET", api_url, headers=headers, allow_redirects=False)
 
             if resp and resp.status == 200:
                 parsed = self._parse_roomlist_response(resp, page, limit)
@@ -406,7 +436,7 @@ class ChaturbateAPI:
         if page > 1:
             url += f"?page={page}"
 
-        resp = await self._request("GET", url)
+        resp = await self._request("GET", url, allow_redirects=False)
         if not resp or resp.status != 200:
             return {
                 "models": [],
@@ -494,7 +524,11 @@ class ChaturbateAPI:
             resp = await self._request("GET", url, headers=headers, allow_redirects=False)
             if not resp:
                 return self._untrusted_followed_result("Chaturbate followed-cams request failed")
-            if resp.status in {301, 302, 303, 307, 308}:
+            if resp.status in _REDIRECT_STATUSES and await self._prepare_flaresolverr_retry_headers(url, headers):
+                resp = await self._request("GET", url, headers=headers, allow_redirects=False)
+                if not resp:
+                    return self._untrusted_followed_result("Chaturbate followed-cams request failed after FlareSolverr")
+            if resp.status in _REDIRECT_STATUSES:
                 return self._untrusted_followed_result("Chaturbate followed-cams redirected to login")
             if resp.status == 403:
                 return self._untrusted_followed_result("Chaturbate followed-cams returned 403")

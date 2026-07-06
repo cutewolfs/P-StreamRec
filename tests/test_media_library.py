@@ -550,6 +550,32 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(profile["streamSources"][0]["channelUsername"], "brand_new_live")
         self.assertEqual(profile["streamSources"][0]["recordPath"], "brand_new/videos/record")
 
+    async def test_profile_source_prefers_provider_from_channel_url_over_default_chaturbate(self):
+        response = self.client.put(
+            "/api/media-profiles/strip_profile",
+            json={
+                "displayName": "Strip Profile",
+                "sourceType": "chaturbate",
+                "streamSources": [
+                    {
+                        "sourceType": "chaturbate",
+                        "channelUrl": "https://stripchat.com/aaa/",
+                        "recordQuality": "best",
+                        "retentionDays": 30,
+                        "autoRecord": False,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        source = response.json()["profile"]["streamSources"][0]
+        self.assertEqual("stripchat", source["sourceType"])
+        self.assertEqual("aaa", source["channelUsername"])
+        self.assertEqual("https://stripchat.com/aaa/", source["channelUrl"])
+        self.assertIsNotNone(await app_main.db.get_model("aaa", source_type="stripchat"))
+        self.assertIsNone(await app_main.db.get_model("aaa", source_type="chaturbate"))
+
     async def test_resolves_and_serves_dedicated_profile_image(self):
         async def fake_download(username, image_url):
             self.assertEqual(username, "empty_model")

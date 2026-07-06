@@ -17,6 +17,18 @@ class _CookieAuth(_FakeAuth):
         return {"sessionid": "abc", "csrftoken": "csrf"}
 
 
+class _FakeFlareSolverr:
+    def __init__(self):
+        self.urls = []
+
+    async def solve_challenge(self, url):
+        self.urls.append(url)
+        return {
+            "cookies": {"cf_clearance": "solved"},
+            "user_agent": "Solved-UA",
+        }
+
+
 def _json_response(payload):
     return _FakeResponse(
         200,
@@ -44,7 +56,7 @@ class _RoomlistAPI(ChaturbateAPI):
         return None
 
     async def _request(self, method, url, headers=None, **kwargs):
-        self.requests.append({"method": method, "url": url, "headers": headers or {}})
+        self.requests.append({"method": method, "url": url, "headers": headers or {}, "kwargs": kwargs})
         return self.response
 
     async def _scrape_live_models(self, page, limit, gender, search):
@@ -56,8 +68,8 @@ class _RoomlistAPI(ChaturbateAPI):
 
 
 class _FollowedAPI(ChaturbateAPI):
-    def __init__(self, responses):
-        super().__init__(_CookieAuth())
+    def __init__(self, responses, flaresolverr=None):
+        super().__init__(_CookieAuth(), flaresolverr=flaresolverr)
         self.responses = list(responses)
         self.requests = []
 
@@ -79,6 +91,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("application/json", headers["Accept"])
         self.assertEqual("XMLHttpRequest", headers["X-Requested-With"])
         self.assertEqual("https://chaturbate.com/", headers["Referer"])
+        self.assertFalse(api.requests[0]["kwargs"].get("allow_redirects", True))
 
     async def test_roomlist_parses_current_chaturbate_fields(self):
         api = _RoomlistAPI(_json_response({
@@ -197,6 +210,31 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.trusted)
         self.assertEqual([], list(result))
         self.assertIn("redirected", result.skipped_reason)
+
+    async def test_followed_models_retry_login_redirect_with_flaresolverr(self):
+        html = """
+        <html><body>
+          <li class="room_list_room" data-room="alice">
+            <img src="//thumb.example.test/alice.jpg">
+            <span class="cams">42</span>
+          </li>
+        </body></html>
+        """
+        flaresolverr = _FakeFlareSolverr()
+        api = _FollowedAPI([
+            _FakeResponse(302, b"", {"Location": "/auth/login/?next=/followed-cams/"}, "text/html"),
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+        ], flaresolverr=flaresolverr)
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertEqual(["alice"], [item["username"] for item in result])
+        self.assertEqual(["https://chaturbate.com/followed-cams/"], flaresolverr.urls)
+        self.assertEqual(2, len(api.requests))
+        retry_headers = api.requests[1]["headers"]
+        self.assertEqual("Solved-UA", retry_headers["User-Agent"])
+        self.assertIn("cf_clearance=solved", retry_headers["Cookie"])
 
     async def test_followed_models_skip_when_safety_limit_is_exceeded(self):
         import app.services.chaturbate_api as cb_api

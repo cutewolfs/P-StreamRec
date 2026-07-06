@@ -24,6 +24,9 @@ from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .flaresolverr import FlareSolverrClient
 
 
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+
+
 class ChaturbateAuthService:
     def __init__(self, db, flaresolverr: Optional[FlareSolverrClient] = None):
         self.db = db
@@ -41,6 +44,35 @@ class ChaturbateAuthService:
         self._last_validation_error: Optional[str] = None
         self._cookies_file = OUTPUT_DIR / "cookies" / "chaturbate.json"
         self._lock = asyncio.Lock()
+
+    def _apply_flaresolverr_solution(
+        self,
+        headers: Dict[str, str],
+        cookies: Dict[str, str],
+        solution: Dict[str, Any],
+    ) -> bool:
+        solved_cookies = solution.get("cookies") or {}
+        user_agent = solution.get("user_agent") or ""
+        if user_agent:
+            self._user_agent = user_agent
+            headers["User-Agent"] = self._user_agent
+        cookies.update({str(k): str(v) for k, v in solved_cookies.items()})
+        if cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        return bool(solved_cookies or user_agent)
+
+    async def _prepare_flaresolverr_headers(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        cookies: Dict[str, str],
+    ) -> bool:
+        if not self.flaresolverr:
+            return False
+        solution = await self.flaresolverr.solve_challenge(url)
+        if not solution:
+            return False
+        return self._apply_flaresolverr_solution(headers, cookies, solution)
 
     async def initialize(self):
         """Load saved auth state from DB"""
@@ -207,24 +239,20 @@ class ChaturbateAuthService:
             try:
                 async with session.get(
                     url, headers=headers, ssl=False,
+                    allow_redirects=False,
                     timeout=aiohttp.ClientTimeout(total=15),
                     **aiohttp_request_kwargs(),
                 ) as resp:
-                    if resp.status == 403 and self.flaresolverr:
+                    if resp.status == 403 or resp.status in _REDIRECT_STATUSES:
                         # Cloudflare block - use FlareSolverr
-                        logger.info("Cloudflare detected, using FlareSolverr")
-                        solution = await self.flaresolverr.solve_challenge(url)
-                        if solution:
-                            cookies.update(solution.get("cookies", {}))
-                            self._user_agent = solution.get("user_agent", self._user_agent)
-                            # Retry with solved cookies
-                            headers["User-Agent"] = self._user_agent
-                            cookie_header = "; ".join(
-                                f"{k}={v}" for k, v in cookies.items()
-                            )
-                            headers["Cookie"] = cookie_header
+                        logger.info(
+                            "Chaturbate protection detected, using FlareSolverr",
+                            status=resp.status,
+                        )
+                        if await self._prepare_flaresolverr_headers(url, headers, cookies):
                             async with session.get(
                                 url, headers=headers, ssl=False,
+                                allow_redirects=False,
                                 timeout=aiohttp.ClientTimeout(total=15),
                                 **aiohttp_request_kwargs(),
                             ) as retry_resp:
@@ -240,6 +268,22 @@ class ChaturbateAuthService:
                         html = await resp.text()
                         for c in resp.cookies.values():
                             cookies[c.key] = c.value
+                        if self.flaresolverr and "cf_clearance" not in cookies:
+                            csrf = self._parse_csrf(html, cookies)
+                            if await self._prepare_flaresolverr_headers(url, headers, cookies):
+                                async with session.get(
+                                    url, headers=headers, ssl=False,
+                                    allow_redirects=False,
+                                    timeout=aiohttp.ClientTimeout(total=15),
+                                    **aiohttp_request_kwargs(),
+                                ) as retry_resp:
+                                    if retry_resp.status == 200:
+                                        retry_html = await retry_resp.text()
+                                        for c in retry_resp.cookies.values():
+                                            cookies[c.key] = c.value
+                                        retry_csrf = self._parse_csrf(retry_html, cookies)
+                                        return retry_csrf or csrf, cookies
+                            return csrf, cookies
                         csrf = self._parse_csrf(html, cookies)
                         return csrf, cookies
 

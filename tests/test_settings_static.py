@@ -166,6 +166,8 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn("streamSources", js)
         self.assertIn("channelUsername", js)
         self.assertIn("channelUsernameFromUrl", js)
+        self.assertIn("sourceTypeFromUrl", js)
+        self.assertIn("{ value: 'stripchat', label: 'Stripchat'", js)
         self.assertIn("selectedProfile", js)
         self.assertIn("filterProfile", js)
         self.assertIn("formatProfileMediaCounts", js)

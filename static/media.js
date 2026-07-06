@@ -28,6 +28,18 @@
     resolvingProfileImage: false
   };
 
+  var PROFILE_SOURCE_OPTIONS = [
+    { value: 'chaturbate', label: 'Chaturbate', domains: ['chaturbate.com'] },
+    { value: 'cam4', label: 'CAM4', domains: ['cam4.com'] },
+    { value: 'stripchat', label: 'Stripchat', domains: ['stripchat.com'] },
+    { value: 'bongacams', label: 'BongaCams', domains: ['bongacams.com'] },
+    { value: 'myfreecams', label: 'MyFreeCams', domains: ['myfreecams.com', 'mfc.im'] },
+    { value: 'livejasmin', label: 'LiveJasmin', domains: ['livejasmin.com'] },
+    { value: 'camsoda', label: 'CamSoda', domains: ['camsoda.com'] },
+    { value: 'cams', label: 'Cams.com', domains: ['cams.com'] },
+    { value: 'xcams', label: 'Xcams', domains: ['xcams.com'] }
+  ];
+
   var searchTimer = null;
   var mediaVolumeUsername = '';
   var mediaPlaybackVolume = null;
@@ -344,6 +356,26 @@
     } catch (e) {
       return '';
     }
+  }
+
+  function sourceTypeFromUrl(value) {
+    try {
+      var url = new URL(String(value || '').trim());
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return '';
+      var host = (url.hostname || '').toLowerCase().replace(/\.$/, '');
+      for (var i = 0; i < PROFILE_SOURCE_OPTIONS.length; i++) {
+        var option = PROFILE_SOURCE_OPTIONS[i];
+        for (var j = 0; j < option.domains.length; j++) {
+          var domain = option.domains[j].toLowerCase();
+          if (host === domain || host.slice(-(domain.length + 1)) === '.' + domain) {
+            return option.value;
+          }
+        }
+      }
+    } catch (e) {
+      return '';
+    }
+    return '';
   }
 
   function buildQuery() {
@@ -996,10 +1028,9 @@
   }
 
   function sourceOptionsHtml(value) {
-    var options = [
-      { value: 'chaturbate', label: 'Chaturbate' },
-      { value: 'cam4', label: 'CAM4' }
-    ];
+    var options = PROFILE_SOURCE_OPTIONS.map(function(option) {
+      return { value: option.value, label: option.label };
+    });
     var found = options.some(function(option) { return option.value === value; });
     if (value && !found) options.push({ value: value, label: value });
     return options.map(function(option) {
@@ -1009,13 +1040,18 @@
 
   function normalizeProfileSource(source, fallbackUsername) {
     source = source || {};
+    var channelUrl = source.channelUrl || source.channel_url || '';
+    var sourceType = (source.sourceType || source.source_type || '').toString().trim().toLowerCase();
+    var urlSourceType = sourceTypeFromUrl(channelUrl);
+    if (urlSourceType && (!sourceType || sourceType === 'chaturbate')) sourceType = urlSourceType;
+    if (!sourceType) sourceType = 'chaturbate';
     var retention = parseInt(source.retentionDays == null ? source.retention_days : source.retentionDays, 10);
     if (Number.isNaN(retention)) retention = 30;
     retention = Math.max(0, Math.min(365, retention));
     return {
-      sourceType: (source.sourceType || source.source_type || 'chaturbate').toString().trim().toLowerCase() || 'chaturbate',
+      sourceType: sourceType,
       channelUsername: source.channelUsername || source.channel_username || source.username || fallbackUsername || '',
-      channelUrl: source.channelUrl || source.channel_url || '',
+      channelUrl: channelUrl,
       recordQuality: source.recordQuality || source.record_quality || 'best',
       retentionDays: retention,
       autoRecord: !!(source.autoRecord != null ? source.autoRecord : source.auto_record)
@@ -1079,10 +1115,13 @@
         return el.value.trim();
       }
       var channelUrl = get('channelUrl');
+      var selectedSource = (get('sourceType') || '').toLowerCase();
+      var urlSource = sourceTypeFromUrl(channelUrl);
+      if (urlSource && (!selectedSource || selectedSource === 'chaturbate')) selectedSource = urlSource;
       var retention = parseInt(get('retentionDays'), 10);
       if (Number.isNaN(retention)) retention = 30;
       return {
-        sourceType: get('sourceType') || 'chaturbate',
+        sourceType: selectedSource || 'chaturbate',
         channelUsername: channelUsernameFromUrl(channelUrl) || normalizeProfileUsername(get('channelUsername')),
         channelUrl: channelUrl,
         recordQuality: get('recordQuality') || 'best',

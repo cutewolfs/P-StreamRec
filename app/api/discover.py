@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
 
 from ..logger import logger
+from ..core.config import CHATURBATE_REQUEST_TIMEOUT_SECONDS
 
 router = APIRouter(prefix="/api", tags=["discover"])
 
@@ -210,6 +211,8 @@ async def _fetch_provider(
 ) -> Optional[Dict[str, Any]]:
     try:
         timeout = 25 if allow_browser else 14
+        if getattr(provider, "source_type", "") == "chaturbate":
+            timeout = max(timeout, CHATURBATE_REQUEST_TIMEOUT_SECONDS + (45 if allow_browser else 5))
         return await asyncio.wait_for(
             provider.list_live_models(
                 page=page,

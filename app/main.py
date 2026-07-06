@@ -885,16 +885,19 @@ async def _normalize_profile_source_payload(
     default_auto_record: bool = False,
 ) -> dict:
     raw_source = raw_source or {}
-    source_type = _normalize_source_type(
+    channel_url = raw_source.get("channelUrl") or raw_source.get("channel_url") or raw_source.get("url") or raw_source.get("sourceUrl")
+    source_from_url = _source_type_from_url(str(channel_url or ""))
+    requested_source = _normalize_source_type(
         raw_source.get("sourceType")
         or raw_source.get("source_type")
-        or _source_type_from_url(str(raw_source.get("channelUrl") or raw_source.get("channel_url") or raw_source.get("url") or ""))
-        or "chaturbate"
-    ) or "chaturbate"
+    )
+    if source_from_url and (not requested_source or requested_source == "chaturbate"):
+        source_type = source_from_url
+    else:
+        source_type = requested_source or source_from_url or "chaturbate"
     if source_type not in _available_source_types():
         raise HTTPException(status_code=400, detail=f"Source '{source_type}' is not available")
 
-    channel_url = raw_source.get("channelUrl") or raw_source.get("channel_url") or raw_source.get("url") or raw_source.get("sourceUrl")
     channel_username = _normalize_live_channel_username(
         raw_source.get("channelUsername")
         or raw_source.get("channel_username")
