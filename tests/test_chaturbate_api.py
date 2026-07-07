@@ -2,6 +2,7 @@ import json
 import unittest
 
 from app.services.chaturbate_api import ChaturbateAPI, _FakeResponse
+from app.services.chaturbate_auth import ChaturbateAuthService
 
 
 class _FakeAuth:
@@ -15,6 +16,18 @@ class _FakeAuth:
 class _CookieAuth(_FakeAuth):
     def get_cookies(self):
         return {"sessionid": "abc", "csrftoken": "csrf"}
+
+
+class _MutableCookieAuth(_FakeAuth):
+    def __init__(self):
+        self._cookies = {"sessionid": "real-session", "csrftoken": "real-csrf"}
+        self._user_agent = "P-StreamRec-Test"
+
+    def get_cookies(self):
+        return dict(self._cookies)
+
+    def get_user_agent(self):
+        return self._user_agent
 
 
 class _FakeFlareSolverr:
@@ -82,6 +95,52 @@ class _FollowedAPI(ChaturbateAPI):
 
 
 class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_flaresolverr_cookie_merge_preserves_authenticated_session(self):
+        auth = _MutableCookieAuth()
+        api = ChaturbateAPI(auth)
+        headers = {"User-Agent": auth.get_user_agent()}
+
+        applied = api._apply_flaresolverr_solution(headers, {
+            "cookies": {
+                "sessionid": "anonymous-session",
+                "csrftoken": "anonymous-csrf",
+                "cf_clearance": "solved",
+                "__cf_bm": "bot-token",
+            },
+            "user_agent": "Solved-UA",
+        })
+
+        self.assertTrue(applied)
+        self.assertEqual("real-session", auth._cookies["sessionid"])
+        self.assertEqual("real-csrf", auth._cookies["csrftoken"])
+        self.assertEqual("solved", auth._cookies["cf_clearance"])
+        self.assertEqual("bot-token", auth._cookies["__cf_bm"])
+        self.assertEqual("Solved-UA", headers["User-Agent"])
+        self.assertIn("sessionid=real-session", headers["Cookie"])
+        self.assertNotIn("anonymous-session", headers["Cookie"])
+
+    async def test_auth_flaresolverr_cookie_merge_preserves_authenticated_session(self):
+        auth = ChaturbateAuthService(db=object())
+        cookies = {"sessionid": "real-session", "csrftoken": "real-csrf"}
+        headers = {}
+
+        applied = auth._apply_flaresolverr_solution(headers, cookies, {
+            "cookies": {
+                "sessionid": "anonymous-session",
+                "csrftoken": "anonymous-csrf",
+                "cf_clearance": "solved",
+            },
+            "user_agent": "Solved-UA",
+        })
+
+        self.assertTrue(applied)
+        self.assertEqual("real-session", cookies["sessionid"])
+        self.assertEqual("real-csrf", cookies["csrftoken"])
+        self.assertEqual("solved", cookies["cf_clearance"])
+        self.assertEqual("Solved-UA", headers["User-Agent"])
+        self.assertIn("sessionid=real-session", headers["Cookie"])
+        self.assertNotIn("anonymous-session", headers["Cookie"])
+
     async def test_roomlist_uses_ajax_json_headers(self):
         api = _RoomlistAPI(_json_response({"rooms": [{"username": "alice"}], "total_count": 1}))
 
@@ -201,6 +260,86 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(123, result[0]["viewers"])
         self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
         self.assertEqual(["French"], result[0]["tags"])
+
+    async def test_followed_models_use_roomlist_api_for_react_shell(self):
+        html = """
+        <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
+          <div id="roomlist_root" data-testid="room-list">
+            <li class="roomCard placeholder camBgColor"></li>
+          </div>
+        </body></html>
+        """
+        api = _FollowedAPI([
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+            _json_response({
+                "rooms": [{
+                    "username": "alice",
+                    "display_name": "Alice",
+                    "current_show": "public",
+                    "num_users": "42",
+                    "img": "//thumb.example.test/alice.jpg",
+                    "tags": ["French"],
+                }],
+                "total_count": 1,
+            }),
+        ])
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertEqual(["alice"], [item["username"] for item in result])
+        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
+        self.assertIn("follow=true", api.requests[1]["url"])
+        self.assertEqual("application/json", api.requests[1]["headers"]["Accept"])
+        self.assertEqual("XMLHttpRequest", api.requests[1]["headers"]["X-Requested-With"])
+
+    async def test_followed_models_reject_roomlist_api_above_safety_limit(self):
+        import app.services.chaturbate_api as cb_api
+
+        html = """
+        <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
+          <div id="roomlist_root" data-testid="room-list"></div>
+        </body></html>
+        """
+        original = cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS
+        cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = 2
+        try:
+            api = _FollowedAPI([
+                _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+                _json_response({
+                    "rooms": [{"username": "alice"}, {"username": "bella"}],
+                    "total_count": 36000,
+                }),
+            ])
+            result = await api.get_followed_models()
+        finally:
+            cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = original
+
+        self.assertFalse(result.trusted)
+        self.assertEqual([], list(result))
+        self.assertIn("safety limit", result.skipped_reason)
+
+    async def test_followed_models_reject_full_roomlist_page_without_total(self):
+        html = """
+        <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
+          <div id="roomlist_root" data-testid="room-list"></div>
+        </body></html>
+        """
+        api = _FollowedAPI([
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+            _json_response({
+                "rooms": [{"username": f"model_{i}"} for i in range(90)],
+            }),
+        ])
+
+        result = await api.get_followed_models()
+
+        self.assertFalse(result.trusted)
+        self.assertEqual([], list(result))
+        self.assertIn("total", result.skipped_reason)
 
     async def test_followed_models_skip_untrusted_login_redirect(self):
         api = _FollowedAPI([_FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html")])

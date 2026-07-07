@@ -25,6 +25,42 @@ from .flaresolverr import FlareSolverrClient
 
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_CHATURBATE_AUTH_COOKIE_NAMES = {"sessionid", "csrftoken"}
+
+
+def _is_cloudflare_cookie(name: str) -> bool:
+    lower = str(name or "").strip().lower()
+    return lower == "cf_clearance" or lower.startswith("__cf") or lower.startswith("cf_")
+
+
+def merge_flaresolverr_cookies(
+    cookies: Dict[str, str],
+    solved_cookies: Dict[str, Any],
+) -> bool:
+    """Merge FlareSolverr cookies without replacing authenticated CTB cookies."""
+    changed = False
+    existing_by_lower = {str(k).lower(): k for k in cookies}
+
+    for raw_name, raw_value in (solved_cookies or {}).items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if lower in _CHATURBATE_AUTH_COOKIE_NAMES:
+            continue
+
+        existing_key = existing_by_lower.get(lower)
+        if _is_cloudflare_cookie(name):
+            target = existing_key or name
+            cookies[target] = str(raw_value)
+            existing_by_lower[lower] = target
+            changed = True
+        elif existing_key is None:
+            cookies[name] = str(raw_value)
+            existing_by_lower[lower] = name
+            changed = True
+
+    return changed
 
 
 class ChaturbateAuthService:
@@ -56,10 +92,10 @@ class ChaturbateAuthService:
         if user_agent:
             self._user_agent = user_agent
             headers["User-Agent"] = self._user_agent
-        cookies.update({str(k): str(v) for k, v in solved_cookies.items()})
+        merged_cookies = merge_flaresolverr_cookies(cookies, solved_cookies)
         if cookies:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        return bool(solved_cookies or user_agent)
+        return bool(merged_cookies or user_agent)
 
     async def _prepare_flaresolverr_headers(
         self,
