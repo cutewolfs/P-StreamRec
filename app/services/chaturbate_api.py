@@ -284,6 +284,13 @@ class ChaturbateAPI:
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _roomlist_total(cls, data: Dict[str, Any], default: int) -> tuple[int, Optional[str]]:
+        for key in ("total_count", "totalCount", "num_total", "numTotal", "total"):
+            if key in data:
+                return cls._as_int(data.get(key), default), key
+        return default, None
+
     @staticmethod
     def _normalize_tags(value: Any) -> List[str]:
         if isinstance(value, list):
@@ -370,7 +377,7 @@ class ChaturbateAPI:
             if model:
                 models.append(model)
 
-        total = cls._as_int(data.get("total_count"), len(models))
+        total, _total_key = cls._roomlist_total(data, len(models))
         total_pages = max(1, (total + limit - 1) // limit)
 
         return {
@@ -538,12 +545,18 @@ class ChaturbateAPI:
             html = resp.text()
             if self._looks_like_login_or_challenge(html):
                 return self._untrusted_followed_result("Chaturbate followed-cams returned a login or challenge page")
+            if page == 1 and not self._looks_like_followed_page_context(html):
+                return self._untrusted_followed_result("Chaturbate followed-cams page shape is not recognized")
 
             page_items = self._parse_followed_html(html)
             if not page_items and page == 1 and self._looks_like_followed_roomlist_shell(html):
                 return await self._fetch_followed_roomlist_api(headers)
             if not page_items and page == 1 and not self._looks_like_empty_followed_page(html):
                 return self._untrusted_followed_result("Chaturbate followed-cams page shape is not recognized")
+            if page_items and self._has_next_followed_page(html):
+                return self._untrusted_followed_result(
+                    "Chaturbate followed-cams HTML pagination is ambiguous"
+                )
 
             for item in page_items:
                 username = item.get("username", "")
@@ -611,6 +624,9 @@ class ChaturbateAPI:
                 logger.debug("Chaturbate followed roomlist payload ignored", error=str(e))
                 return self._untrusted_followed_result("Chaturbate followed roomlist response is not recognized")
 
+            if not isinstance(data, dict) or "total_count" not in data:
+                return self._untrusted_followed_result("Chaturbate followed roomlist total is not recognized")
+
             total = self._as_int(parsed.get("total"), 0)
             if total > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
                 return self._untrusted_followed_result(
@@ -618,8 +634,8 @@ class ChaturbateAPI:
                 )
 
             page_models = parsed.get("models") or []
-            if isinstance(data, dict) and "total_count" not in data and len(page_models) >= limit:
-                return self._untrusted_followed_result("Chaturbate followed roomlist total is not recognized")
+            if page_models and total < offset + len(page_models):
+                return self._untrusted_followed_result("Chaturbate followed roomlist total is inconsistent")
 
             for model in page_models:
                 item = self._followed_roomlist_item(model)
@@ -681,6 +697,20 @@ class ChaturbateAPI:
             "you aren't following",
         )
         return any(marker in lower for marker in empty_markers)
+
+    @staticmethod
+    def _looks_like_followed_page_context(html: str) -> bool:
+        lower = (html or "").lower()
+        markers = (
+            "followed-cams",
+            "followed cams",
+            "followedpage",
+            "follow=true",
+            "my followed",
+            "models you follow",
+            "rooms you follow",
+        )
+        return any(marker in lower for marker in markers)
 
     @staticmethod
     def _looks_like_followed_roomlist_shell(html: str) -> bool:

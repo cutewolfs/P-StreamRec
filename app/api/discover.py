@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +19,7 @@ _provider_registry = None
 _pagination_total_cache: dict[tuple, tuple[float, int, int]] = {}
 _PAGINATION_TOTAL_TTL_SECONDS = 300
 _PROVIDER_DISABLED_SETTING = "disabled_providers"
+_DISCOVER_AGGREGATE_PROVIDER_TIMEOUT_SECONDS = 6.0
 _GENDER_ALIASES = {
     "female": "female",
     "f": "female",
@@ -128,6 +130,14 @@ def _pagination_cache_key(
     )
 
 
+def _timeout_setting(name: str, default: float, minimum: float = 0.1) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
 def _stable_pagination_totals(
     cache_key: tuple,
     page: int,
@@ -208,11 +218,17 @@ async def _fetch_provider(
     tags: Optional[List[str]],
     allow_browser: bool,
     exact_search_fallback: bool,
+    aggregate_mode: bool,
 ) -> Optional[Dict[str, Any]]:
+    timeout = 25 if allow_browser else 14
+    if aggregate_mode:
+        timeout = _timeout_setting(
+            "PSTREAMREC_DISCOVER_AGGREGATE_PROVIDER_TIMEOUT",
+            _DISCOVER_AGGREGATE_PROVIDER_TIMEOUT_SECONDS,
+        )
+    elif getattr(provider, "source_type", "") == "chaturbate":
+        timeout = max(timeout, CHATURBATE_REQUEST_TIMEOUT_SECONDS + (45 if allow_browser else 5))
     try:
-        timeout = 25 if allow_browser else 14
-        if getattr(provider, "source_type", "") == "chaturbate":
-            timeout = max(timeout, CHATURBATE_REQUEST_TIMEOUT_SECONDS + (45 if allow_browser else 5))
         return await asyncio.wait_for(
             provider.list_live_models(
                 page=page,
@@ -225,6 +241,21 @@ async def _fetch_provider(
             ),
             timeout=timeout,
         )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Discover provider timeout",
+            source_type=getattr(provider, "source_type", "unknown"),
+            timeout=timeout,
+        )
+        return {
+            "models": [],
+            "total": 0,
+            "page": page,
+            "limit": limit,
+            "total_pages": 1,
+            "provider_status": "timeout",
+            "provider_detail": f"Provider timed out after {timeout:g}s.",
+        }
     except Exception as e:
         logger.warning(
             "Discover provider échec",
@@ -264,6 +295,7 @@ async def discover_models(
     per_source_limit = limit if explicit_source else 100
     provider_page = page if explicit_source else 1
     allow_browser = explicit_source
+    aggregate_mode = not explicit_source
 
     results = await asyncio.gather(*[
         _fetch_provider(
@@ -275,6 +307,7 @@ async def discover_models(
             included_tags or None,
             allow_browser=allow_browser,
             exact_search_fallback=explicit_source,
+            aggregate_mode=aggregate_mode,
         )
         for provider in providers
     ])

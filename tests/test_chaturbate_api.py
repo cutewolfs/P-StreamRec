@@ -221,6 +221,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_followed_models_parse_followed_cams_html(self):
         html = """
         <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
           <li class="room_list_room" data-room="_alice_">
             <a href="/_alice_/"><img data-src="//thumb.example.test/alice.jpg" alt="Alice"></a>
             <span class="cams">1,234</span>
@@ -241,6 +242,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_followed_models_parse_embedded_json_payload(self):
         html = """
         <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
           <script type="application/json">
             {"props":{"followed":[
               {"username":"_alice_","display_name":"Alice","is_online":true,
@@ -341,6 +343,44 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], list(result))
         self.assertIn("total", result.skipped_reason)
 
+    async def test_followed_models_reject_short_roomlist_page_without_total(self):
+        html = """
+        <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
+          <div id="roomlist_root" data-testid="room-list"></div>
+        </body></html>
+        """
+        api = _FollowedAPI([
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+            _json_response({
+                "rooms": [{"username": "global_model"}],
+            }),
+        ])
+
+        result = await api.get_followed_models()
+
+        self.assertFalse(result.trusted)
+        self.assertEqual([], list(result))
+        self.assertIn("total", result.skipped_reason)
+
+    async def test_followed_models_reject_paginated_html_roomlist(self):
+        html = """
+        <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
+          <li class="room_list_room" data-room="global_model">
+            <img src="//thumb.example.test/global.jpg">
+          </li>
+          <a href="/followed-cams/?page=2">Next</a>
+        </body></html>
+        """
+        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+
+        result = await api.get_followed_models()
+
+        self.assertFalse(result.trusted)
+        self.assertEqual([], list(result))
+        self.assertIn("pagination", result.skipped_reason)
+
     async def test_followed_models_skip_untrusted_login_redirect(self):
         api = _FollowedAPI([_FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html")])
 
@@ -353,6 +393,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
     async def test_followed_models_retry_login_redirect_with_flaresolverr(self):
         html = """
         <html><body>
+          <a href="/followed-cams/">Followed Cams</a>
           <li class="room_list_room" data-room="alice">
             <img src="//thumb.example.test/alice.jpg">
             <span class="cams">42</span>
@@ -379,6 +420,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         import app.services.chaturbate_api as cb_api
 
         html = """
+        <a href="/followed-cams/">Followed Cams</a>
         <li class="room_list_room" data-room="alice"><img src="//thumb/a.jpg"></li>
         <li class="room_list_room" data-room="bella"><img src="//thumb/b.jpg"></li>
         """

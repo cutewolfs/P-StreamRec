@@ -1,4 +1,8 @@
+import asyncio
+import os
+import time
 import unittest
+from unittest.mock import patch
 
 from app.api import discover
 from app.providers.base import BaseProvider, ProviderCapabilities
@@ -119,6 +123,12 @@ class _UnstableTotalProvider(_Provider):
         }
 
 
+class _SlowProvider(_Provider):
+    async def list_live_models(self, **kwargs):
+        await asyncio.sleep(1)
+        return await super().list_live_models(**kwargs)
+
+
 class DiscoverProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         discover.init(None, None, _Registry())
@@ -232,6 +242,27 @@ class DiscoverProviderRegistryTests(unittest.IsolatedAsyncioTestCase):
             [item["username"] for item in result["models"]],
         )
         self.assertNotIn("strip_zero", [item["username"] for item in result["models"]])
+
+    async def test_discover_global_timeout_returns_partial_results(self):
+        registry = _Registry()
+        registry.providers = {
+            "chaturbate": _Provider("chaturbate", models=[
+                {"username": "cb_mid", "is_online": True, "room_status": "public", "viewers": 120, "tags": ["public"]},
+            ]),
+            "slow": _SlowProvider("slow"),
+        }
+        discover.init(None, None, registry)
+
+        with patch.dict(os.environ, {"PSTREAMREC_DISCOVER_AGGREGATE_PROVIDER_TIMEOUT": "0.01"}):
+            started = time.monotonic()
+            result = await discover.discover_models(
+                page=1, limit=24, source=None, gender=None, search=None, tags=None, sort="viewers"
+            )
+
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(["cb_mid"], [item["username"] for item in result["models"]])
+        slow_status = [item for item in result["provider_statuses"] if item["source_type"] == "slow"][0]
+        self.assertEqual("timeout", slow_status["status"])
 
     async def test_discover_total_pages_is_stable_between_aggregate_pages(self):
         registry = _Registry()
