@@ -6790,6 +6790,62 @@ async def ffmpeg_watchdog_task():
             await asyncio.sleep(60)
 
 
+async def _auto_record_status_for_job(
+    source_type: str,
+    target_username: str,
+    cached_status: Optional[dict],
+) -> Optional[dict]:
+    """Return the freshest status available for an auto-record target."""
+    if cached_status and cached_status.get("is_online"):
+        return cached_status
+
+    source_type = _normalize_source_type(source_type) or "chaturbate"
+    if source_type not in _available_source_types():
+        return cached_status
+
+    try:
+        status_obj = await _provider_status(source_type, target_username)
+        status = status_obj.as_dict() if hasattr(status_obj, "as_dict") else dict(status_obj)
+    except Exception as e:
+        logger.debug(
+            "Auto-record provider status refresh failed",
+            task="auto-record",
+            username=target_username,
+            source_type=source_type,
+            error=str(e),
+        )
+        return cached_status
+
+    if not status.get("is_online"):
+        return cached_status or status
+
+    if cached_status:
+        try:
+            await db.update_model_status(
+                username=target_username,
+                is_online=True,
+                viewers=int(status.get("viewers") or 0),
+                room_status=status.get("room_status"),
+                source_type=source_type,
+            )
+        except Exception as e:
+            logger.debug(
+                "Auto-record status cache update failed",
+                task="auto-record",
+                username=target_username,
+                source_type=source_type,
+                error=str(e),
+            )
+
+    logger.debug(
+        "Auto-record live status refreshed",
+        task="auto-record",
+        username=target_username,
+        source_type=source_type,
+    )
+    return {**(cached_status or {}), **status, "is_online": True}
+
+
 async def auto_record_task():
     """Vérifie automatiquement les modèles et lance les enregistrements (utilise SQLite)"""
     failure_cooldowns: dict[str, float] = {}
@@ -6874,6 +6930,11 @@ async def auto_record_task():
 
                 # Vérifier le statut depuis le cache SQLite (mis à jour par monitor)
                 cached_status = await db.get_model(target_username, source_type=source_hint)
+                cached_status = await _auto_record_status_for_job(
+                    source_hint,
+                    target_username,
+                    cached_status,
+                )
                 
                 if cached_status and cached_status.get('is_online'):
                     # Modèle en ligne: résoudre le flux HLS
