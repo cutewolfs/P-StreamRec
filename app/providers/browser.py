@@ -24,7 +24,6 @@ from .base import (
     ProviderInteractionRequired,
     ProviderOfflineError,
     ProviderPrivateError,
-    ProviderStatus,
     ResolvedStream,
 )
 from .sessions import ProviderSessionStore

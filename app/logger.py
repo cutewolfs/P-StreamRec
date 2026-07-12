@@ -7,7 +7,6 @@ import logging
 import sys
 import collections
 from datetime import datetime
-from pathlib import Path
 from typing import Optional, List, Dict
 import json
 
@@ -119,14 +118,14 @@ class MemoryLogHandler(logging.Handler):
         logs = list(self.logs)
         if level:
             level_upper = level.upper()
-            logs = [l for l in logs if l["level"] == level_upper]
+            logs = [entry for entry in logs if entry["level"] == level_upper]
         # Return most recent first
         logs.reverse()
         return logs[offset:offset + limit]
 
     def get_total(self, level: Optional[str] = None) -> int:
         if level:
-            return sum(1 for l in self.logs if l["level"] == level.upper())
+            return sum(1 for entry in self.logs if entry["level"] == level.upper())
         return len(self.logs)
 
 

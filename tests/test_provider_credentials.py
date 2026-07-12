@@ -140,10 +140,32 @@ class ProviderCredentialTests(unittest.IsolatedAsyncioTestCase):
             {("alice", "chaturbate"), ("alice", "stripchat")},
             {(row["username"], row["source_type"]) for row in follows},
         )
+        self.assertEqual(0, await self.db.reconcile_model_sources_from_followed())
+        models_after_reconcile = await self.db.get_all_models()
+        self.assertEqual(
+            {("alice", "chaturbate"), ("alice", "stripchat")},
+            {(row["username"], row["source_type"]) for row in models_after_reconcile},
+        )
         self.assertEqual("stripchat", (await self.db.get_model("alice", "stripchat"))["source_type"])
         await self.db.delete_followed_model("alice", source_type="stripchat")
         self.assertIsNone(await self.db.get_followed_model("alice", "stripchat"))
         self.assertIsNotNone(await self.db.get_followed_model("alice", "chaturbate"))
+
+    async def test_source_inference_never_overrides_explicit_chaturbate_identity(self):
+        await self.db.upsert_followed_model("alice", source_type="stripchat")
+        original_db = app_main.db
+        app_main.db = self.db
+        try:
+            explicit = await app_main._infer_source_type(
+                "alice",
+                {"username": "alice", "source_type": "chaturbate"},
+            )
+            inferred = await app_main._infer_source_type("alice")
+        finally:
+            app_main.db = original_db
+
+        self.assertEqual("chaturbate", explicit)
+        self.assertEqual("stripchat", inferred)
 
 
 if __name__ == "__main__":

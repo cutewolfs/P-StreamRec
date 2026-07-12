@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .core.config import MIN_RECORDING_SECONDS
 from .logger import logger
@@ -64,6 +64,7 @@ class BrowserCaptureSession:
         session_store=None,
         target: Optional[str] = None,
         session_key: Optional[str] = None,
+        on_complete: Optional[Callable[["BrowserCaptureSession"], None]] = None,
     ):
         self.id = session_id
         self.source_type = source_type
@@ -77,6 +78,7 @@ class BrowserCaptureSession:
         self.record = bool(record)
         self.browser_root = browser_root
         self.session_store = session_store
+        self.on_complete = on_complete
         self.file_extension = (file_extension or "webm").strip(".").lower() or "webm"
         self.filename_format = filename_format
         self.created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -100,6 +102,8 @@ class BrowserCaptureSession:
         self._thread: Optional[threading.Thread] = None
         self._subscribers: list[queue.Queue[bytes]] = []
         self._first_chunk: Optional[bytes] = None
+        self._completion_notified = False
+        self._index_future = None
 
     def _unique_record_base(self, base: str) -> str:
         first_path = self.records_dir_for_person / f"{base}.{self.file_extension}"
@@ -186,6 +190,9 @@ class BrowserCaptureSession:
     def is_running(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and not self._done_evt.is_set())
 
+    def thread_is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def seconds_since_progress(self) -> float:
         return max(0.0, time.time() - self.last_progress_at)
 
@@ -198,10 +205,31 @@ class BrowserCaptureSession:
             raise RuntimeError(self.error)
         return self.bytes_written > 0 or (not self.record and self._first_chunk is not None)
 
-    def stop(self, timeout: float = 10) -> None:
+    def stop(self, timeout: float = 10) -> bool:
         self._stop_evt.set()
-        if self._thread and self._thread.is_alive():
+        if self.thread_is_alive():
             self._thread.join(timeout=timeout)
+        return not self.thread_is_alive()
+
+    def _complete(self) -> None:
+        with self._lock:
+            if self._completion_notified:
+                return
+            self._completion_notified = True
+            callback = self.on_complete
+        self.completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        self._cleanup_short_recording()
+        if callback:
+            try:
+                callback(self)
+            except Exception as exc:
+                logger.error(
+                    "Browser capture completion callback failed",
+                    session_id=self.id,
+                    person=self.person,
+                    error=str(exc),
+                )
+        self._done_evt.set()
 
     def subscribe(self) -> queue.Queue[bytes]:
         q: queue.Queue[bytes] = queue.Queue(maxsize=90)
@@ -442,9 +470,7 @@ class BrowserCaptureSession:
                     await browser.close()
             except Exception:
                 pass
-            self.completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            self._done_evt.set()
-            self._cleanup_short_recording()
+            self._complete()
 
     def _cleanup_short_recording(self) -> None:
         if not self.record:
@@ -560,9 +586,7 @@ class BrowserWebSocketMP4CaptureSession(BrowserCaptureSession):
                     await browser.close()
             except Exception:
                 pass
-            self.completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            self._done_evt.set()
-            self._cleanup_short_recording()
+            self._complete()
 
 
 class BrowserCaptureManager:
@@ -587,6 +611,7 @@ class BrowserCaptureManager:
         records_dir_for_person: Optional[Path] = None,
         target: Optional[str] = None,
         session_key: Optional[str] = None,
+        on_complete: Optional[Callable[[BrowserCaptureSession], None]] = None,
     ) -> BrowserCaptureSession:
         with self._lock:
             self._prune_finished_locked()
@@ -626,6 +651,7 @@ class BrowserCaptureManager:
                 session_store=self.session_store,
                 target=target,
                 session_key=session_key,
+                on_complete=on_complete,
             )
             session.capture_mode = (capture_mode or "media_recorder").strip().lower()
             self._sessions[session_id] = session
@@ -642,9 +668,10 @@ class BrowserCaptureManager:
             session = self._sessions.get(session_id)
         if not session:
             return False
-        session.stop()
-        with self._lock:
-            self._sessions.pop(session_id, None)
+        finished = session.stop()
+        if finished:
+            with self._lock:
+                self._sessions.pop(session_id, None)
         return True
 
     def stop_live_if_idle(self, session_id: str) -> None:

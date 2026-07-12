@@ -297,6 +297,32 @@ class HlsProxyTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("#EXTM3U\n", response.text)
 
+    def test_chaturbate_status_is_protected_when_password_is_enabled(self):
+        original_password = main.PASSWORD
+        main.PASSWORD = "secret"
+        try:
+            response = TestClient(main.app).get("/api/chaturbate/status")
+        finally:
+            main.PASSWORD = original_password
+
+        self.assertEqual(401, response.status_code)
+
+    def test_legacy_model_page_redirects_and_static_copy_is_removed(self):
+        client = TestClient(main.app)
+        response = client.get(
+            "/model.html?username=alice&source=chaturbate",
+            follow_redirects=False,
+        )
+
+        self.assertEqual(308, response.status_code)
+        self.assertEqual(
+            "/watch/alice?source=chaturbate",
+            response.headers["location"],
+        )
+        missing_username = client.get("/model.html", follow_redirects=False)
+        self.assertEqual("/", missing_username.headers["location"])
+        self.assertEqual(404, client.get("/static/model.html").status_code)
+
     def test_hls_proxy_retries_upstream_without_cookie_on_403(self):
         class FakeResp:
             def __init__(self, status, body=b"segment", url="https://edge.example.test/seg.ts"):

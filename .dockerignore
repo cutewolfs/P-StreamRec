@@ -1,0 +1,14 @@
+.git
+.github
+.claude
+.env*
+.DS_Store
+**/.DS_Store
+**/__pycache__
+**/*.py[cod]
+data
+data-dev
+tests
+*.png
+docker-compose*.yml
+static/media 2.js

@@ -17,10 +17,11 @@ import secrets
 import hashlib
 import http.client
 import socket as raw_socket
+import ipaddress
 from html import unescape
 
 from fastapi import FastAPI, HTTPException, Request, Cookie, Response
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 from .browser_recorder import BrowserCaptureManager
 from .ffmpeg_runner import FFmpegManager
 from .logger import logger
+from .subprocess_utils import communicate_with_timeout
 from .core.database import Database
 from .core.config import MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
 from .core.utils import format_bytes
@@ -42,6 +44,7 @@ from .tasks.monitor import (
     normalize_check_interval_seconds,
 )
 from .tasks.convert import auto_convert_recordings_task
+from .tasks.retention import cleanup_retention_job
 from .tasks.media_imports import (
     DEFAULT_MIN_AGE_SECONDS,
     DIRECT_PLAYABLE_EXTENSIONS,
@@ -71,7 +74,6 @@ from .providers import (
     ProviderInteractionRequired,
     ProviderOfflineError,
     ProviderPrivateError,
-    ProviderRegistry,
     ProviderStatus,
     ResolvedStream,
     create_provider_registry,
@@ -133,6 +135,7 @@ _IVS_PLAYER_ASSET_CACHE: dict[str, dict[str, object]] = {}
 
 # Docker constants
 DOCKER_SOCKET = '/var/run/docker.sock'
+DOCKER_UPDATE_ENABLED = os.getenv("PSTREAMREC_ALLOW_DOCKER_UPDATE", "false").lower() in {"1", "true", "yes"}
 DOCKER_IMAGE = 'ghcr.io/raccommode/p-streamrec'
 
 
@@ -244,7 +247,7 @@ def generate_session_token() -> str:
 
 def verify_password(provided_password: str) -> bool:
     """Vérifie si le mot de passe fourni correspond"""
-    return provided_password == PASSWORD
+    return secrets.compare_digest(str(provided_password), str(PASSWORD))
 
 def is_authenticated(session_token: Optional[str]) -> bool:
     """Vérifie si la session est valide"""
@@ -257,7 +260,7 @@ def is_authenticated(session_token: Optional[str]) -> bool:
 async def auth_middleware(request: Request, call_next):
     # Routes publiques (pas besoin d'authentification)
     public_paths = ["/login", "/api/login", "/favicon.ico"]
-    public_prefixes = ["/static/", "/api/chaturbate/status", "/api/proxy/hls/"]
+    public_prefixes = ["/static/", "/api/proxy/hls/"]
 
     if request.url.path in public_paths or any(
         request.url.path.startswith(p) for p in public_prefixes
@@ -695,6 +698,124 @@ def _normalize_profile_image_url(value: object) -> Optional[str]:
     return raw
 
 
+def _validate_public_http_url(url: str) -> str:
+    raw = str(url or "").strip()
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid remote image URL")
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or hostname == "localhost"
+        or hostname.endswith(".localhost")
+        or hostname.endswith(".local")
+    ):
+        raise HTTPException(status_code=400, detail="Remote image URL is not allowed")
+    try:
+        address = ipaddress.ip_address(hostname.split("%", 1)[0])
+    except ValueError:
+        address = None
+    if address is not None:
+        mapped = getattr(address, "ipv4_mapped", None)
+        if mapped is not None:
+            address = mapped
+        if not address.is_global:
+            raise HTTPException(status_code=400, detail="Remote image URL is not allowed")
+    if port is not None and not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="Invalid remote image URL")
+    return raw
+
+
+class _PublicAddressResolver:
+    """Reject non-public DNS answers at the point aiohttp opens a socket."""
+
+    def __init__(self):
+        self._resolver = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=raw_socket.AF_INET):
+        results = await self._resolver.resolve(host, port, family)
+        if not results:
+            raise OSError("Remote image host did not resolve")
+        for result in results:
+            raw_address = str(result.get("host") or "").split("%", 1)[0]
+            try:
+                address = ipaddress.ip_address(raw_address)
+            except ValueError as exc:
+                raise OSError("Remote image host returned an invalid address") from exc
+            mapped = getattr(address, "ipv4_mapped", None)
+            if mapped is not None:
+                address = mapped
+            if not address.is_global:
+                raise OSError("Remote image host resolved to a non-public address")
+        return results
+
+    async def close(self):
+        await self._resolver.close()
+
+
+async def _fetch_public_http_bytes(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout_seconds: int,
+    max_bytes: int,
+) -> dict:
+    current_url = _validate_public_http_url(url)
+    resolver = _PublicAddressResolver()
+    connector = aiohttp.TCPConnector(resolver=resolver, use_dns_cache=True)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers=headers,
+            connector=connector,
+            trust_env=False,
+        ) as session:
+            for redirect_count in range(6):
+                current_url = _validate_public_http_url(current_url)
+                async with session.get(current_url, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location or redirect_count >= 5:
+                            raise HTTPException(status_code=400, detail="Remote image redirect is not allowed")
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    content_length = response.headers.get("Content-Length")
+                    try:
+                        if content_length is not None and int(content_length) > max_bytes:
+                            raise HTTPException(status_code=413, detail="Remote image response is too large")
+                    except ValueError:
+                        pass
+
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(256 * 1024):
+                        if not chunk:
+                            continue
+                        body.extend(chunk)
+                        if len(body) > max_bytes:
+                            raise HTTPException(status_code=413, detail="Remote image response is too large")
+                    return {
+                        "status": response.status,
+                        "body": bytes(body),
+                        "contentType": (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower(),
+                        "url": str(response.url),
+                    }
+    except HTTPException:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        logger.warning("Remote profile image request blocked or failed", error=str(exc))
+        raise HTTPException(status_code=400, detail="Remote image host is not reachable or allowed")
+
+    raise HTTPException(status_code=400, detail="Remote image redirect is not allowed")
+
+
 def _normalize_profile_source_url(value: object) -> Optional[str]:
     raw = str(value or "").strip()
     if not raw:
@@ -1031,13 +1152,16 @@ def _extract_babepedia_image_url(html: str, page_url: str) -> Optional[str]:
 
 
 async def _fetch_text_url(url: str) -> str:
-    timeout = aiohttp.ClientTimeout(total=20)
     headers = {"User-Agent": BABEPEDIA_USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    async with aiohttp_client_session(timeout=timeout, headers=headers) as session:
-        async with session.get(url, **aiohttp_request_kwargs()) as response:
-            if response.status >= 400:
-                raise HTTPException(status_code=404, detail="Profile image source not found")
-            return await response.text(errors="ignore")
+    response = await _fetch_public_http_bytes(
+        url,
+        headers=headers,
+        timeout_seconds=20,
+        max_bytes=2 * 1024 * 1024,
+    )
+    if response["status"] >= 400:
+        raise HTTPException(status_code=404, detail="Profile image source not found")
+    return response["body"].decode("utf-8", errors="ignore")
 
 
 def _profile_image_extension(url: str, content_type: str) -> str:
@@ -1053,32 +1177,27 @@ def _profile_image_extension(url: str, content_type: str) -> str:
 
 
 async def _download_profile_image(username: str, image_url: str) -> dict:
-    timeout = aiohttp.ClientTimeout(total=30)
     headers = {"User-Agent": BABEPEDIA_USER_AGENT, "Accept": "image/avif,image/webp,image/*,*/*;q=0.8"}
-    async with aiohttp_client_session(timeout=timeout, headers=headers) as session:
-        async with session.get(image_url, **aiohttp_request_kwargs()) as response:
-            if response.status >= 400:
-                raise HTTPException(status_code=404, detail="Profile image could not be downloaded")
+    response = await _fetch_public_http_bytes(
+        image_url,
+        headers=headers,
+        timeout_seconds=30,
+        max_bytes=PROFILE_IMAGE_MAX_BYTES,
+    )
+    if response["status"] >= 400:
+        raise HTTPException(status_code=404, detail="Profile image could not be downloaded")
 
-            content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-            if content_type and not content_type.startswith("image/"):
-                raise HTTPException(status_code=400, detail="Profile image source did not return an image")
+    content_type = response["contentType"]
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Profile image source did not return an image")
 
-            extension = _profile_image_extension(str(response.url), content_type)
-            PROFILE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-            destination = PROFILE_IMAGES_DIR / f"{username}{extension}"
-            temporary = destination.with_suffix(destination.suffix + ".tmp")
-            size = 0
-            with temporary.open("wb") as fh:
-                async for chunk in response.content.iter_chunked(1024 * 256):
-                    if not chunk:
-                        continue
-                    size += len(chunk)
-                    if size > PROFILE_IMAGE_MAX_BYTES:
-                        temporary.unlink(missing_ok=True)
-                        raise HTTPException(status_code=413, detail="Profile image is too large")
-                    fh.write(chunk)
-            temporary.replace(destination)
+    extension = _profile_image_extension(response["url"], content_type)
+    PROFILE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    destination = PROFILE_IMAGES_DIR / f"{username}{extension}"
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    temporary.write_bytes(response["body"])
+    temporary.replace(destination)
+    size = len(response["body"])
 
     return {
         "path": str(destination),
@@ -1321,6 +1440,10 @@ async def _ensure_media_library_video_metadata(
     if media_kind == "import":
         protected_from_retention = True
 
+    is_converted = bool(playable_path) if media_kind == "import" and source_changed else bool(
+        current.get("is_converted") or playable_path
+    )
+
     await db.add_or_update_recording(
         username=username,
         filename=media_path.name,
@@ -1331,7 +1454,7 @@ async def _ensure_media_library_video_metadata(
         thumbnail_path=thumbnail_path,
         mp4_path=mp4_path,
         mp4_size=mp4_size,
-        is_converted=bool(current.get("is_converted") or playable_path),
+        is_converted=is_converted,
         media_kind=media_kind,
         title=title,
         import_status=import_status,
@@ -1341,6 +1464,7 @@ async def _ensure_media_library_video_metadata(
         playable_size=playable_size,
         protected_from_retention=protected_from_retention,
         created_at=created_at,
+        replace_media_paths=bool(media_kind == "import" and source_changed),
     )
 
     current.update({
@@ -1353,7 +1477,7 @@ async def _ensure_media_library_video_metadata(
         "thumbnail_path": thumbnail_path or current.get("thumbnail_path"),
         "mp4_path": mp4_path,
         "mp4_size": mp4_size,
-        "is_converted": bool(current.get("is_converted") or playable_path),
+        "is_converted": is_converted,
         "media_kind": media_kind,
         "title": title,
         "import_status": import_status,
@@ -1492,7 +1616,6 @@ async def _scan_media_library_items(
     profile_username: Optional[str] = None,
     refresh_metadata: bool = True,
 ) -> list[dict]:
-    from .core.utils import format_bytes
 
     records_root = OUTPUT_DIR / "records"
     if not records_root.exists():
@@ -1950,9 +2073,9 @@ async def _infer_source_type(
     username: Optional[str],
     model: Optional[dict] = None,
 ) -> str:
-    """Pick the platform for a username, repairing old CAM4 rows when possible."""
+    """Pick the platform without overriding an explicit provider identity."""
     model_source = _normalize_source_type(model.get("source_type") if model else None)
-    if model_source and model_source != "chaturbate":
+    if model_source:
         return model_source
 
     if username:
@@ -1961,10 +2084,7 @@ async def _infer_source_type(
             followed_source = _normalize_source_type(
                 followed.get("source_type") if followed else None
             )
-            if followed_source and (
-                not model_source
-                or (model_source == "chaturbate" and followed_source != "chaturbate")
-            ):
+            if followed_source:
                 return followed_source
         except Exception:
             pass
@@ -2357,6 +2477,26 @@ def _ffmpeg_stream_input(stream: ResolvedStream) -> tuple[str, Optional[dict[str
     return stream.url, stream.headers, stream.url
 
 
+def _browser_capture_completion_callback(loop):
+    """Schedule final indexing on the server loop from the capture thread."""
+    def completed(session) -> None:
+        if not getattr(session, "record", False):
+            return
+        index_coro = _index_browser_capture_recording(session)
+        try:
+            session._index_future = asyncio.run_coroutine_threadsafe(index_coro, loop)
+        except Exception as exc:
+            index_coro.close()
+            logger.warning(
+                "Planification indexation browser recording échouée",
+                session_id=getattr(session, "id", None),
+                person=getattr(session, "person", None),
+                error=str(exc),
+            )
+
+    return completed
+
+
 def _start_browser_capture(
     source_type: str,
     target: str,
@@ -2377,6 +2517,10 @@ def _start_browser_capture(
     else:
         page_url = provider.canonical_url(target)
     capture_mode = "websocket_mp4" if normalized_source == "livejasmin" else "media_recorder"
+    try:
+        completion_callback = _browser_capture_completion_callback(asyncio.get_running_loop())
+    except RuntimeError:
+        completion_callback = None
     return browser_capture_manager.start_session(
         source_type=source_type,
         page_url=page_url,
@@ -2388,6 +2532,7 @@ def _start_browser_capture(
         records_dir_for_person=records_dir_for_person,
         target=target_username or target,
         session_key=session_key,
+        on_complete=completion_callback,
     )
 
 
@@ -2532,7 +2677,7 @@ async def _remux_browser_recording(record_path: Path) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        stdout, stderr = await communicate_with_timeout(proc, 120)
         if proc.returncode != 0:
             logger.warning(
                 "Remux browser recording échoué",
@@ -2576,7 +2721,7 @@ def load_models():
         try:
             with open(MODELS_FILE, 'r') as f:
                 return json.load(f)
-        except:
+        except Exception:
             return []
     return []
 
@@ -2865,6 +3010,7 @@ async def get_version():
         "version": version,
         "output_dir": str(OUTPUT_DIR),
         "ffmpeg_path": FFMPEG_PATH,
+        "authentication_required": bool(PASSWORD),
         "check_interval": check_interval,
         "check_interval_seconds": check_interval,
     }
@@ -3059,8 +3205,22 @@ async def restart_application():
 
 
 @app.get("/model.html")
-async def model_page():
-    return FileResponse(str(STATIC_DIR / "model.html"))
+async def model_page(request: Request):
+    """Redirect the retired legacy player to the maintained Watch page."""
+    username = str(request.query_params.get("username") or "").strip()
+    if not username:
+        return RedirectResponse("/", status_code=308)
+    target = f"/watch/{quote(username, safe='')}"
+    remaining_query = urlencode(
+        [
+            (key, value)
+            for key, value in request.query_params.multi_items()
+            if key != "username"
+        ]
+    )
+    if remaining_query:
+        target = f"{target}?{remaining_query}"
+    return RedirectResponse(target, status_code=308)
 
 
 @app.api_route("/vendor/{asset_name}", methods=["GET", "HEAD"])
@@ -3500,6 +3660,7 @@ async def provider_sync_following(source_type: str):
         "synced": stored["synced"],
         "sourceType": source_type,
         "trusted": stored["trusted"],
+        "authoritative": stored["authoritative"],
         "skippedReason": stored["skippedReason"],
         "repairedSources": repaired_sources,
         "message": (
@@ -3718,7 +3879,7 @@ async def api_start(body: StartBody):
                 )
                 ready = await asyncio.to_thread(sess.wait_until_ready, 35)
                 if not ready:
-                    browser_capture_manager.stop_session(sess.id)
+                    await asyncio.to_thread(browser_capture_manager.stop_session, sess.id)
                     raise RuntimeError("Aucun flux video capturable dans le navigateur")
                 duration_ms = (time.time() - start_time) * 1000
                 logger.success(
@@ -3791,7 +3952,8 @@ async def api_start(body: StartBody):
     segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
     logger.subsection("Démarrage Session FFmpeg")
     try:
-        sess = manager.start_session(
+        sess = await asyncio.to_thread(
+            manager.start_session,
             m3u8_url,
             person=person,
             display_name=body.name,
@@ -3841,14 +4003,16 @@ async def api_status():
 @app.post("/api/stop/{session_id}")
 async def api_stop(session_id: str):
     ffmpeg_session = manager.get_session(session_id)
-    ok = manager.stop_session(session_id)
+    ok = await asyncio.to_thread(manager.stop_session, session_id)
     if ok and ffmpeg_session:
         await _index_ffmpeg_recording(ffmpeg_session)
     if not ok:
         browser_session = browser_capture_manager.get(session_id)
-        ok = browser_capture_manager.stop_session(session_id)
+        ok = await asyncio.to_thread(browser_capture_manager.stop_session, session_id)
         if ok and browser_session:
-            await _index_browser_capture_recording(browser_session)
+            index_future = getattr(browser_session, "_index_future", None)
+            if index_future is not None:
+                await asyncio.wrap_future(index_future)
     if not ok:
         raise HTTPException(status_code=404, detail="Session introuvable")
     return {"stopped": True, "id": session_id}
@@ -4060,7 +4224,7 @@ async def api_process_log(session_id: str, lines: int = 30):
 @app.post("/api/processes/{session_id}/stop")
 async def api_process_stop(session_id: str):
     """Graceful stop (SIGTERM, then SIGKILL on timeout). Same as /api/stop."""
-    ok = manager.stop_session(session_id)
+    ok = await asyncio.to_thread(manager.stop_session, session_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Session introuvable")
     return {"stopped": True, "session_id": session_id}
@@ -4075,14 +4239,14 @@ async def api_process_kill(session_id: str):
     proc = getattr(sess, "process", None)
     if not proc or proc.poll() is not None:
         # Already gone — fall back to graceful stop to clean up bookkeeping
-        manager.stop_session(session_id)
+        await asyncio.to_thread(manager.stop_session, session_id)
         return {"killed": False, "reason": "already-exited", "session_id": session_id}
     try:
         proc.kill()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur kill: {e}")
     # Run the manager's stop to release locks / threads
-    manager.stop_session(session_id)
+    await asyncio.to_thread(manager.stop_session, session_id)
     return {"killed": True, "session_id": session_id}
 
 
@@ -4099,7 +4263,7 @@ async def api_process_restart(session_id: str):
     if not sess:
         raise HTTPException(status_code=404, detail="Session introuvable")
     person = sess.person
-    ok = manager.stop_session(session_id)
+    ok = await asyncio.to_thread(manager.stop_session, session_id)
     if not ok:
         raise HTTPException(status_code=500, detail="Stop échoué")
     return {
@@ -4216,7 +4380,7 @@ async def get_model_stream(username: str, source: Optional[str] = None):
                 )
                 ready = await asyncio.to_thread(sess.wait_until_ready, 35)
                 if not ready:
-                    browser_capture_manager.stop_session(sess.id)
+                    await asyncio.to_thread(browser_capture_manager.stop_session, sess.id)
                     raise RuntimeError("Aucun flux video capturable dans le navigateur")
             except Exception as e:
                 raise HTTPException(status_code=404, detail=_provider_error_detail(source_type, username, e))
@@ -4323,7 +4487,6 @@ def _format_size_display(file_size: int) -> str:
 
 
 def _format_import_recording(rec: dict, username: str) -> Optional[dict]:
-    from .core.utils import format_bytes
 
     source_path = Path(rec.get("file_path") or "")
     if not source_path.exists():
@@ -4377,7 +4540,6 @@ def _format_import_recording(rec: dict, username: str) -> Optional[dict]:
 async def list_recordings(username: str, show_ts: bool = False):
     """Liste les enregistrements (MP4 convertis ou TS bruts)"""
     from datetime import datetime
-    from .core.utils import format_bytes
 
     # Récupérer depuis SQLite
     recordings_db = await db.get_recordings(username)
@@ -4402,8 +4564,8 @@ async def list_recordings(username: str, show_ts: bool = False):
             file_size = rec.get('mp4_size') or serve_path.stat().st_size
         elif ts_raw and Path(ts_raw).exists():
             serve_path = Path(ts_raw)
-            # Skip raw TS files unless show_ts is enabled. Browser captures are
-            # written as WebM and are directly playable, so keep them visible.
+            # Only raw transport streams are opt-in. Browser captures are
+            # written as WebM/MP4 and remain directly playable by default.
             if serve_path.suffix.lower() == ".ts" and not show_ts:
                 continue
             file_size = rec.get('file_size') or serve_path.stat().st_size
@@ -4544,7 +4706,6 @@ async def get_media_library(
     offset: int = 0,
 ):
     """Liste les médias présents dans les dossiers records."""
-    from .core.utils import format_bytes
 
     metadata_mode = (metadata or "full").strip().lower()
     refresh_metadata = metadata_mode not in {"lazy", "fast", "0", "false", "no"}
@@ -4708,18 +4869,23 @@ async def get_media_library(
     sort_key = (sort or "newest").strip().lower()
     reverse = True
     if sort_key == "oldest":
-        key_func = lambda item: item["createdAt"]
+        def key_func(item):
+            return item["createdAt"]
         reverse = False
     elif sort_key == "largest":
-        key_func = lambda item: item["size"]
+        def key_func(item):
+            return item["size"]
     elif sort_key == "smallest":
-        key_func = lambda item: item["size"]
+        def key_func(item):
+            return item["size"]
         reverse = False
     elif sort_key == "name":
-        key_func = lambda item: (item["title"].lower(), item["filename"].lower())
+        def key_func(item):
+            return (item["title"].lower(), item["filename"].lower())
         reverse = False
     else:
-        key_func = lambda item: item["createdAt"]
+        def key_func(item):
+            return item["createdAt"]
 
     filtered = sorted(filtered, key=key_func, reverse=reverse)
     total = len(filtered)
@@ -5130,6 +5296,20 @@ def _path_is_inside_output(path: Path) -> bool:
         return False
 
 
+def _recording_delete_path_is_allowed(path: Path, username: str) -> bool:
+    """Limit regular recording deletion to this profile's media directories."""
+    try:
+        resolved = path.resolve()
+        profile_part = _clean_record_path_part(username)
+        record_profile_root = (_records_root() / profile_part).resolve()
+        thumbnail_profile_root = (OUTPUT_DIR / "thumbnails" / username).resolve()
+        return resolved.is_relative_to(record_profile_root) or resolved.is_relative_to(
+            thumbnail_profile_root
+        )
+    except Exception:
+        return False
+
+
 async def _find_recording_for_media_path(username: str, media_path: Path, relative_path: str) -> Optional[dict]:
     target_key = _resolved_path_key(str(media_path))
     recordings = await db.get_recordings(username)
@@ -5258,7 +5438,6 @@ async def get_all_recordings(
     show_ts: bool = False
 ):
     """Get all recordings across all models with pagination"""
-    from .core.utils import format_bytes
 
     result = await db.get_all_recordings_paginated(
         page=page,
@@ -5286,10 +5465,11 @@ async def get_all_recordings(
             serve_file = Path(mp4_raw)
             file_size = rec.get("mp4_size") or serve_file.stat().st_size
         elif ts_raw and Path(ts_raw).exists():
-            # Skip TS files unless show_ts is enabled
-            if not show_ts:
-                continue
             serve_file = Path(ts_raw)
+            # Only raw TS files are opt-in; browser WebM/MP4 captures are
+            # directly playable and should stay visible in the default view.
+            if serve_file.suffix.lower() == ".ts" and not show_ts:
+                continue
             file_size = rec.get("file_size") or serve_file.stat().st_size
         else:
             continue
@@ -5350,14 +5530,29 @@ async def get_all_recordings(
 async def get_recording_thumbnail(username: str, filename: str):
     """Récupère la miniature d'un enregistrement"""
     from fastapi.responses import FileResponse, Response
-    
-    # Sécurité
-    if ".." in filename or "/" in filename:
+
+    username = _validate_media_profile_username(username)
+    if (
+        not filename
+        or ".." in filename
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or Path(filename).name != filename
+        or Path(filename).suffix.lower() not in {".jpg", ".jpeg"}
+    ):
         raise HTTPException(status_code=400, detail="Nom invalide")
-    
-    thumb_path = OUTPUT_DIR / "thumbnails" / username / filename
-    
-    if thumb_path.exists():
+
+    thumbnails_root = (OUTPUT_DIR / "thumbnails").resolve()
+    profile_root = (thumbnails_root / username).resolve()
+    thumb_path = (profile_root / filename).resolve()
+    if (
+        not profile_root.is_relative_to(thumbnails_root)
+        or not thumb_path.is_relative_to(profile_root)
+    ):
+        raise HTTPException(status_code=403, detail="Thumbnail path is not allowed")
+
+    if thumb_path.exists() and thumb_path.is_file():
         return FileResponse(
             path=str(thumb_path),
             media_type="image/jpeg",
@@ -5365,7 +5560,7 @@ async def get_recording_thumbnail(username: str, filename: str):
         )
     
     # Placeholder SVG si pas de miniature
-    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180">
+    svg = '''<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180">
         <rect fill="#1a1f3a" width="320" height="180"/>
         <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#a0aec0" font-size="16">📹 Génération...</text>
     </svg>'''
@@ -5595,11 +5790,16 @@ async def delete_model(username: str, source: Optional[str] = None):
 @app.delete("/api/recordings/{username}/{filename}")
 async def delete_recording(username: str, filename: str):
     """Supprime un enregistrement (TS + MP4 + miniature + DB)"""
-    from fastapi.responses import Response
-    from datetime import datetime
     
-    # Sécurité
-    if ".." in filename or "/" in filename:
+    username = _validate_media_profile_username(username)
+    if (
+        not filename
+        or ".." in filename
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or Path(filename).name != filename
+    ):
         raise HTTPException(status_code=400, detail="Nom invalide")
 
     existing_recs = await db.get_recordings(username)
@@ -5677,8 +5877,8 @@ async def delete_recording(username: str, filename: str):
             if not key or key in seen_paths:
                 continue
             seen_paths.add(key)
-            if not _path_is_inside_output(path):
-                logger.warning("Suppression recording hors volume ignorée", username=username, path=str(path))
+            if not _recording_delete_path_is_allowed(path, username):
+                logger.warning("Suppression recording hors profil ignorée", username=username, path=str(path))
                 continue
             if path.exists() and path.is_file():
                 path.unlink()
@@ -5897,7 +6097,7 @@ async def get_system_stats():
 async def check_for_update():
     """Check GitHub for the latest release and compare with current version."""
     current_version = os.getenv("APP_VERSION", "dev")
-    docker_available = os.path.exists(DOCKER_SOCKET)
+    docker_available = DOCKER_UPDATE_ENABLED and bool(PASSWORD) and os.path.exists(DOCKER_SOCKET)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -5940,11 +6140,15 @@ async def check_for_update():
 @app.post("/api/system/update")
 async def perform_system_update():
     """Pull latest Docker image and recreate the container via docker compose."""
+    if not DOCKER_UPDATE_ENABLED:
+        raise HTTPException(status_code=404, detail="Automatic Docker updates are disabled")
+    if not PASSWORD:
+        raise HTTPException(status_code=403, detail="Automatic Docker updates require password protection")
     if not os.path.exists(DOCKER_SOCKET):
         return {
             "success": False,
             "error": "docker_socket_unavailable",
-            "message": "Docker socket not available. Add this volume to your docker-compose.yml to enable automatic updates: /var/run/docker.sock:/var/run/docker.sock",
+            "message": "Docker socket not available. Mount it explicitly only on a password-protected deployment.",
             "manual_commands": "docker compose pull && docker compose up -d",
         }
 
@@ -6596,29 +6800,132 @@ async def save_playback_position(recording_id: str, body: dict):
 # Recordings grouped by model
 # ============================================
 
+def _recording_group_visible(rec: dict, show_ts: bool) -> bool:
+    file_suffix = Path(str(rec.get("file_path") or "")).suffix.lower()
+    return bool(
+        show_ts
+        or rec.get("media_kind") == "import"
+        or rec.get("is_converted")
+        or rec.get("mp4_path") is not None
+        or file_suffix != ".ts"
+    )
+
+
+def _recording_model_identity(model: dict) -> tuple[str, str]:
+    return (
+        str(model.get("username") or ""),
+        _normalize_source_type(model.get("source_type")) or "chaturbate",
+    )
+
+
+def _legacy_recording_model(models: list[dict]) -> dict:
+    """Choose a stable owner when a legacy recording has no provider key."""
+    return sorted(
+        models,
+        key=lambda model: (
+            0 if _recording_model_identity(model)[1] == "chaturbate" else 1,
+            _recording_model_identity(model)[1],
+            str(model.get("record_path") or ""),
+        ),
+    )[0]
+
+
+def _recording_models_for_path(rec: dict, models: list[dict]) -> list[dict]:
+    raw_path = rec.get("file_path") or rec.get("playable_path") or rec.get("mp4_path")
+    if not raw_path:
+        return []
+    try:
+        recording_path = Path(raw_path).resolve()
+    except Exception:
+        return []
+
+    matches: list[tuple[int, dict]] = []
+    for model in models:
+        try:
+            model_root = _model_record_dir(
+                model, str(model.get("username") or "")
+            ).resolve()
+            if recording_path.is_relative_to(model_root):
+                matches.append((len(model_root.parts), model))
+        except Exception:
+            continue
+    if not matches:
+        return []
+    most_specific_depth = max(depth for depth, _model in matches)
+    return [model for depth, model in matches if depth == most_specific_depth]
+
+
+def _summarize_recording_rows(username: str, records: list[dict], source_type: str) -> dict:
+    created_values = [int(rec.get("created_at") or 0) for rec in records]
+    return {
+        "username": username,
+        "source_type": source_type,
+        "recording_count": len(records),
+        "total_size": sum(
+            int(rec.get("playable_size") or rec.get("mp4_size") or rec.get("file_size") or 0)
+            for rec in records
+        ),
+        "last_recording_at": max(created_values, default=0) or None,
+        "total_duration": sum(int(rec.get("duration_seconds") or 0) for rec in records),
+    }
+
+
 @app.get("/api/recordings-by-model")
 async def get_recordings_by_model(show_ts: bool = False):
     """Get recordings grouped by model with stats, including models with 0 recordings"""
     groups = await db.get_recordings_grouped_by_model(show_ts=show_ts)
 
-    # Build a lookup of auto_record status
     all_models = await db.get_all_models()
-    auto_record_map = {m["username"]: bool(m.get("auto_record")) for m in all_models}
-    source_type_map = {
-        m["username"]: await _infer_source_type(m.get("username"), m)
-        for m in all_models
-    }
+    models_by_identity = {_recording_model_identity(model): model for model in all_models}
+    models_by_username: dict[str, list[dict]] = {}
+    for model in all_models:
+        models_by_username.setdefault(str(model.get("username") or ""), []).append(model)
 
-    # Build a set of usernames that have recordings
-    usernames_with_recordings = set()
+    provider_groups: list[dict] = []
+    for group in groups:
+        username = str(group.get("username") or "")
+        candidate_models = models_by_username.get(username, [])
+        if len(candidate_models) <= 1:
+            source_type = (
+                _recording_model_identity(candidate_models[0])[1]
+                if candidate_models
+                else await _infer_source_type(username)
+            )
+            provider_groups.append({**group, "source_type": source_type})
+            continue
+
+        # Recordings predate provider-aware model identities. Distinct custom
+        # record paths let us preserve their provider association. If multiple
+        # providers share the same legacy path, assign those ambiguous rows to
+        # a deterministic Chaturbate-first owner and expose the others as empty.
+        canonical_model = _legacy_recording_model(candidate_models)
+        rows_by_identity: dict[tuple[str, str], list[dict]] = {}
+        for rec in await db.get_recordings(username):
+            if not _recording_group_visible(rec, show_ts):
+                continue
+            path_matches = _recording_models_for_path(rec, candidate_models)
+            owner = path_matches[0] if len(path_matches) == 1 else canonical_model
+            rows_by_identity.setdefault(_recording_model_identity(owner), []).append(rec)
+
+        split_groups = [
+            _summarize_recording_rows(identity[0], records, identity[1])
+            for identity, records in rows_by_identity.items()
+        ]
+        split_groups.sort(key=lambda item: int(item.get("last_recording_at") or 0), reverse=True)
+        provider_groups.extend(split_groups)
+
+    identities_with_recordings: set[tuple[str, str]] = set()
 
     # Any model with recordings is shown here, regardless of auto_record status.
     # auto_record only controls whether NEW recordings are triggered; past
     # recordings should never disappear from the list (GH #13).
     result = []
-    for group in groups:
+    for group in provider_groups:
         username = group["username"]
-        usernames_with_recordings.add(username)
+        source_type = _normalize_source_type(group.get("source_type")) or "chaturbate"
+        identity = (username, source_type)
+        identities_with_recordings.add(identity)
+        model = models_by_identity.get(identity)
         thumb_url = f"/api/thumbnail/{username}"
         result.append({
             "username": username,
@@ -6627,15 +6934,15 @@ async def get_recordings_by_model(show_ts: bool = False):
             "lastRecordingAt": group["last_recording_at"],
             "totalDuration": group["total_duration"],
             "thumbnail": thumb_url,
-            "autoRecord": auto_record_map.get(username, True),
-            "sourceType": source_type_map.get(username, "chaturbate"),
-            "source_type": source_type_map.get(username, "chaturbate"),
+            "autoRecord": bool(model.get("auto_record")) if model else True,
+            "sourceType": source_type,
+            "source_type": source_type,
         })
 
     # Also include tracked models (auto_record=1) that have 0 recordings
     for model in all_models:
-        username = model["username"]
-        if username not in usernames_with_recordings and model.get("auto_record"):
+        username, source_type = _recording_model_identity(model)
+        if (username, source_type) not in identities_with_recordings and model.get("auto_record"):
             result.append({
                 "username": username,
                 "recordingCount": 0,
@@ -6644,8 +6951,8 @@ async def get_recordings_by_model(show_ts: bool = False):
                 "totalDuration": 0,
                 "thumbnail": f"/api/thumbnail/{username}",
                 "autoRecord": True,
-                "sourceType": source_type_map.get(username, "chaturbate"),
-                "source_type": source_type_map.get(username, "chaturbate"),
+                "sourceType": source_type,
+                "source_type": source_type,
             })
 
     return {"models": result}
@@ -6976,7 +7283,7 @@ async def auto_record_task():
                                 )
                                 ready = await asyncio.to_thread(sess.wait_until_ready, 35)
                                 if not ready:
-                                    browser_capture_manager.stop_session(sess.id)
+                                    await asyncio.to_thread(browser_capture_manager.stop_session, sess.id)
                                     raise RuntimeError("Aucun flux video capturable dans le navigateur")
                                 logger.success("Auto-enregistrement browser démarré",
                                              task="auto-record",
@@ -7018,7 +7325,8 @@ async def auto_record_task():
 
                             try:
                                 segment_duration_seconds, segment_size_bytes = await _get_recording_segment_limits()
-                                sess = manager.start_session(
+                                sess = await asyncio.to_thread(
+                                    manager.start_session,
                                     input_url=hls_source,
                                     display_name=job["display_name"],
                                     person=profile_username,
@@ -7064,122 +7372,115 @@ async def auto_record_task():
             await asyncio.sleep(60)
 
 
+def _coerce_cleanup_retention_days(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 30
+
+
+async def cleanup_old_recordings_once(now_timestamp: Optional[float] = None) -> dict[str, int]:
+    """Run one retention pass using each model/source's configured window."""
+    media_sources = await db.get_all_media_profile_sources()
+    models = await db.get_all_models()
+    media_source_keys = {
+        (
+            str(source.get("source_type") or "chaturbate").strip().lower(),
+            source.get("channel_username"),
+        )
+        for source in media_sources
+        if source.get("channel_username")
+    }
+
+    # One directory can be referenced by duplicate provider rows. Since old
+    # recording rows do not carry a provider key, retain the most conservative
+    # window for that shared directory (0/forever wins).
+    path_policies: dict[tuple[str, str], tuple[Path, int]] = {}
+
+    def add_policy(username: str, path: Path, retention_days: object) -> None:
+        days = _coerce_cleanup_retention_days(retention_days)
+        key = (username, str(path.resolve()))
+        existing = path_policies.get(key)
+        if existing:
+            previous_days = existing[1]
+            days = 0 if 0 in {previous_days, days} else max(previous_days, days)
+        path_policies[key] = (path, days)
+
+    for source in media_sources:
+        profile_username = str(source.get("profile_username") or "").strip()
+        if not profile_username:
+            continue
+        try:
+            record_dir = _record_dir_from_path(
+                _normalize_record_path(
+                    source.get("record_path") or _default_record_path(profile_username),
+                    profile_username,
+                )
+            )
+        except HTTPException:
+            continue
+        add_policy(profile_username, record_dir, source.get("retention_days", 30))
+
+    for model in models:
+        username = str(model.get("username") or "").strip()
+        source_type = str(model.get("source_type") or "chaturbate").strip().lower()
+        if not username or (source_type, username) in media_source_keys:
+            continue
+        for record_dir in _record_dirs_for_model(username, model):
+            add_policy(username, record_dir, model.get("retention_days", 30))
+
+    grouped_jobs: dict[tuple[str, int], list[Path]] = {}
+    for (username, _path_key), (path, retention_days) in path_policies.items():
+        grouped_jobs.setdefault((username, retention_days), []).append(path)
+
+    active_paths = [
+        status.get("record_path")
+        for status in _all_recording_statuses()
+        if status.get("running") and status.get("record_path")
+    ]
+    totals = {
+        "deleted_files": 0,
+        "deleted_recordings": 0,
+        "deleted_playback": 0,
+        "skipped_protected": 0,
+        "skipped_active": 0,
+        "errors": 0,
+    }
+    for (username, retention_days), record_dirs in grouped_jobs.items():
+        if retention_days == 0:
+            logger.debug("Rétention infinie, skip", task="cleanup", username=username)
+            continue
+        current_paths = {str(path.resolve()) for path in record_dirs}
+        excluded_dirs = []
+        for (policy_username, _policy_key), (policy_path, _policy_days) in path_policies.items():
+            if policy_username != username or str(policy_path.resolve()) in current_paths:
+                continue
+            if any(policy_path.resolve().is_relative_to(root.resolve()) for root in record_dirs):
+                excluded_dirs.append(policy_path)
+        result = await cleanup_retention_job(
+            db,
+            OUTPUT_DIR,
+            username,
+            retention_days,
+            record_dirs,
+            now_timestamp=now_timestamp,
+            active_paths=active_paths,
+            excluded_dirs=excluded_dirs,
+        )
+        for key in totals:
+            totals[key] += result.get(key, 0)
+
+    logger.info("Nettoyage rétention terminé", task="cleanup", **totals)
+    return totals
+
+
 async def cleanup_old_recordings_task():
     """Nettoie automatiquement les anciennes rediffusions selon la rétention configurée"""
-    from datetime import datetime, timedelta
-    
     while True:
         try:
-            await asyncio.sleep(3600)  # Vérifier toutes les heures
-            
+            await asyncio.sleep(3600)
             logger.background_task("cleanup", "Début nettoyage anciennes rediffusions")
-            
-            # Charger les modèles et les sources Media avec leurs paramètres de rétention
-            media_sources = await db.get_all_media_profile_sources()
-            models = await db.get_all_models()
-            cleanup_jobs: list[dict] = []
-            media_source_keys = {
-                ((source.get("source_type") or "chaturbate"), source.get("channel_username"))
-                for source in media_sources
-                if source.get("channel_username")
-            }
-            for source in media_sources:
-                profile_username = source.get("profile_username")
-                if not profile_username:
-                    continue
-                try:
-                    records_dir = _record_dir_from_path(
-                        _normalize_record_path(
-                            source.get("record_path") or _default_record_path(profile_username),
-                            profile_username,
-                        )
-                    )
-                except HTTPException:
-                    continue
-                cleanup_jobs.append({
-                    "username": profile_username,
-                    "retention_days": source.get("retention_days", 30),
-                    "records_dirs": [records_dir],
-                })
-            for model in models:
-                username = model.get("username")
-                source_type = model.get("source_type") or "chaturbate"
-                if not username or (source_type, username) in media_source_keys:
-                    continue
-                cleanup_jobs.append({
-                    "username": username,
-                    "retention_days": model.get("retention_days", 30),
-                    "records_dirs": _record_dirs_for_model(username, model),
-                })
-
-            for job in cleanup_jobs:
-                username = job.get('username')
-                retention_days = job.get('retention_days', 30)  # Défaut 30 jours
-
-                if not username:
-                    continue
-
-                # retention_days == 0 means keep forever
-                if retention_days == 0:
-                    logger.debug("Rétention infinie, skip",
-                               task="cleanup",
-                               username=username)
-                    continue
-
-                thumbnails_dir = OUTPUT_DIR / "thumbnails" / username
-                records_dirs = [path for path in job.get("records_dirs", []) if path.exists()]
-
-                if not records_dirs:
-                    continue
-
-                # Date limite (aujourd'hui - rétention)
-                cutoff_date = datetime.now() - timedelta(days=retention_days)
-                
-                # Parcourir les fichiers .ts
-                for records_dir in records_dirs:
-                    for ts_file in records_dir.glob("*.ts"):
-                        try:
-                            # Le nom du fichier est au format YYYY-MM-DD.ts
-                            date_str = ts_file.stem  # Enlève .ts
-                            file_date = datetime.strptime(date_str, "%Y-%m-%d")
-
-                            # Si le fichier est plus vieux que la limite
-                            if file_date < cutoff_date:
-                                # Supprimer le fichier TS
-                                file_size = ts_file.stat().st_size
-                                ts_file.unlink()
-                                logger.info("Fichier supprimé (rétention)",
-                                          task="cleanup",
-                                          username=username,
-                                          filename=ts_file.name,
-                                          retention_days=retention_days,
-                                          size_mb=f"{file_size / 1024 / 1024:.1f}")
-
-                                # Supprimer la miniature associée
-                                thumb_file = thumbnails_dir / f"{ts_file.stem}.jpg"
-                                if thumb_file.exists():
-                                    thumb_file.unlink()
-
-                                # Supprimer l'entrée du cache
-                                cache_file = records_dir / ".metadata_cache.json"
-                                if cache_file.exists():
-                                    try:
-                                        with open(cache_file, 'r') as f:
-                                            cache = json.load(f)
-                                        if ts_file.name in cache:
-                                            del cache[ts_file.name]
-                                            with open(cache_file, 'w') as f:
-                                                json.dump(cache, f)
-                                    except:
-                                        pass
-
-                        except Exception as e:
-                            logger.error("Erreur nettoyage fichier",
-                                       task="cleanup",
-                                       filename=ts_file.name,
-                                       error=str(e))
-                            continue
-                        
+            await cleanup_old_recordings_once()
         except Exception as e:
             logger.error("Erreur cleanup task", task="cleanup", exc_info=True, error=str(e))
             await asyncio.sleep(3600)
@@ -7224,7 +7525,6 @@ async def sync_following_task(source_type: str = "chaturbate"):
 
 async def sync_cam4_following_task(cam4_auth):
     """Background task: sync les favoris CAM4 toutes les 5 minutes."""
-    from .services import cam4_source
     while True:
         try:
             await asyncio.sleep(300)

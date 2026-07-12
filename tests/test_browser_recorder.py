@@ -1,10 +1,11 @@
+import asyncio
 import queue
 import inspect
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.browser_recorder import (
     BrowserCaptureManager,
@@ -153,6 +154,161 @@ class BrowserCaptureSessionTests(unittest.TestCase):
 
             self.assertEqual(root / "provider-browser", session.browser_root)
             self.assertIs(store, session.session_store)
+
+    def test_completion_callback_runs_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            completed = []
+            session = BrowserCaptureSession(
+                session_id="abc123",
+                source_type="xcams",
+                page_url="https://www.xcams.com/chat/model",
+                sessions_dir=root / "sessions" / "abc123",
+                records_dir_for_person=root / "records" / "model",
+                person="model",
+                record=True,
+                on_complete=completed.append,
+            )
+
+            session._complete()
+            session._complete()
+
+            self.assertEqual(completed, [session])
+            self.assertTrue(session._done_evt.is_set())
+
+    def test_manager_stop_keeps_session_while_thread_is_still_alive(self):
+        class ThreadStub:
+            def __init__(self):
+                self.alive = True
+                self.join_timeout = None
+
+            def is_alive(self):
+                return self.alive
+
+            def join(self, timeout=None):
+                self.join_timeout = timeout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = BrowserCaptureManager(tmp)
+            root = Path(tmp)
+            session = BrowserCaptureSession(
+                session_id="abc123",
+                source_type="xcams",
+                page_url="https://www.xcams.com/chat/model",
+                sessions_dir=root / "sessions" / "abc123",
+                records_dir_for_person=root / "records" / "model",
+                person="model",
+                record=True,
+            )
+            thread = ThreadStub()
+            session._thread = thread
+            manager._sessions[session.id] = session
+
+            self.assertTrue(manager.stop_session(session.id))
+            self.assertTrue(session._stop_evt.is_set())
+            self.assertEqual(thread.join_timeout, 10)
+            self.assertIn(session.id, manager._sessions)
+
+            thread.alive = False
+            self.assertEqual(manager.list_status(), [])
+            self.assertNotIn(session.id, manager._sessions)
+
+
+class BrowserCaptureIndexLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_natural_and_error_completion_each_schedule_index_once(self):
+        from app import main as app_main
+
+        class FinishingSession(BrowserCaptureSession):
+            async def _run(self):
+                if getattr(self, "forced_error", None):
+                    self.error = self.forced_error
+                self._complete()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            loop = asyncio.get_running_loop()
+            sessions = []
+            with patch.object(
+                app_main,
+                "_index_browser_capture_recording",
+                new=AsyncMock(),
+            ) as index_mock:
+                for suffix, error in (("natural", None), ("error", "page closed")):
+                    session = FinishingSession(
+                        session_id=suffix,
+                        source_type="xcams",
+                        page_url="https://www.xcams.com/chat/model",
+                        sessions_dir=root / "sessions" / suffix,
+                        records_dir_for_person=root / "records" / "model",
+                        person="model",
+                        record=True,
+                        on_complete=app_main._browser_capture_completion_callback(loop),
+                    )
+                    session.forced_error = error
+                    session.start()
+                    await asyncio.to_thread(session._thread.join, 2)
+                    self.assertFalse(session.thread_is_alive())
+                    self.assertIsNotNone(session._index_future)
+                    await asyncio.wrap_future(session._index_future)
+                    session._complete()
+                    sessions.append(session)
+
+            self.assertEqual(index_mock.await_count, 2)
+            self.assertEqual(
+                [call.args[0] for call in index_mock.await_args_list],
+                sessions,
+            )
+
+    async def test_manual_stop_uses_completion_index_without_duplicate(self):
+        from app import main as app_main
+
+        class StoppableSession(BrowserCaptureSession):
+            async def _run(self):
+                try:
+                    while not self._stop_evt.is_set():
+                        await asyncio.sleep(0.01)
+                finally:
+                    self._complete()
+
+        class NoFFmpegSessions:
+            def get_session(self, _session_id):
+                return None
+
+            def stop_session(self, _session_id):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = BrowserCaptureManager(tmp)
+            session = StoppableSession(
+                session_id="manual",
+                source_type="xcams",
+                page_url="https://www.xcams.com/chat/model",
+                sessions_dir=root / "sessions" / "manual",
+                records_dir_for_person=root / "records" / "model",
+                person="model",
+                record=True,
+                on_complete=app_main._browser_capture_completion_callback(
+                    asyncio.get_running_loop()
+                ),
+            )
+            manager._sessions[session.id] = session
+
+            with (
+                patch.object(app_main, "manager", new=NoFFmpegSessions()),
+                patch.object(app_main, "browser_capture_manager", new=manager),
+                patch.object(
+                    app_main,
+                    "_index_browser_capture_recording",
+                    new=AsyncMock(),
+                ) as index_mock,
+            ):
+                session.start()
+                response = await app_main.api_stop(session.id)
+
+            self.assertEqual(response, {"stopped": True, "id": session.id})
+            index_mock.assert_awaited_once_with(session)
+            self.assertNotIn(session.id, manager._sessions)
 
 
 if __name__ == "__main__":

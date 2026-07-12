@@ -360,13 +360,29 @@ class Database:
                     room_status, created_at, updated_at
                 )
                 SELECT
-                    username, display_name, is_online, is_recording, viewers,
-                    thumbnail_path, thumbnail_updated_at, last_check_at,
-                    auto_record, record_quality, retention_days, record_path,
-                    COALESCE(NULLIF(source_type, ''), 'chaturbate'),
-                    room_status, created_at, updated_at
-                FROM models_legacy_provider_identity
-                WHERE username IS NOT NULL AND username != ''
+                    legacy.username, legacy.display_name, legacy.is_online,
+                    legacy.is_recording, legacy.viewers, legacy.thumbnail_path,
+                    legacy.thumbnail_updated_at, legacy.last_check_at,
+                    legacy.auto_record, legacy.record_quality,
+                    legacy.retention_days, legacy.record_path,
+                    CASE
+                        WHEN COALESCE(NULLIF(legacy.source_type, ''), 'chaturbate') = 'chaturbate'
+                         AND EXISTS (
+                            SELECT 1 FROM followed_models fm
+                            WHERE fm.username = legacy.username
+                              AND fm.source_type = 'cam4'
+                         )
+                         AND NOT EXISTS (
+                            SELECT 1 FROM followed_models fm
+                            WHERE fm.username = legacy.username
+                              AND fm.source_type = 'chaturbate'
+                         )
+                        THEN 'cam4'
+                        ELSE COALESCE(NULLIF(legacy.source_type, ''), 'chaturbate')
+                    END,
+                    legacy.room_status, legacy.created_at, legacy.updated_at
+                FROM models_legacy_provider_identity AS legacy
+                WHERE legacy.username IS NOT NULL AND legacy.username != ''
             """)
             await db.execute("DROP TABLE models_legacy_provider_identity")
 
@@ -468,7 +484,13 @@ class Database:
         logger.debug("Modèle ajouté/mis à jour", username=username, source_type=source_type)
 
     async def reconcile_model_sources_from_followed(self) -> int:
-        """Repair tracked models whose platform can be inferred from followed rows."""
+        """Repair only genuinely source-less legacy rows.
+
+        ``source_type`` is part of the current model identity. A Chaturbate row
+        must never be rewritten merely because another provider follows the same
+        username. Old username-only CAM4 rows are repaired once during schema
+        migration instead.
+        """
         await self.initialize()
 
         async with self._connect() as db:
@@ -483,7 +505,7 @@ class Database:
                       AND fm.source_type != 'chaturbate'
                     LIMIT 1
                 )
-                WHERE (source_type IS NULL OR source_type = '' OR source_type = 'chaturbate')
+                WHERE (source_type IS NULL OR source_type = '')
                   AND EXISTS (
                     SELECT 1
                     FROM followed_models fm
@@ -1040,11 +1062,13 @@ class Database:
         playable_size: Optional[int] = None,
         protected_from_retention: Optional[bool] = None,
         created_at: Optional[int] = None,
+        replace_media_paths: bool = False,
     ):
         """Ajoute ou met à jour un enregistrement"""
         await self.initialize()
         
         now = int(datetime.now().timestamp())
+        created_at_update = created_at
         created_at = created_at or now
         media_kind = (media_kind or "recording").strip().lower() or "recording"
         protected_value = 1 if protected_from_retention else 0
@@ -1063,19 +1087,20 @@ class Database:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username, filename) DO UPDATE SET
+                    file_path = ?,
                     file_size = ?,
                     duration_seconds = ?,
-                    thumbnail_path = COALESCE(?, thumbnail_path),
-                    mp4_path = COALESCE(?, mp4_path),
-                    mp4_size = COALESCE(?, mp4_size),
+                    thumbnail_path = CASE WHEN ? THEN ? ELSE COALESCE(?, thumbnail_path) END,
+                    mp4_path = CASE WHEN ? THEN ? ELSE COALESCE(?, mp4_path) END,
+                    mp4_size = CASE WHEN ? THEN ? ELSE COALESCE(?, mp4_size) END,
                     is_converted = ?,
                     media_kind = COALESCE(?, media_kind),
                     title = COALESCE(?, title),
                     import_status = COALESCE(?, import_status),
                     import_error = ?,
                     source_mtime = COALESCE(?, source_mtime),
-                    playable_path = COALESCE(?, playable_path),
-                    playable_size = COALESCE(?, playable_size),
+                    playable_path = CASE WHEN ? THEN ? ELSE COALESCE(?, playable_path) END,
+                    playable_size = CASE WHEN ? THEN ? ELSE COALESCE(?, playable_size) END,
                     protected_from_retention = ?,
                     created_at = COALESCE(?, created_at)
             """, (
@@ -1083,9 +1108,15 @@ class Database:
                 duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
                 media_kind, title, import_status, import_error, source_mtime,
                 playable_path, playable_size, protected_value, created_at,
-                file_size, duration_seconds, thumbnail_path, mp4_path, mp4_size, is_converted,
+                file_path, file_size, duration_seconds,
+                replace_media_paths, thumbnail_path, thumbnail_path,
+                replace_media_paths, mp4_path, mp4_path,
+                replace_media_paths, mp4_size, mp4_size,
+                is_converted,
                 media_kind, title, import_status, import_error, source_mtime,
-                playable_path, playable_size, protected_value, created_at
+                replace_media_paths, playable_path, playable_path,
+                replace_media_paths, playable_size, playable_size,
+                protected_value, created_at_update
             ))
             await db.commit()
     
@@ -1555,11 +1586,15 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
 
-            # Base filter: when show_ts=False, only count converted recordings
+            # Raw transport streams are opt-in; directly playable WebM/MP4
+            # captures and imported media remain visible by default.
             where_clauses = ["1=1"]
             where_params = []
             if not show_ts:
-                where_clauses.append("(media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL)")
+                where_clauses.append(
+                    "(media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL "
+                    "OR LOWER(file_path) NOT LIKE '%.ts')"
+                )
             if username_filter:
                 where_clauses.append("username = ?")
                 where_params.append(username_filter)
@@ -1584,7 +1619,7 @@ class Database:
             if show_ts:
                 size_sql = f"SELECT COALESCE(SUM(COALESCE(playable_size, mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
             else:
-                # When not showing TS, only sum MP4 sizes for converted, or file_size for those with mp4_path
+                # The WHERE clause already excludes raw TS rows.
                 size_sql = f"SELECT COALESCE(SUM(COALESCE(playable_size, mp4_size, file_size)), 0) FROM recordings WHERE {where_sql}"
 
             cursor = await db.execute(size_sql, where_params)
@@ -1783,12 +1818,14 @@ class Database:
         await self.initialize()
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            # When show_ts is False, only count recordings that have been converted (have mp4_path)
-            # or show all recordings when show_ts is True
+            # Raw TS rows are opt-in; non-TS browser captures remain visible.
             if show_ts:
                 where_clause = ""
             else:
-                where_clause = "WHERE media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL"
+                where_clause = (
+                    "WHERE media_kind = 'import' OR is_converted = 1 OR mp4_path IS NOT NULL "
+                    "OR LOWER(file_path) NOT LIKE '%.ts'"
+                )
             cursor = await db.execute(f"""
                 SELECT
                     username,

@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   flaresolverr:
     image: ghcr.io/flaresolverr/flaresolverr:latest
@@ -35,6 +33,7 @@ services:
       - AUTO_RECORD_USERS=${AUTO_RECORD_USERS:-}
       # - CB_COOKIE=session=...; autre=...   # Optionnel
       - PASSWORD=${PASSWORD:-}
+      - PSTREAMREC_ALLOW_DOCKER_UPDATE=${PSTREAMREC_ALLOW_DOCKER_UPDATE:-false}
       - TZ=${TZ:-America/Toronto}
       # Chaturbate Authentication
       - CHATURBATE_USERNAME=${CHATURBATE_USERNAME:-}
@@ -49,5 +48,4 @@ services:
       - "${HOST_PORT:-8080}:${PORT:-8080}"
     volumes:
       - ${HOST_DATA_DIR:-./data}:/data
-      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

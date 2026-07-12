@@ -4,7 +4,6 @@ API Router: Chaturbate Authentication
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 
 router = APIRouter(prefix="/api/chaturbate", tags=["chaturbate-auth"])
 

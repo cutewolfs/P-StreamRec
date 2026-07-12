@@ -59,6 +59,31 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(mp4_needs_faststart_repair(source))
 
+    async def test_thumbnail_refresh_replaces_stale_file_atomically(self):
+        source = self.write_old_file("records/model/changed.mp4")
+        thumbnail = self.output_dir / "thumbnails/model/import_test.jpg"
+        thumbnail.parent.mkdir(parents=True, exist_ok=True)
+        thumbnail.write_bytes(b"stale")
+
+        async def fake_ffmpeg(command, timeout):
+            output = Path(command[-1])
+            self.assertTrue(output.name.endswith(".tmp.jpg"))
+            output.write_bytes(b"fresh")
+            return True, ""
+
+        with patch.object(media_imports, "_run_ffmpeg", side_effect=fake_ffmpeg):
+            result = await media_imports.generate_import_thumbnail(
+                source,
+                self.output_dir,
+                "model",
+                "import_test",
+                replace_existing=True,
+            )
+
+        self.assertEqual(str(thumbnail), result)
+        self.assertEqual(b"fresh", thumbnail.read_bytes())
+        self.assertFalse(thumbnail.with_suffix(".tmp.jpg").exists())
+
     async def test_scan_imports_direct_mp4_and_creates_profile(self):
         source = self.write_old_file("records/new_profile/paid_clip.mp4")
 
@@ -293,6 +318,64 @@ class MediaImportScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rec["playable_path"], str(converted))
         self.assertEqual(rec["mp4_path"], str(converted))
         self.assertEqual(rec["import_status"], "ready")
+
+    async def test_changed_import_clears_stale_playable_paths_when_replacement_fails(self):
+        source = self.write_old_file("records/model/bonus_clip.mkv", b"old source")
+        old_stat = source.stat()
+        stale_copy = self.output_dir / "media_imports/model/import_test.mp4"
+        stale_copy.parent.mkdir(parents=True, exist_ok=True)
+        stale_copy.write_bytes(b"stale mp4")
+        stale_thumbnail = self.output_dir / "thumbnails/model/import_test.jpg"
+        stale_thumbnail.parent.mkdir(parents=True, exist_ok=True)
+        stale_thumbnail.write_bytes(b"stale thumbnail")
+        await self.db.add_or_update_recording(
+            username="model",
+            filename=source.name,
+            file_path=str(source),
+            file_size=old_stat.st_size,
+            recording_id="import_test",
+            duration_seconds=90,
+            thumbnail_path=str(stale_thumbnail),
+            mp4_path=str(stale_copy),
+            mp4_size=stale_copy.stat().st_size,
+            is_converted=True,
+            media_kind="import",
+            import_status="ready",
+            source_mtime=int(old_stat.st_mtime),
+            playable_path=str(stale_copy),
+            playable_size=stale_copy.stat().st_size,
+            protected_from_retention=True,
+            created_at=int(old_stat.st_mtime),
+        )
+
+        source.write_bytes(b"changed source that cannot be converted")
+        changed_mtime = time.time() - 60
+        os.utime(source, (changed_mtime, changed_mtime))
+
+        with (
+            patch.object(media_imports, "get_video_duration", new=AsyncMock(return_value=91)),
+            patch.object(media_imports, "get_media_created_at", new=AsyncMock(return_value=1704164645)),
+            patch.object(media_imports, "generate_import_thumbnail", new=AsyncMock(return_value=None)),
+            patch.object(
+                media_imports,
+                "create_playable_mp4_copy",
+                new=AsyncMock(return_value=(False, None, "replacement failed")),
+            ) as convert_mock,
+        ):
+            result = await scan_media_imports(self.db, self.output_dir, min_age_seconds=30)
+
+        convert_mock.assert_awaited_once()
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["failed"], 1)
+        rec = (await self.db.get_recordings("model"))[0]
+        self.assertIsNone(rec["playable_path"])
+        self.assertIsNone(rec["playable_size"])
+        self.assertIsNone(rec["mp4_path"])
+        self.assertIsNone(rec["mp4_size"])
+        self.assertIsNone(rec["thumbnail_path"])
+        self.assertFalse(bool(rec["is_converted"]))
+        self.assertEqual(rec["import_status"], "failed")
+        self.assertEqual(rec["import_error"], "replacement failed")
 
 
 class MediaImportApiTests(unittest.IsolatedAsyncioTestCase):

@@ -17,9 +17,8 @@ concurrency:
 
 jobs:
   quick-checks:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 10
     permissions:
       contents: read
 
@@ -27,12 +26,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Fast syntax checks
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Full repository checks
         run: |
           python3 -m compileall -q app tests
           sh -n docker/entrypoint.sh
+          for file in static/*.js; do node --check "$file"; done
+          docker compose config --quiet
+          uv run --python 3.12 --with-requirements requirements.txt python -m unittest discover -s tests
 
   build-and-push:
+    needs: quick-checks
     if: github.event_name == 'workflow_dispatch' || github.ref_name == 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -49,7 +55,7 @@ jobs:
       - name: Compute version (YEAR.WEEK.N)
         id: version
         run: |
-          YEAR=$(date -u +%Y)
+          YEAR=$(date -u +%G)
           WEEK=$(date -u +%V)
           # Remove leading zero for clean version number
           WEEK_NUM=$((10#$WEEK))

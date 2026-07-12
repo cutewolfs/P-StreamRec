@@ -4,11 +4,14 @@ Tâche de conversion automatique des enregistrements TS -> MP4
 import asyncio
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 from ..logger import logger
 from ..core.config import AUTO_CONVERT, KEEP_TS, MIN_RECORDING_BYTES, MIN_RECORDING_SECONDS
+from ..subprocess_utils import communicate_with_timeout as _communicate_with_timeout
 from .monitor import get_media_created_at, get_video_duration
+
 
 # Nombre maximal de tentatives de conversion avant skip automatique
 MAX_CONVERSION_ATTEMPTS = 3
@@ -81,7 +84,7 @@ async def _best_video_stream_map(ts_path: Path, ffmpeg_path: str = "ffmpeg") -> 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await _communicate_with_timeout(process, 30)
         if process.returncode == 0 and stdout:
             return _select_best_video_stream_map(json.loads(stdout.decode("utf-8")))
         error_msg = stderr.decode("utf-8", errors="replace") if stderr else ""
@@ -105,10 +108,26 @@ async def convert_ts_to_mp4(
     if not ts_path.exists():
         logger.error("Fichier TS introuvable", ts_path=str(ts_path))
         return False, None, None
+    try:
+        ts_size = ts_path.stat().st_size
+    except OSError as exc:
+        logger.error("Fichier TS illisible", ts_path=str(ts_path), error=str(exc))
+        return False, None, None
+    if ts_size <= 0:
+        logger.error("Fichier TS vide", ts_path=str(ts_path))
+        return False, None, None
     
     # Générer le nom du fichier MP4 si non fourni
     if mp4_path is None:
         mp4_path = ts_path.with_suffix('.mp4')
+
+    # FFmpeg must never write directly to the published path: an interrupted
+    # process can otherwise leave a truncated MP4 that the next scan mistakes
+    # for a successful conversion. Keep the real MP4 suffix so FFmpeg can infer
+    # the output container, then atomically replace the destination on success.
+    temp_mp4_path = mp4_path.with_name(
+        f".{mp4_path.stem}.{uuid.uuid4().hex}.tmp{mp4_path.suffix}"
+    )
     
     logger.info("Remux TS->MP4 démarré",
                ts_file=ts_path.name,
@@ -131,7 +150,7 @@ async def convert_ts_to_mp4(
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
         "-y",
-        str(mp4_path)
+        str(temp_mp4_path)
     ]
     
     try:
@@ -144,13 +163,14 @@ async def convert_ts_to_mp4(
             stderr=asyncio.subprocess.PIPE
         )
         
-        stdout, stderr = await process.communicate()
+        stdout, stderr = await _communicate_with_timeout(process, 3600)
         
-        if process.returncode == 0:
-            # Conversion réussie
-            mp4_size = mp4_path.stat().st_size
-            ts_size = ts_path.stat().st_size
+        if process.returncode == 0 and temp_mp4_path.exists() and temp_mp4_path.stat().st_size > 0:
+            # Publish only a complete, non-empty FFmpeg output. Path.replace()
+            # uses os.replace(), which is atomic while both files are siblings.
+            mp4_size = temp_mp4_path.stat().st_size
             reduction = ((ts_size - mp4_size) / ts_size) * 100
+            temp_mp4_path.replace(mp4_path)
             
             logger.success("Conversion réussie",
                          ts_file=ts_path.name,
@@ -161,8 +181,12 @@ async def convert_ts_to_mp4(
             
             return True, mp4_path, mp4_size
         else:
-            # Erreur de conversion
-            error_msg = stderr.decode('utf-8') if stderr else "Unknown error"
+            # A zero exit code without a usable output is still a failed
+            # conversion and must not make the caller delete the TS source.
+            if process.returncode == 0:
+                error_msg = "FFmpeg produced no non-empty MP4 output"
+            else:
+                error_msg = stderr.decode('utf-8') if stderr else "Unknown error"
             logger.error("Erreur conversion FFmpeg",
                         ts_file=ts_path.name,
                         error=error_msg[:500])
@@ -174,6 +198,30 @@ async def convert_ts_to_mp4(
                     error=str(e),
                     exc_info=True)
         return False, None, None
+    finally:
+        # Covers FFmpeg failures, output validation failures, exceptions, and
+        # task cancellation. Never leave a stale temp file for later scans.
+        try:
+            temp_mp4_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(
+                "Impossible de supprimer le MP4 temporaire",
+                temp_file=str(temp_mp4_path),
+                error=str(e),
+            )
+
+
+async def _is_valid_existing_mp4(mp4_path: Path, ffmpeg_path: str = "ffmpeg") -> bool:
+    """Return whether an existing MP4 is safe to adopt and use to remove its TS."""
+    try:
+        if not mp4_path.is_file() or mp4_path.stat().st_size <= 0:
+            return False
+    except OSError:
+        return False
+
+    # A stale direct-to-final FFmpeg output can be non-empty but lack a usable
+    # MP4 index. ffprobe reports no duration for those interrupted files.
+    return await get_video_duration(mp4_path, ffmpeg_path) > 0
 
 
 async def _get_recording_settings(db) -> tuple[bool, bool]:
@@ -285,7 +333,7 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
 
                     # Vérifier si le MP4 existe déjà
                     mp4_path = ts_path.with_suffix('.mp4')
-                    if mp4_path.exists():
+                    if mp4_path.exists() and await _is_valid_existing_mp4(mp4_path, ffmpeg_path):
                         logger.debug("MP4 existe déjà, skip conversion",
                                    username=username,
                                    file=ts_file.name)
@@ -329,6 +377,13 @@ async def auto_convert_recordings_task(db, output_dir: Path, ffmpeg_manager, ffm
                                            ts_file=ts_file.name,
                                            error=str(e))
                         continue
+                    elif mp4_path.exists():
+                        logger.warning(
+                            "MP4 existant invalide, nouvelle conversion requise",
+                            username=username,
+                            ts_file=ts_file.name,
+                            mp4_file=mp4_path.name,
+                        )
 
                     # Vérifier si le fichier TS est stable (pas modifié depuis 180s)
                     last_modified = ts_path.stat().st_mtime

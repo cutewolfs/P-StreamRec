@@ -6,7 +6,6 @@ import asyncio
 import aiohttp
 import json
 import re
-import subprocess
 import os
 import unicodedata
 from pathlib import Path
@@ -18,6 +17,7 @@ if TYPE_CHECKING:
     from ..core.database import Database
 
 from ..logger import logger
+from ..subprocess_utils import communicate_with_timeout, wait_with_timeout
 from ..core.config import (
     AUTO_RECORD_INTERVAL,
     CHATURBATE_REQUEST_TIMEOUT_SECONDS,
@@ -243,7 +243,7 @@ async def generate_thumbnail_from_stream(
             stderr=asyncio.subprocess.DEVNULL
         )
         
-        await asyncio.wait_for(process.wait(), timeout=10)
+        await wait_with_timeout(process, 10)
         
         if thumb_path.exists():
             return str(thumb_path)
@@ -294,7 +294,7 @@ async def generate_thumbnail_from_recording(
             stderr=asyncio.subprocess.DEVNULL
         )
         
-        await asyncio.wait_for(process.wait(), timeout=15)
+        await wait_with_timeout(process, 15)
         
         if thumb_path.exists():
             return str(thumb_path)
@@ -342,7 +342,7 @@ async def download_thumbnail_from_chaturbate(
                                 f.write(content)
                             
                             return str(thumb_path)
-            except:
+            except Exception:
                 continue
     
     except Exception as e:
@@ -366,7 +366,7 @@ async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> in
             stderr=asyncio.subprocess.PIPE
         )
         
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        stdout, stderr = await communicate_with_timeout(process, 10)
         
         if process.returncode == 0 and stdout:
             duration_str = stdout.decode().strip()
@@ -703,7 +703,7 @@ async def get_video_recorded_at(file_path: Path, ffmpeg_path: str = "ffmpeg") ->
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        stdout, _stderr = await communicate_with_timeout(process, 10)
         if process.returncode == 0 and stdout:
             return _parse_video_recorded_at(json.loads(stdout.decode("utf-8", errors="replace")))
     except Exception as e:
@@ -782,7 +782,7 @@ async def generate_recording_thumbnail(
             stderr=asyncio.subprocess.DEVNULL
         )
         
-        await asyncio.wait_for(process.wait(), timeout=15)
+        await wait_with_timeout(process, 15)
         
         if thumb_path.exists():
             return str(thumb_path)
@@ -1059,14 +1059,6 @@ async def monitor_models_task(
                 for model in models:
                     username = model['username']
                     source_type = model.get('source_type') or 'chaturbate'
-                    if source_type == 'chaturbate':
-                        try:
-                            followed = await db.get_followed_model(username)
-                            followed_source = (followed or {}).get('source_type') or ''
-                            if followed_source and followed_source != 'chaturbate':
-                                source_type = followed_source
-                        except Exception:
-                            pass
 
                     try:
                         if provider_registry is not None and provider_registry.has(source_type):
@@ -1108,7 +1100,13 @@ async def monitor_models_task(
                         
                         # Vérifier si en cours d'enregistrement
                         active_session = next(
-                            (s for s in active_sessions if s.get('person') == username and s.get('running')),
+                            (
+                                s
+                                for s in active_sessions
+                                if s.get('running')
+                                and (s.get('source_type') or 'chaturbate') == source_type
+                                and (s.get('target') or s.get('person')) == username
+                            ),
                             None
                         )
                         is_recording = active_session is not None

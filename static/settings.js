@@ -111,7 +111,7 @@ function providerEnabledControl(source, enabled) {
     '<span>Enabled</span>' +
     '<label class="toggle-switch">' +
       '<input type="checkbox" ' + (enabled ? 'checked' : '') +
-        ' onchange="toggleProviderEnabled(\'' + escapeHtml(source) + '\', this.checked, this)">' +
+        ' onchange="toggleProviderEnabled(\'' + escapeInlineJs(source) + '\', this.checked, this)">' +
       '<span class="toggle-slider"></span>' +
     '</label>' +
   '</div>';
@@ -199,16 +199,16 @@ function providerAccountControls(source, status, caps) {
       '</form>';
   }
   var reconnect = (!connected && savedCredentials)
-    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="reconnectProvider(\'' + escapeHtml(source) + '\')">Reconnect</button>'
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="reconnectProvider(\'' + escapeInlineJs(source) + '\')">Reconnect</button>'
     : '';
   var sync = canSync
-    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="syncProviderFollowing(\'' + escapeHtml(source) + '\')">Sync follows</button>'
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="syncProviderFollowing(\'' + escapeInlineJs(source) + '\')">Sync follows</button>'
     : '';
   var importSession = !connected
-    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="toggleProviderSessionImport(\'' + escapeHtml(source) + '\')">Import Session</button>'
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="toggleProviderSessionImport(\'' + escapeInlineJs(source) + '\')">Import Session</button>'
     : '';
   var logout = connected
-    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="logoutProvider(\'' + escapeHtml(source) + '\')">Disconnect</button>'
+    ? '<button type="button" class="btn btn-secondary btn-sm" onclick="logoutProvider(\'' + escapeInlineJs(source) + '\')">Disconnect</button>'
     : '';
 
   return '<div class="provider-account">' +
@@ -223,7 +223,7 @@ function providerAccountControls(source, status, caps) {
       '<textarea id="providerCookieHeader-' + escapeHtml(source) + '" rows="2" placeholder="Cookie header, for example sessionid=..."></textarea>' +
       '<textarea id="providerStorageState-' + escapeHtml(source) + '" rows="4" placeholder="Playwright storageState JSON (optional)"></textarea>' +
       '<input id="providerUserAgent-' + escapeHtml(source) + '" type="text" placeholder="User-Agent (optional)">' +
-      '<button type="button" class="btn btn-primary btn-sm" onclick="importProviderSession(\'' + escapeHtml(source) + '\')">Save Session</button>' +
+      '<button type="button" class="btn btn-primary btn-sm" onclick="importProviderSession(\'' + escapeInlineJs(source) + '\')">Save Session</button>' +
     '</div>' +
   '</div>';
 }
@@ -752,16 +752,31 @@ function renderBlacklistedTags() {
   if (!container) return;
 
   if (blacklistedTags.length === 0) {
-    container.innerHTML = '<span style="font-size: 0.85rem; color: var(--text-muted);">No blacklisted tags yet.</span>';
+    container.replaceChildren();
+    var empty = document.createElement('span');
+    empty.style.cssText = 'font-size: 0.85rem; color: var(--text-muted);';
+    empty.textContent = 'No blacklisted tags yet.';
+    container.appendChild(empty);
     return;
   }
 
-  container.innerHTML = blacklistedTags.map(function(tag) {
-    return '<span style="display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.7rem; border-radius: 6px; background: rgba(239, 68, 68, 0.15); color: #f87171; font-size: 0.85rem; font-weight: 500;">' +
-      escapeHtml(tag) +
-      '<button onclick="removeBlacklistedTag(\'' + escapeHtml(tag) + '\')" style="background: none; border: none; color: #f87171; cursor: pointer; font-size: 1.1rem; padding: 0; line-height: 1;">&times;</button>' +
-    '</span>';
-  }).join('');
+  container.replaceChildren();
+  blacklistedTags.forEach(function(tag) {
+    var chip = document.createElement('span');
+    chip.style.cssText = 'display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.7rem; border-radius: 6px; background: rgba(239, 68, 68, 0.15); color: #f87171; font-size: 0.85rem; font-weight: 500;';
+    chip.appendChild(document.createTextNode(String(tag)));
+
+    var removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.style.cssText = 'background: none; border: none; color: #f87171; cursor: pointer; font-size: 1.1rem; padding: 0; line-height: 1;';
+    removeButton.textContent = '\u00d7';
+    removeButton.setAttribute('aria-label', 'Remove ' + String(tag));
+    removeButton.addEventListener('click', function() {
+      removeBlacklistedTag(tag);
+    });
+    chip.appendChild(removeButton);
+    container.appendChild(chip);
+  });
 }
 
 async function addBlacklistedTag() {
@@ -818,6 +833,20 @@ function escapeHtml(text) {
   var div = document.createElement('div');
   div.appendChild(document.createTextNode(text));
   return div.innerHTML;
+}
+
+function escapeInlineJs(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '\\x27')
+    .replace(/"/g, '\\x22')
+    .replace(/&/g, '\\x26')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 // ============================================
@@ -1619,12 +1648,12 @@ function renderProcesses(data) {
     processesLastSnap[p.session_id] = p;
     var dot = '<span class="proc-status-dot ' + statusDotClass(p) + '" title="' + escapeProcHtml(p.status || '?') + '"></span>';
     var actions =
-      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procStop(\'' + escapeProcHtml(p.session_id) + '\')"    title="Stop (graceful)">&#9209;</button>' +
-      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procRestart(\'' + escapeProcHtml(p.session_id) + '\')" title="Restart (stop + monitor re-spawns)">&#8635;</button>' +
-      '<button class="proc-action-btn danger" onclick="event.stopPropagation(); procKill(\'' + escapeProcHtml(p.session_id) + '\')"    title="Force kill (SIGKILL)">&#9760;</button>' +
-      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procPreview(\'' + escapeProcHtml(p.playback_url || '') + '\')" title="Open HLS preview">&#9654;</button>';
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procStop(\'' + escapeInlineJs(p.session_id) + '\')"    title="Stop (graceful)">&#9209;</button>' +
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procRestart(\'' + escapeInlineJs(p.session_id) + '\')" title="Restart (stop + monitor re-spawns)">&#8635;</button>' +
+      '<button class="proc-action-btn danger" onclick="event.stopPropagation(); procKill(\'' + escapeInlineJs(p.session_id) + '\')"    title="Force kill (SIGKILL)">&#9760;</button>' +
+      '<button class="proc-action-btn"        onclick="event.stopPropagation(); procPreview(\'' + escapeInlineJs(p.playback_url || '') + '\')" title="Open HLS preview">&#9654;</button>';
 
-    var row = '<tr class="proc-row" data-sid="' + escapeProcHtml(p.session_id) + '" onclick="toggleProcRow(\'' + escapeProcHtml(p.session_id) + '\')">' +
+    var row = '<tr class="proc-row" data-sid="' + escapeProcHtml(p.session_id) + '" onclick="toggleProcRow(\'' + escapeInlineJs(p.session_id) + '\')">' +
       '<td>' + dot + '</td>' +
       '<td>' + (p.pid != null ? p.pid : '-') + '</td>' +
       '<td>' + escapeProcHtml(p.person || p.name || '-') + '</td>' +
@@ -1684,7 +1713,7 @@ function renderProcDetail(p) {
     '<h4>Paths</h4>' +
     '<div class="kv"><span class="k">Quality</span><span class="v">' + escapeProcHtml(p.record_quality || '?') + ' &rarr; ' + escapeProcHtml(p.quality || '?') + ' (effective)</span></div>' +
     '<div class="kv"><span class="k">Input m3u8</span><span class="v">' + escapeProcHtml(inputShort) +
-      '<button class="copy-btn" onclick="event.stopPropagation(); navigator.clipboard.writeText(' + JSON.stringify(input) + ').catch(function(){})">copy</button>' +
+      '<button class="copy-btn" onclick="event.stopPropagation(); navigator.clipboard.writeText(\'' + escapeInlineJs(input) + '\').catch(function(){})">copy</button>' +
     '</span></div>' +
     '<div class="kv"><span class="k">Output</span><span class="v">' + escapeProcHtml(p.record_path || '-') + '</span></div>' +
     '<div class="kv"><span class="k">HLS</span><span class="v">' + escapeProcHtml(p.playback_url || '-') + '</span></div>' +

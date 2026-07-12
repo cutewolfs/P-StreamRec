@@ -43,6 +43,9 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertNotIn("gitStatusText", header)
         self.assertNotIn("/api/git/status", loader)
         self.assertNotIn("checkGitStatus", loader)
+        self.assertIn('id="logoutBtn"', header)
+        self.assertIn("data.authentication_required", loader)
+        self.assertIn("fetch('/api/logout', { method: 'POST' })", loader)
 
     def test_settings_application_tab_is_removed(self):
         html = (ROOT / "static" / "settings.html").read_text()
@@ -93,6 +96,41 @@ class SettingsStaticTests(unittest.TestCase):
         self.assertIn("function normalizeCheckIntervalSeconds", js)
         self.assertIn("function setCheckIntervalInput", js)
         self.assertIn("data.check_interval_seconds", js)
+
+    def test_blacklisted_tags_use_dom_events_instead_of_inline_javascript(self):
+        js = (ROOT / "static" / "settings.js").read_text()
+
+        self.assertIn("removeButton.addEventListener('click'", js)
+        self.assertIn("chip.appendChild(document.createTextNode(String(tag)))", js)
+        self.assertNotIn("onclick=\"removeBlacklistedTag", js)
+
+    def test_dynamic_inline_handlers_use_javascript_string_escaping(self):
+        for filename in ("discover.js", "following.js", "recordings.js", "settings.js"):
+            js = (ROOT / "static" / filename).read_text()
+            self.assertIn("function escapeInlineJs(value)", js, filename)
+            self.assertIn(".replace(/'/g, '\\\\x27')", js, filename)
+            self.assertIn(".replace(/</g, '\\\\x3c')", js, filename)
+
+        discover = (ROOT / "static" / "discover.js").read_text()
+        following = (ROOT / "static" / "following.js").read_text()
+        recordings = (ROOT / "static" / "recordings.js").read_text()
+        settings = (ROOT / "static" / "settings.js").read_text()
+        self.assertIn("toggleFollowOnCard(\\'' + escapeInlineJs(model.username)", discover)
+        self.assertIn("unfollowFollowingModel(\\'' + escapeInlineJs(username)", following)
+        self.assertIn("playRecording(\\'' + escapeInlineJs(username)", recordings)
+        self.assertIn("navigator.clipboard.writeText(\\'' + escapeInlineJs(input)", settings)
+
+    def test_hls_player_dependency_is_version_pinned_with_integrity(self):
+        expected_src = "https://cdn.jsdelivr.net/npm/hls.js@1.6.16/dist/hls.min.js"
+        expected_integrity = (
+            "sha384-5E8B0pTlZZJMabWpC0fyYf6OUpe15jJij34BqBAh4NXoHAlLNOjCPRrwtOXOQFAn"
+        )
+        for filename in ("watch.html", "recordings.html"):
+            html = (ROOT / "static" / filename).read_text()
+            self.assertIn(expected_src, html, filename)
+            self.assertIn(expected_integrity, html, filename)
+            self.assertIn('crossorigin="anonymous"', html, filename)
+            self.assertNotIn("hls.js@latest", html, filename)
 
     def test_tests_center_covers_local_diagnostics(self):
         js = (ROOT / "static" / "settings.js").read_text()

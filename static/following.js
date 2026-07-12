@@ -393,11 +393,11 @@ function renderFollowingRow(model) {
   var watchHref = '/watch/' + encodeURIComponent(username) + '?source=' + encodeURIComponent(sourceType);
   var trackAction = tracked
     ? '<span class="following-row-tracked">Tracked</span>'
-    : '<button type="button" class="following-row-btn" onclick="trackFollowedModel(\'' + escapeHtml(username) + '\', \'' + escapeHtml(sourceType) + '\', this)">Track</button>';
+    : '<button type="button" class="following-row-btn" onclick="trackFollowedModel(\'' + escapeInlineJs(username) + '\', \'' + escapeInlineJs(sourceType) + '\', this)">Track</button>';
   return '<div class="following-list-row ' + statusClass + '" data-username="' + escapeHtml(username) + '" data-source="' + escapeHtml(sourceType) + '">' +
     '<a class="following-row-thumb" href="' + escapeHtml(watchHref) + '">' +
       '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(username) + '" loading="lazy" ' +
-        'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2296%22 height=%2254%22%3E%3Crect fill=%22%231a1f3a%22 width=%2296%22 height=%2254%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2211%22%3E' + escapeHtml(username) + '%3C/text%3E%3C/svg%3E\'" />' +
+        'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2296%22 height=%2254%22%3E%3Crect fill=%22%231a1f3a%22 width=%2296%22 height=%2254%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2211%22%3E' + escapeInlineJs(escapeHtml(username)) + '%3C/text%3E%3C/svg%3E\'" />' +
     '</a>' +
     '<div class="following-row-main">' +
       '<div class="following-row-title">' +
@@ -413,7 +413,7 @@ function renderFollowingRow(model) {
     '<div class="following-row-actions">' +
       '<a class="following-row-btn" href="' + escapeHtml(watchHref) + '">Watch</a>' +
       trackAction +
-      '<button type="button" class="following-row-btn danger" onclick="unfollowFollowingModel(\'' + escapeHtml(username) + '\', \'' + escapeHtml(sourceType) + '\', this)">Unfollow</button>' +
+      '<button type="button" class="following-row-btn danger" onclick="unfollowFollowingModel(\'' + escapeInlineJs(username) + '\', \'' + escapeInlineJs(sourceType) + '\', this)">Unfollow</button>' +
     '</div>' +
   '</div>';
 }
@@ -533,9 +533,9 @@ function renderFollowingCard(model) {
 
   var cardClass = isOnline ? 'is-online' : (isPrivate ? 'is-private' : 'is-offline');
   return '<div class="following-card ' + cardClass + '" data-username="' + escapeHtml(username) + '">' +
-    '<div class="following-card-thumb" title="' + (isPrivate ? 'Private show' : 'Watch live') + '" onclick="window.location.href=\'' + escapeHtml(watchHref) + '\'">' +
+    '<div class="following-card-thumb" title="' + (isPrivate ? 'Private show' : 'Watch live') + '" onclick="window.location.href=\'' + escapeInlineJs(watchHref) + '\'">' +
       '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(username) + '" style="' + imgFilter + '" ' +
-        'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22180%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22180%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
+        'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22180%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22180%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeInlineJs(escapeHtml(username)) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
       platformBadge +
       privateRibbon +
     '</div>' +
@@ -728,6 +728,20 @@ function escapeHtml(text) {
   var div = document.createElement('div');
   div.appendChild(document.createTextNode(text));
   return div.innerHTML;
+}
+
+function escapeInlineJs(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '\\x27')
+    .replace(/"/g, '\\x22')
+    .replace(/&/g, '\\x26')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 // ============================================

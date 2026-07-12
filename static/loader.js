@@ -63,6 +63,19 @@
             const res = await fetch('/api/version');
             const data = await res.json();
             setVersionText(data.version);
+            const logoutBtn = document.getElementById('logoutBtn');
+            if (logoutBtn && data.authentication_required) {
+              logoutBtn.hidden = false;
+              logoutBtn.style.display = 'flex';
+              logoutBtn.addEventListener('click', async function() {
+                logoutBtn.disabled = true;
+                try {
+                  await fetch('/api/logout', { method: 'POST' });
+                } finally {
+                  window.location.href = '/login';
+                }
+              });
+            }
           } catch (e) {
             console.error('Error loading version:', e);
           }

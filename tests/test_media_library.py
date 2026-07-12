@@ -227,6 +227,43 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delete_ts.status_code, 400)
         self.assertTrue(self.ts_file.exists())
 
+    async def test_thumbnail_route_rejects_encoded_profile_traversal(self):
+        secret = self.output_dir / "secret.jpg"
+        secret.write_bytes(b"internal secret")
+
+        response = self.client.get("/api/recording-thumbnail/%2E%2E/secret.jpg")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertNotEqual(b"internal secret", response.content)
+
+    async def test_recording_delete_rejects_encoded_profile_traversal(self):
+        target = self.output_dir / "target.mp4"
+        target.write_bytes(b"must remain")
+
+        response = self.client.delete("/api/recordings/%2E%2E/target.mp4")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(target.exists())
+        self.assertEqual(b"must remain", target.read_bytes())
+
+    async def test_recording_delete_does_not_trust_database_paths_outside_profile(self):
+        target = self.output_dir / "target.mp4"
+        target.write_bytes(b"must remain")
+        await app_main.db.add_or_update_recording(
+            username="model",
+            filename="target.mp4",
+            file_path=str(target),
+            file_size=target.stat().st_size,
+            recording_id="rec_outside_profile",
+            media_kind="recording",
+        )
+
+        response = self.client.delete("/api/recordings/model/target.mp4")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(target.exists())
+        self.assertEqual(b"must remain", target.read_bytes())
+
     async def test_initial_open_range_includes_large_mp4_metadata(self):
         app_main.RECORDING_RANGE_CHUNK_SIZE = 64
         ftyp = (32).to_bytes(4, "big") + b"ftyp" + b"isom" + (b"\0" * 20)
@@ -398,6 +435,185 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(legacy_url.status_code, 206)
         self.assertEqual(legacy_url.content, b"nested")
+
+    async def test_browser_webm_recording_is_visible_while_raw_ts_is_opt_in(self):
+        browser_dir = self.output_dir / "records" / "browser_model"
+        browser_dir.mkdir(parents=True)
+        webm = browser_dir / "browser_capture.webm"
+        webm.write_bytes(b"browser capture")
+        await app_main.db.add_or_update_recording(
+            username="browser_model",
+            filename=webm.name,
+            file_path=str(webm),
+            file_size=webm.stat().st_size,
+            recording_id="browser_capture",
+            duration_seconds=12,
+            is_converted=False,
+            media_kind="recording",
+            created_at=int(time.time()) - 120,
+        )
+        raw_ts = browser_dir / "raw_capture.ts"
+        raw_ts.write_bytes(b"raw transport stream")
+        await app_main.db.add_or_update_recording(
+            username="browser_model",
+            filename=raw_ts.name,
+            file_path=str(raw_ts),
+            file_size=raw_ts.stat().st_size,
+            recording_id="raw_capture",
+            duration_seconds=12,
+            is_converted=False,
+            media_kind="recording",
+            created_at=int(time.time()) - 119,
+        )
+
+        default_listing = self.client.get("/api/recordings/browser_model")
+        self.assertEqual(default_listing.status_code, 200)
+        self.assertEqual(
+            [item["filename"] for item in default_listing.json()["recordings"]],
+            ["browser_capture.webm"],
+        )
+
+        flat_listing = self.client.get("/api/all-recordings?username=browser_model")
+        self.assertEqual(flat_listing.status_code, 200)
+        self.assertEqual(
+            [item["filename"] for item in flat_listing.json()["recordings"]],
+            ["browser_capture.webm"],
+        )
+
+        grouped = self.client.get("/api/recordings-by-model")
+        self.assertEqual(grouped.status_code, 200)
+        browser_group = next(
+            item for item in grouped.json()["models"] if item["username"] == "browser_model"
+        )
+        self.assertEqual(browser_group["recordingCount"], 1)
+
+        visible = self.client.get("/api/recordings/browser_model?show_ts=true")
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(
+            [item["filename"] for item in visible.json()["recordings"]],
+            ["raw_capture.ts", "browser_capture.webm"],
+        )
+
+    async def test_recording_groups_keep_provider_identity_for_distinct_record_paths(self):
+        models = [
+            ("chaturbate", "shared/chaturbate"),
+            ("cam4", "shared/cam4"),
+        ]
+        for index, (source_type, record_path) in enumerate(models, start=1):
+            await app_main.db.add_or_update_model(
+                username="shared",
+                source_type=source_type,
+                auto_record=True,
+                record_path=record_path,
+            )
+            media_dir = self.output_dir / "records" / record_path
+            media_dir.mkdir(parents=True)
+            media_path = media_dir / f"capture_{source_type}.mp4"
+            media_path.write_bytes(source_type.encode("utf-8"))
+            await app_main.db.add_or_update_recording(
+                username="shared",
+                filename=media_path.name,
+                file_path=str(media_path),
+                file_size=media_path.stat().st_size,
+                recording_id=f"shared_{source_type}",
+                duration_seconds=index * 10,
+                mp4_path=str(media_path),
+                mp4_size=media_path.stat().st_size,
+                is_converted=True,
+                media_kind="recording",
+                created_at=1704164645 + index,
+            )
+
+        response = self.client.get("/api/recordings-by-model")
+        self.assertEqual(response.status_code, 200)
+        shared = {
+            item["sourceType"]: item
+            for item in response.json()["models"]
+            if item["username"] == "shared"
+        }
+        self.assertEqual(set(shared), {"chaturbate", "cam4"})
+        self.assertEqual(shared["chaturbate"]["recordingCount"], 1)
+        self.assertEqual(shared["cam4"]["recordingCount"], 1)
+        self.assertEqual(shared["chaturbate"]["totalDuration"], 10)
+        self.assertEqual(shared["cam4"]["totalDuration"], 20)
+
+    async def test_ambiguous_legacy_recording_group_uses_deterministic_provider(self):
+        shared_record_path = "shared/videos/record"
+        for source_type in ("cam4", "chaturbate"):
+            await app_main.db.add_or_update_model(
+                username="shared",
+                source_type=source_type,
+                auto_record=True,
+                record_path=shared_record_path,
+            )
+        media_dir = self.output_dir / "records" / shared_record_path
+        media_dir.mkdir(parents=True)
+        media_path = media_dir / "legacy.mp4"
+        media_path.write_bytes(b"legacy")
+        await app_main.db.add_or_update_recording(
+            username="shared",
+            filename=media_path.name,
+            file_path=str(media_path),
+            file_size=media_path.stat().st_size,
+            recording_id="shared_legacy",
+            duration_seconds=30,
+            mp4_path=str(media_path),
+            mp4_size=media_path.stat().st_size,
+            is_converted=True,
+            media_kind="recording",
+            created_at=1704164645,
+        )
+
+        response = self.client.get("/api/recordings-by-model")
+        self.assertEqual(response.status_code, 200)
+        shared = {
+            item["sourceType"]: item
+            for item in response.json()["models"]
+            if item["username"] == "shared"
+        }
+        self.assertEqual(shared["chaturbate"]["recordingCount"], 1)
+        self.assertEqual(shared["cam4"]["recordingCount"], 0)
+
+    async def test_recording_group_prefers_most_specific_nested_provider_path(self):
+        await app_main.db.add_or_update_model(
+            username="shared",
+            source_type="chaturbate",
+            auto_record=True,
+            record_path="shared",
+        )
+        await app_main.db.add_or_update_model(
+            username="shared",
+            source_type="cam4",
+            auto_record=True,
+            record_path="shared/cam4",
+        )
+        media_dir = self.output_dir / "records/shared/cam4"
+        media_dir.mkdir(parents=True)
+        media_path = media_dir / "nested.mp4"
+        media_path.write_bytes(b"cam4")
+        await app_main.db.add_or_update_recording(
+            username="shared",
+            filename=media_path.name,
+            file_path=str(media_path),
+            file_size=media_path.stat().st_size,
+            recording_id="shared_nested",
+            duration_seconds=15,
+            mp4_path=str(media_path),
+            mp4_size=media_path.stat().st_size,
+            is_converted=True,
+            media_kind="recording",
+        )
+
+        response = self.client.get("/api/recordings-by-model")
+
+        self.assertEqual(response.status_code, 200)
+        shared = {
+            item["sourceType"]: item
+            for item in response.json()["models"]
+            if item["username"] == "shared"
+        }
+        self.assertEqual(shared["cam4"]["recordingCount"], 1)
+        self.assertEqual(shared["chaturbate"]["recordingCount"], 0)
 
     async def test_deletes_photo_and_indexed_video(self):
         photo = self.client.delete("/api/media-library/model/photo.jpg")
@@ -619,6 +835,37 @@ class MediaLibraryApiTests(unittest.IsolatedAsyncioTestCase):
         profiles = {item["username"]: item for item in listing.json()["profiles"]}
         self.assertTrue(profiles["empty_model"]["profileImageUrl"].startswith("/api/media-profiles/empty_model/profile-image?v="))
         self.assertEqual(profiles["empty_model"]["profileImageSourceUrl"], "https://www.babepedia.com/babe/Empty_Model")
+
+    async def test_profile_image_resolver_rejects_private_network_urls(self):
+        for image_url in (
+            "http://127.0.0.1:8080/secret.jpg",
+            "http://[::1]/secret.jpg",
+            "http://[::ffff:127.0.0.1]/secret.jpg",
+        ):
+            with self.subTest(image_url=image_url):
+                response = self.client.post(
+                    "/api/media-profiles/empty_model/profile-image/resolve",
+                    json={"profileImageUrl": image_url},
+                )
+                self.assertEqual(response.status_code, 400)
+
+        self.assertFalse(app_main.PROFILE_IMAGES_DIR.exists())
+
+    async def test_profile_image_dns_resolver_rejects_private_answers(self):
+        class FakeResolver:
+            async def resolve(self, host, port, family):
+                return [{"host": "192.168.40.59", "port": port}]
+
+            async def close(self):
+                return None
+
+        resolver = app_main._PublicAddressResolver.__new__(
+            app_main._PublicAddressResolver
+        )
+        resolver._resolver = FakeResolver()
+
+        with self.assertRaisesRegex(OSError, "non-public"):
+            await resolver.resolve("images.example.test", 443)
 
     async def test_deletes_profile_folder_metadata_and_recordings(self):
         response = self.client.put(

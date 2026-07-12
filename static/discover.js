@@ -298,7 +298,7 @@ function renderGrid(models, providerStatuses) {
     if (model.tags && model.tags.length > 0) {
       var displayTags = model.tags.slice(0, 3);
       tagsHtml = '<div class="discover-tags">' + displayTags.map(function(t) {
-        return '<span class="discover-tag" onclick="event.stopPropagation(); addTagFilter(\'' + escapeHtml(t) + '\')">' + escapeHtml(t) + '</span>';
+        return '<span class="discover-tag" onclick="event.stopPropagation(); addTagFilter(\'' + escapeInlineJs(t) + '\')">' + escapeHtml(t) + '</span>';
       }).join('') + '</div>';
     }
 
@@ -309,17 +309,17 @@ function renderGrid(models, providerStatuses) {
     var isFollowed = followedSet.has(sourceKey(model.username, cardSource));
     var heartBtn = canFollow ? '<button class="discover-follow-heart ' + (isFollowed ? 'is-followed' : '') + '" ' +
       'title="' + (isFollowed ? 'Unfollow' : 'Follow') + ' ' + escapeHtml(model.username) + '" ' +
-      'onclick="event.stopPropagation(); toggleFollowOnCard(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\', this)">&#9829;</button>' : '';
+      'onclick="event.stopPropagation(); toggleFollowOnCard(\'' + escapeInlineJs(model.username) + '\', \'' + escapeInlineJs(cardSource) + '\', this)">&#9829;</button>' : '';
     var streamBadge = streamAvailable ? '' : '<span class="discover-stream-status">Unavailable</span>';
     var cardClass = 'discover-card' + (streamAvailable ? '' : ' is-discover-only');
     var cardAction = streamAvailable
-      ? ' onclick="openWatch(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(cardSource) + '\')"'
+      ? ' onclick="openWatch(\'' + escapeInlineJs(model.username) + '\', \'' + escapeInlineJs(cardSource) + '\')"'
       : ' title="Live playback is not available for this provider yet"';
 
     return '<div class="' + cardClass + '" data-username="' + escapeHtml(model.username) + '" data-source="' + escapeHtml(cardSource) + '"' + cardAction + '>' +
       '<div class="discover-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
-          'onerror="this.onerror=null;this.src=\'' + escapeHtml(fallbackThumbUrl) + '\'" loading="lazy" />' +
+          'onerror="this.onerror=null;this.src=\'' + escapeInlineJs(fallbackThumbUrl) + '\'" loading="lazy" />' +
         viewerText +
         ageText +
         renderPlatformBadge(model.source_type || model.platform || 'chaturbate') +
@@ -420,7 +420,7 @@ function renderActiveTagFilters() {
   container.innerHTML = activeTags.map(function(tag) {
     return '<span class="active-tag-chip">' +
       escapeHtml(tag) +
-      '<button onclick="event.stopPropagation(); removeTagFilter(\'' + escapeHtml(tag) + '\')">&times;</button>' +
+      '<button onclick="event.stopPropagation(); removeTagFilter(\'' + escapeInlineJs(tag) + '\')">&times;</button>' +
     '</span>';
   }).join('') +
   '<button class="clear-tags-btn" onclick="clearAllTags()">Clear all</button>';
@@ -445,6 +445,20 @@ function escapeHtml(text) {
   var div = document.createElement('div');
   div.appendChild(document.createTextNode(text));
   return div.innerHTML;
+}
+
+function escapeInlineJs(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '\\x27')
+    .replace(/"/g, '\\x22')
+    .replace(/&/g, '\\x26')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 // ============================================

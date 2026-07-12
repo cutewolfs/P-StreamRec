@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..logger import logger
+from ..subprocess_utils import communicate_with_timeout
 from .monitor import get_media_created_at, get_video_duration
 
 
@@ -132,7 +133,9 @@ async def _run_ffmpeg(cmd: list[str], timeout: int = 3600) -> tuple[bool, str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout, stderr = await communicate_with_timeout(process, timeout)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         return False, str(e)
 
@@ -146,13 +149,19 @@ async def generate_import_thumbnail(
     username: str,
     recording_id: str,
     ffmpeg_path: str = "ffmpeg",
+    replace_existing: bool = False,
 ) -> Optional[str]:
     thumbs_dir = output_dir / "thumbnails" / username
     thumbs_dir.mkdir(parents=True, exist_ok=True)
     thumb_path = thumbs_dir / f"{recording_id}.jpg"
 
-    if thumb_path.exists():
+    if thumb_path.exists() and not replace_existing:
         return str(thumb_path)
+    if replace_existing:
+        thumb_path.unlink(missing_ok=True)
+
+    temporary = thumb_path.with_suffix(".tmp.jpg")
+    temporary.unlink(missing_ok=True)
 
     for seek in ("00:00:30", "00:00:03", "00:00:00"):
         cmd = [
@@ -170,11 +179,13 @@ async def generate_import_thumbnail(
             "-vf",
             "scale=320:-1",
             "-y",
-            str(thumb_path),
+            str(temporary),
         ]
         ok, error = await _run_ffmpeg(cmd, timeout=30)
-        if ok and thumb_path.exists():
+        if ok and temporary.exists() and temporary.stat().st_size > 0:
+            temporary.replace(thumb_path)
             return str(thumb_path)
+        temporary.unlink(missing_ok=True)
         logger.debug(
             "Miniature import non générée",
             username=username,
@@ -183,6 +194,7 @@ async def generate_import_thumbnail(
             error=error,
         )
 
+    temporary.unlink(missing_ok=True)
     return None
 
 
@@ -466,6 +478,7 @@ async def scan_media_imports(
                 username,
                 recording_id,
                 ffmpeg_path,
+                replace_existing=bool(is_existing_import and source_changed),
             )
 
             playable_path: Optional[Path] = None
@@ -520,6 +533,7 @@ async def scan_media_imports(
                 playable_size=playable_size,
                 protected_from_retention=True,
                 created_at=created_at,
+                replace_media_paths=bool(is_existing_import and source_changed),
             )
 
             if is_existing_import:

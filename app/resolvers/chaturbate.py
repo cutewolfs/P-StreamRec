@@ -1,7 +1,5 @@
 import re
 import html
-import time
-import asyncio
 import aiohttp
 import requests
 from typing import Optional

@@ -232,10 +232,10 @@ function renderModelGrid(models) {
 
     var sourceType = model.sourceType || model.source_type || '';
 
-    return '<div class="rec-model-card" onclick="showModelRecordings(\'' + escapeHtml(model.username) + '\', \'' + escapeHtml(sourceType) + '\')">' +
+    return '<div class="rec-model-card" onclick="showModelRecordings(\'' + escapeInlineJs(model.username) + '\', \'' + escapeInlineJs(sourceType) + '\')">' +
       '<div class="rec-model-card-thumb">' +
         '<img src="' + escapeHtml(thumbUrl) + '" alt="' + escapeHtml(model.username) + '" ' +
-          'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeHtml(model.username) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
+          'onerror="this.src=\'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22280%22 height=%22200%22%3E%3Crect fill=%22%231a1f3a%22 width=%22280%22 height=%22200%22/%3E%3Ctext x=%2250%25%22 y=%2250%25%22 dominant-baseline=%22middle%22 text-anchor=%22middle%22 fill=%22%23a0aec0%22 font-family=%22system-ui%22 font-size=%2216%22%3E' + escapeInlineJs(escapeHtml(model.username)) + '%3C/text%3E%3C/svg%3E\'" loading="lazy" />' +
         '<span class="rec-model-count">' + countLabel + '</span>' +
       '</div>' +
       '<div class="rec-model-card-info">' +
@@ -331,10 +331,10 @@ async function showModelRecordings(username, sourceType) {
       } else if (!rec.isConverted && (rec.conversionAttempts || 0) > 0) {
         var errMsg = rec.conversionError ? escapeHtml(rec.conversionError) : 'Conversion failed';
         failBadge = '<div class="conversion-fail-badge" title="' + errMsg + '">&#9888; Conversion failed (' + rec.conversionAttempts + ')</div>';
-        retryBtn = '<button class="rec-action-btn" onclick="event.stopPropagation(); retryConversion(\'' + escapeHtml(recId) + '\', this)" title="Retry conversion">&#8635;</button>';
+        retryBtn = '<button class="rec-action-btn" onclick="event.stopPropagation(); retryConversion(\'' + escapeInlineJs(recId) + '\', this)" title="Retry conversion">&#8635;</button>';
       }
 
-      var clickAttr = playable ? ' onclick="playRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\', \'' + escapeHtml(recId) + '\', \'' + escapeHtml(recUrl) + '\', \'' + escapeHtml(displayTitle) + '\')"' : '';
+      var clickAttr = playable ? ' onclick="playRecording(\'' + escapeInlineJs(username) + '\', \'' + escapeInlineJs(rec.filename) + '\', \'' + escapeInlineJs(recId) + '\', \'' + escapeInlineJs(recUrl) + '\', \'' + escapeInlineJs(displayTitle) + '\')"' : '';
       var importBadge = rec.isImported ? '<span class="recording-badge">Imported</span>' : '';
       var titleLine = displayTitle ? '<div class="recording-title">' + escapeHtml(displayTitle) + '</div>' : '';
 
@@ -356,8 +356,8 @@ async function showModelRecordings(username, sourceType) {
         '</div>' +
         '<div class="recording-item-actions">' +
           retryBtn +
-          '<button class="rec-action-btn" onclick="event.stopPropagation(); downloadRecording(\'' + escapeHtml(downloadUrl) + '\', \'' + escapeHtml(rec.filename) + '\')" title="Download">&#11015;</button>' +
-          '<button class="rec-action-btn danger" onclick="event.stopPropagation(); deleteRecording(\'' + escapeHtml(username) + '\', \'' + escapeHtml(rec.filename) + '\', this)" title="Delete">&#128465;</button>' +
+          '<button class="rec-action-btn" onclick="event.stopPropagation(); downloadRecording(\'' + escapeInlineJs(downloadUrl) + '\', \'' + escapeInlineJs(rec.filename) + '\')" title="Download">&#11015;</button>' +
+          '<button class="rec-action-btn danger" onclick="event.stopPropagation(); deleteRecording(\'' + escapeInlineJs(username) + '\', \'' + escapeInlineJs(rec.filename) + '\', this)" title="Delete">&#128465;</button>' +
         '</div>' +
       '</div>';
     }).join('');
@@ -1323,6 +1323,20 @@ function escapeHtml(text) {
   var div = document.createElement('div');
   div.appendChild(document.createTextNode(text));
   return div.innerHTML;
+}
+
+function escapeInlineJs(value) {
+  return String(value == null ? '' : value)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, '\\x27')
+    .replace(/"/g, '\\x22')
+    .replace(/&/g, '\\x26')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function showNotification(message, type) {

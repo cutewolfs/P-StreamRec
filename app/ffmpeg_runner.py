@@ -470,7 +470,7 @@ class FFmpegSession:
             if pending:
                 write_segmented(pending)
 
-        except Exception as e:
+        except Exception:
             logger.error("Erreur dans writer loop", 
                         session_id=self.id, 
                         exc_info=True,
