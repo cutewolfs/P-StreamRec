@@ -32,10 +32,12 @@ class FollowedSyncResult(list):
         values=(),
         trusted: bool = True,
         skipped_reason: Optional[str] = None,
+        authoritative: bool = True,
     ):
         super().__init__(values)
         self.trusted = trusted
         self.skipped_reason = skipped_reason
+        self.authoritative = bool(authoritative and trusted)
 
 
 class ChaturbateAPI:
@@ -47,6 +49,7 @@ class ChaturbateAPI:
         self.auth = auth_service
         self.flaresolverr = flaresolverr
         self._semaphore = asyncio.Semaphore(2)
+        self._rate_lock = asyncio.Lock()
         self._last_request_time: float = 0
 
     def _apply_flaresolverr_solution(
@@ -83,11 +86,12 @@ class ChaturbateAPI:
 
     async def _rate_limit(self):
         """Apply rate limiting between requests"""
-        now = time.time()
-        elapsed = now - self._last_request_time
-        if elapsed < CB_REQUEST_DELAY:
-            await asyncio.sleep(CB_REQUEST_DELAY - elapsed)
-        self._last_request_time = time.time()
+        async with self._rate_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < CB_REQUEST_DELAY:
+                await asyncio.sleep(CB_REQUEST_DELAY - elapsed)
+            self._last_request_time = time.monotonic()
 
     def _get_headers(self) -> Dict[str, str]:
         """Get headers with auth cookies if available"""
@@ -503,24 +507,59 @@ class ChaturbateAPI:
 
     async def get_followed_models(self) -> List[Dict[str, Any]]:
         """
-        Fetch followed models from Chaturbate's authenticated followed-cams page.
+        Fetch a complete followed-model snapshot from Chaturbate.
 
-        The roomlist API's ``follow=true`` filter has returned non-followed
-        global rooms before. Treat only the HTML followed-cams surface as trusted
-        enough to mutate ``followed_models``.
+        Prefer the authenticated JSON roomlist because the HTML followed-cams
+        page is redirected to a login/age wall for some regions. Chaturbate can
+        silently ignore ``follow=true`` and return the global roomlist, so JSON
+        results are authoritative only when every raw room explicitly reports
+        ``is_following: true`` and both online/offline categories paginate
+        completely. HTML remains a non-authoritative fallback: it may refresh
+        visible statuses, but it must never delete cached offline follows.
         """
-        if not self.auth.get_cookies().get("sessionid"):
+        status_getter = getattr(self.auth, "get_status", None)
+        status = status_getter() if callable(status_getter) else None
+        if (
+            not self.auth.get_cookies().get("sessionid")
+            or (isinstance(status, dict) and status.get("isLoggedIn") is not True)
+        ):
             return FollowedSyncResult(
                 [],
                 trusted=False,
                 skipped_reason="Chaturbate session is not verified",
+                authoritative=False,
             )
 
-        models = []
-        seen = set()
         headers = self._get_headers()
-        headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        headers["Referer"] = "https://chaturbate.com/followed-cams/"
+        roomlist_result = await self._fetch_followed_roomlist_api(headers)
+        if roomlist_result.trusted:
+            return roomlist_result
+
+        html_result = await self._fetch_followed_html(headers)
+        if html_result.trusted:
+            logger.info(
+                "Chaturbate followed roomlist unavailable; using HTML fallback",
+                reason=roomlist_result.skipped_reason,
+            )
+            return html_result
+
+        reasons = [
+            reason
+            for reason in (
+                roomlist_result.skipped_reason,
+                html_result.skipped_reason,
+            )
+            if reason
+        ]
+        return self._untrusted_followed_result("; HTML fallback: ".join(reasons))
+
+    async def _fetch_followed_html(self, headers: Dict[str, str]) -> FollowedSyncResult:
+        html_headers = dict(headers)
+        html_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        html_headers["Referer"] = "https://chaturbate.com/followed-cams/"
+
+        models: List[Dict[str, Any]] = []
+        seen = set()
 
         page = 1
         while True:
@@ -528,33 +567,27 @@ class ChaturbateAPI:
             if page > 1:
                 url = f"{url}?page={page}"
 
-            resp = await self._request("GET", url, headers=headers, allow_redirects=False)
+            resp = await self._request("GET", url, headers=html_headers, allow_redirects=False)
             if not resp:
-                return self._untrusted_followed_result("Chaturbate followed-cams request failed")
-            if resp.status in _REDIRECT_STATUSES and await self._prepare_flaresolverr_retry_headers(url, headers):
-                resp = await self._request("GET", url, headers=headers, allow_redirects=False)
-                if not resp:
-                    return self._untrusted_followed_result("Chaturbate followed-cams request failed after FlareSolverr")
+                return self._followed_failure("Chaturbate followed-cams request failed")
             if resp.status in _REDIRECT_STATUSES:
-                return self._untrusted_followed_result("Chaturbate followed-cams redirected to login")
+                return self._followed_failure("Chaturbate followed-cams redirected to login")
             if resp.status == 403:
-                return self._untrusted_followed_result("Chaturbate followed-cams returned 403")
+                return self._followed_failure("Chaturbate followed-cams returned 403")
             if resp.status != 200:
-                return self._untrusted_followed_result(f"Chaturbate followed-cams returned HTTP {resp.status}")
+                return self._followed_failure(f"Chaturbate followed-cams returned HTTP {resp.status}")
 
             html = resp.text()
             if self._looks_like_login_or_challenge(html):
-                return self._untrusted_followed_result("Chaturbate followed-cams returned a login or challenge page")
+                return self._followed_failure("Chaturbate followed-cams returned a login or challenge page")
             if page == 1 and not self._looks_like_followed_page_context(html):
-                return self._untrusted_followed_result("Chaturbate followed-cams page shape is not recognized")
+                return self._followed_failure("Chaturbate followed-cams page shape is not recognized")
 
             page_items = self._parse_followed_html(html)
-            if not page_items and page == 1 and self._looks_like_followed_roomlist_shell(html):
-                return await self._fetch_followed_roomlist_api(headers)
             if not page_items and page == 1 and not self._looks_like_empty_followed_page(html):
-                return self._untrusted_followed_result("Chaturbate followed-cams page shape is not recognized")
+                return self._followed_failure("Chaturbate followed-cams page shape is not recognized")
             if page_items and self._has_next_followed_page(html):
-                return self._untrusted_followed_result(
+                return self._followed_failure(
                     "Chaturbate followed-cams HTML pagination is ambiguous"
                 )
 
@@ -565,7 +598,7 @@ class ChaturbateAPI:
                     seen.add(key)
                     models.append(item)
                     if len(models) > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
-                        return self._untrusted_followed_result(
+                        return self._followed_failure(
                             f"Chaturbate followed-cams exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
                         )
 
@@ -573,10 +606,10 @@ class ChaturbateAPI:
                 break
             page += 1
             if page > 200:
-                return self._untrusted_followed_result("Chaturbate followed-cams pagination exceeded safety limit")
+                return self._followed_failure("Chaturbate followed-cams pagination exceeded safety limit")
 
         logger.debug("Fetched followed models", total=len(models), source="followed-cams")
-        return FollowedSyncResult(models, trusted=True)
+        return FollowedSyncResult(models, trusted=True, authoritative=False)
 
     async def _fetch_followed_roomlist_api(self, headers: Dict[str, str]) -> FollowedSyncResult:
         api_headers = dict(headers)
@@ -587,83 +620,118 @@ class ChaturbateAPI:
         models: List[Dict[str, Any]] = []
         seen = set()
         limit = 90
-        offset = 0
 
-        while True:
-            url = (
-                "https://chaturbate.com/api/ts/roomlist/room-list/"
-                f"?limit={limit}&offset={offset}&follow=true"
-            )
-            resp = await self._request("GET", url, headers=api_headers, allow_redirects=False)
-            if not resp:
-                return self._untrusted_followed_result("Chaturbate followed roomlist request failed")
-            if resp.status in _REDIRECT_STATUSES and await self._prepare_flaresolverr_retry_headers(url, api_headers):
+        for offline in (False, True):
+            offset = 0
+            expected_total: Optional[int] = None
+            category_seen = set()
+
+            while True:
+                params = f"limit={limit}&offset={offset}&follow=true"
+                if offline:
+                    params += "&offline=true"
+                url = f"https://chaturbate.com/api/ts/roomlist/room-list/?{params}"
                 resp = await self._request("GET", url, headers=api_headers, allow_redirects=False)
                 if not resp:
-                    return self._untrusted_followed_result("Chaturbate followed roomlist request failed after FlareSolverr")
-            if resp.status in _REDIRECT_STATUSES:
-                return self._untrusted_followed_result("Chaturbate followed roomlist redirected to login")
-            if resp.status == 403:
-                return self._untrusted_followed_result("Chaturbate followed roomlist returned 403")
-            if resp.status != 200:
-                return self._untrusted_followed_result(f"Chaturbate followed roomlist returned HTTP {resp.status}")
+                    return self._followed_failure("Chaturbate followed roomlist request failed")
+                if resp.status in _REDIRECT_STATUSES:
+                    return self._followed_failure("Chaturbate followed roomlist redirected to login")
+                if resp.status == 403:
+                    return self._followed_failure("Chaturbate followed roomlist returned 403")
+                if resp.status != 200:
+                    return self._followed_failure(f"Chaturbate followed roomlist returned HTTP {resp.status}")
 
-            try:
-                data = resp.json()
-            except Exception as e:
-                logger.debug(
-                    "Chaturbate followed roomlist JSON decode failed",
-                    error=str(e),
-                    content_type=str(getattr(resp, "content_type", "") or ""),
-                )
-                return self._untrusted_followed_result("Chaturbate followed roomlist response is not recognized")
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    logger.debug(
+                        "Chaturbate followed roomlist JSON decode failed",
+                        error=str(e),
+                        content_type=str(getattr(resp, "content_type", "") or ""),
+                    )
+                    return self._followed_failure("Chaturbate followed roomlist response is not recognized")
 
-            try:
-                parsed = self._parse_roomlist_payload(data, page=(offset // limit) + 1, limit=limit)
-            except Exception as e:
-                logger.debug("Chaturbate followed roomlist payload ignored", error=str(e))
-                return self._untrusted_followed_result("Chaturbate followed roomlist response is not recognized")
+                if not isinstance(data, dict) or "total_count" not in data:
+                    return self._followed_failure("Chaturbate followed roomlist total is not recognized")
+                total = self._strict_nonnegative_int(data.get("total_count"))
+                if total is None:
+                    return self._followed_failure("Chaturbate followed roomlist total is not recognized")
+                if expected_total is None:
+                    expected_total = total
+                elif total != expected_total:
+                    return self._followed_failure("Chaturbate followed roomlist total changed during pagination")
+                if total > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
+                    return self._followed_failure(
+                        f"Chaturbate followed roomlist exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
+                    )
 
-            if not isinstance(data, dict) or "total_count" not in data:
-                return self._untrusted_followed_result("Chaturbate followed roomlist total is not recognized")
+                page_rooms = data.get("rooms")
+                if not isinstance(page_rooms, list):
+                    return self._followed_failure("Chaturbate followed roomlist rooms are not recognized")
+                if len(page_rooms) > limit or offset + len(page_rooms) > total:
+                    return self._followed_failure("Chaturbate followed roomlist total is inconsistent")
+                if not page_rooms and offset < total:
+                    return self._followed_failure("Chaturbate followed roomlist ended before its reported total")
 
-            total = self._as_int(parsed.get("total"), 0)
-            if total > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
-                return self._untrusted_followed_result(
-                    f"Chaturbate followed roomlist exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
-                )
-
-            page_models = parsed.get("models") or []
-            if page_models and total < offset + len(page_models):
-                return self._untrusted_followed_result("Chaturbate followed roomlist total is inconsistent")
-
-            for model in page_models:
-                item = self._followed_roomlist_item(model)
-                username = item.get("username", "")
-                key = username.lower()
-                if username and key not in seen:
-                    seen.add(key)
-                    models.append(item)
-                    if len(models) > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
-                        return self._untrusted_followed_result(
-                            f"Chaturbate followed roomlist exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
+                for room in page_rooms:
+                    if not isinstance(room, dict) or room.get("is_following") is not True:
+                        return self._followed_failure(
+                            "Chaturbate ignored the followed roomlist filter"
                         )
+                    item = self._parse_room_item(room, is_online=not offline)
+                    username = str(item.get("username") or "").strip()
+                    key = username.lower()
+                    if not username or not re.match(r"^[A-Za-z0-9_]+$", username):
+                        return self._followed_failure("Chaturbate followed roomlist contains an invalid room")
+                    if key in category_seen:
+                        return self._followed_failure("Chaturbate followed roomlist contains duplicate rooms")
+                    category_seen.add(key)
+                    if key not in seen:
+                        seen.add(key)
+                        models.append(item)
+                        if len(models) > PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
+                            return self._followed_failure(
+                                f"Chaturbate followed roomlist exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
+                            )
 
-            if total == 0 or not page_models or offset + len(page_models) >= total:
-                break
-            offset += limit
-            if offset >= PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS:
-                return self._untrusted_followed_result(
-                    f"Chaturbate followed roomlist exceeded safety limit ({PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS})"
-                )
+                next_offset = offset + len(page_rooms)
+                if next_offset == total:
+                    break
+                if len(page_rooms) < limit:
+                    return self._followed_failure("Chaturbate followed roomlist pagination is incomplete")
+                offset = next_offset
 
         logger.debug("Fetched followed models", total=len(models), source="followed-roomlist")
-        return FollowedSyncResult(models, trusted=True)
+        return FollowedSyncResult(models, trusted=True, authoritative=True)
+
+    @staticmethod
+    def _strict_nonnegative_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+            return int(value.strip())
+        return None
+
+    @staticmethod
+    def _followed_failure(reason: str) -> FollowedSyncResult:
+        return FollowedSyncResult(
+            [],
+            trusted=False,
+            skipped_reason=reason,
+            authoritative=False,
+        )
 
     @staticmethod
     def _untrusted_followed_result(reason: str) -> FollowedSyncResult:
         logger.warning("Chaturbate following sync skipped", reason=reason)
-        return FollowedSyncResult([], trusted=False, skipped_reason=reason)
+        return FollowedSyncResult(
+            [],
+            trusted=False,
+            skipped_reason=reason,
+            authoritative=False,
+        )
 
     @staticmethod
     def _html_attr(fragment: str, name: str) -> str:

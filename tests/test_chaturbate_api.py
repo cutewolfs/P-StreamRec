@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from app.services.chaturbate_api import ChaturbateAPI, _FakeResponse
 from app.services.chaturbate_auth import ChaturbateAuthService
@@ -16,6 +17,11 @@ class _FakeAuth:
 class _CookieAuth(_FakeAuth):
     def get_cookies(self):
         return {"sessionid": "abc", "csrftoken": "csrf"}
+
+
+class _UnverifiedCookieAuth(_CookieAuth):
+    def get_status(self):
+        return {"isLoggedIn": False, "hasCookies": True}
 
 
 class _MutableCookieAuth(_FakeAuth):
@@ -42,6 +48,44 @@ class _FakeFlareSolverr:
         }
 
 
+class _ResponseCookie:
+    def __init__(self, key, value):
+        self.key = key
+        self.value = value
+
+
+class _AuthLoginResponse:
+    def __init__(self, status=302, cookies=None):
+        self.status = status
+        self.cookies = {
+            key: _ResponseCookie(key, value)
+            for key, value in (cookies or {}).items()
+        }
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def text(self):
+        return ""
+
+
+class _AuthLoginSession:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def post(self, *args, **kwargs):
+        return self.response
+
+
 def _json_response(payload):
     return _FakeResponse(
         200,
@@ -49,6 +93,22 @@ def _json_response(payload):
         {},
         "application/json",
     )
+
+
+def _followed_room(username, *, online=True, is_following=True):
+    return {
+        "username": username,
+        "display_name": username.title(),
+        "current_show": "public" if online else "offline",
+        "num_users": "42" if online else "0",
+        "img": f"//thumb.example.test/{username}.jpg",
+        "tags": ["French"],
+        "is_following": is_following,
+    }
+
+
+def _empty_followed_response():
+    return _json_response({"rooms": [], "total_count": 0})
 
 
 class _RoomlistAPI(ChaturbateAPI):
@@ -95,6 +155,63 @@ class _FollowedAPI(ChaturbateAPI):
 
 
 class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
+    async def test_followed_sync_requires_a_verified_session_not_only_a_cookie(self):
+        api = ChaturbateAPI(_UnverifiedCookieAuth())
+        api._fetch_followed_roomlist_api = AsyncMock()
+
+        result = await api.get_followed_models()
+
+        self.assertFalse(result.trusted)
+        self.assertFalse(result.authoritative)
+        self.assertIn("not verified", result.skipped_reason)
+        api._fetch_followed_roomlist_api.assert_not_awaited()
+
+    async def test_native_login_redirect_requires_verified_session(self):
+        auth = ChaturbateAuthService(db=object())
+        auth._extract_csrf_token = AsyncMock(return_value=("csrf", {"csrftoken": "csrf"}))
+
+        async def reject_session():
+            self.assertEqual("issued-session", auth._cookies.get("sessionid"))
+            auth._last_validation_error = "Chaturbate session validation redirected to login"
+            return False
+
+        auth._validate_session = AsyncMock(side_effect=reject_session)
+        auth._save_state = AsyncMock()
+        auth._save_error = AsyncMock()
+        session = _AuthLoginSession(_AuthLoginResponse(cookies={"sessionid": "issued-session"}))
+
+        with patch(
+            "app.services.chaturbate_auth.aiohttp_client_session",
+            return_value=session,
+        ):
+            result = await auth.login("alice", "secret")
+
+        self.assertFalse(result["success"])
+        self.assertFalse(auth._is_logged_in)
+        self.assertEqual({}, auth._cookies)
+        auth._save_state.assert_not_awaited()
+        auth._save_error.assert_awaited_once()
+
+    async def test_native_login_persists_only_after_session_validation(self):
+        auth = ChaturbateAuthService(db=object())
+        auth._extract_csrf_token = AsyncMock(return_value=("csrf", {"csrftoken": "csrf"}))
+        auth._validate_session = AsyncMock(return_value=True)
+        auth._save_state = AsyncMock()
+        auth._save_error = AsyncMock()
+        session = _AuthLoginSession(_AuthLoginResponse(cookies={"sessionid": "verified-session"}))
+
+        with patch(
+            "app.services.chaturbate_auth.aiohttp_client_session",
+            return_value=session,
+        ):
+            result = await auth.login("alice", "secret")
+
+        self.assertTrue(result["success"])
+        self.assertTrue(auth._is_logged_in)
+        self.assertEqual("verified-session", auth._cookies["sessionid"])
+        auth._save_state.assert_awaited_once_with("alice", "secret")
+        auth._save_error.assert_not_awaited()
+
     async def test_flaresolverr_cookie_merge_preserves_authenticated_session(self):
         auth = _MutableCookieAuth()
         api = ChaturbateAPI(auth)
@@ -218,7 +335,103 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["valid"], [item["username"] for item in result["models"]])
 
-    async def test_followed_models_parse_followed_cams_html(self):
+    async def test_followed_models_prefers_roomlist_and_combines_online_offline(self):
+        api = _FollowedAPI([
+            _json_response({
+                "rooms": [_followed_room("alice", online=True)],
+                "total_count": 1,
+            }),
+            _json_response({
+                "rooms": [_followed_room("bella", online=False)],
+                "total_count": 1,
+            }),
+        ])
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertTrue(result.authoritative)
+        self.assertEqual(["alice", "bella"], [item["username"] for item in result])
+        self.assertTrue(result[0]["is_online"])
+        self.assertFalse(result[1]["is_online"])
+        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
+        self.assertEqual(2, len(api.requests))
+        self.assertIn("follow=true", api.requests[0]["url"])
+        self.assertNotIn("offline=true", api.requests[0]["url"])
+        self.assertIn("offline=true", api.requests[1]["url"])
+        self.assertTrue(all("/api/ts/roomlist/" in request["url"] for request in api.requests))
+        self.assertEqual("application/json", api.requests[0]["headers"]["Accept"])
+        self.assertEqual("XMLHttpRequest", api.requests[0]["headers"]["X-Requested-With"])
+
+    async def test_followed_roomlist_paginates_complete_snapshot(self):
+        first_page = [_followed_room(f"model_{index}") for index in range(90)]
+        api = _FollowedAPI([
+            _json_response({"rooms": first_page, "total_count": 91}),
+            _json_response({"rooms": [_followed_room("model_90")], "total_count": 91}),
+            _empty_followed_response(),
+        ])
+
+        result = await api.get_followed_models()
+
+        self.assertTrue(result.trusted)
+        self.assertEqual(91, len(result))
+        self.assertIn("offset=90", api.requests[1]["url"])
+
+    async def test_followed_roomlist_rejects_false_is_following_below_safety_cap(self):
+        api = _FollowedAPI([
+            _json_response({
+                "rooms": [_followed_room("global_model", is_following=False)],
+                "total_count": 1,
+            }),
+        ])
+
+        result = await api._fetch_followed_roomlist_api(api._get_headers())
+
+        self.assertFalse(result.trusted)
+        self.assertFalse(result.authoritative)
+        self.assertIn("ignored", result.skipped_reason)
+
+    async def test_followed_roomlist_rejects_missing_is_following(self):
+        room = _followed_room("ambiguous")
+        room.pop("is_following")
+        api = _FollowedAPI([_json_response({"rooms": [room], "total_count": 1})])
+
+        result = await api._fetch_followed_roomlist_api(api._get_headers())
+
+        self.assertFalse(result.trusted)
+        self.assertIn("ignored", result.skipped_reason)
+
+    async def test_followed_roomlist_rejects_missing_or_excessive_total(self):
+        api = _FollowedAPI([_json_response({"rooms": [_followed_room("alice")]})])
+        missing = await api._fetch_followed_roomlist_api(api._get_headers())
+        self.assertFalse(missing.trusted)
+        self.assertIn("total", missing.skipped_reason)
+
+        import app.services.chaturbate_api as cb_api
+
+        original = cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS
+        cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = 2
+        try:
+            api = _FollowedAPI([_json_response({"rooms": [], "total_count": 3})])
+            excessive = await api._fetch_followed_roomlist_api(api._get_headers())
+        finally:
+            cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = original
+        self.assertFalse(excessive.trusted)
+        self.assertIn("safety limit", excessive.skipped_reason)
+
+    async def test_followed_roomlist_rejects_premature_empty_page(self):
+        first_page = [_followed_room(f"model_{index}") for index in range(90)]
+        api = _FollowedAPI([
+            _json_response({"rooms": first_page, "total_count": 91}),
+            _json_response({"rooms": [], "total_count": 91}),
+        ])
+
+        result = await api._fetch_followed_roomlist_api(api._get_headers())
+
+        self.assertFalse(result.trusted)
+        self.assertIn("ended before", result.skipped_reason)
+
+    async def test_followed_models_falls_back_to_non_authoritative_html(self):
         html = """
         <html><body>
           <a href="/followed-cams/">Followed Cams</a>
@@ -228,18 +441,25 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
           </li>
         </body></html>
         """
-        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+        api = _FollowedAPI([
+            _json_response({
+                "rooms": [_followed_room("global_model", is_following=False)],
+                "total_count": 1,
+            }),
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+        ])
 
         result = await api.get_followed_models()
 
         self.assertTrue(result.trusted)
+        self.assertFalse(result.authoritative)
         self.assertEqual("_alice_", result[0]["username"])
-        self.assertTrue(result[0]["is_online"])
         self.assertEqual(1234, result[0]["viewers"])
         self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
-        self.assertFalse(api.requests[0]["kwargs"].get("allow_redirects", True))
+        self.assertIn("/api/ts/roomlist/", api.requests[0]["url"])
+        self.assertEqual("https://chaturbate.com/followed-cams/", api.requests[1]["url"])
 
-    async def test_followed_models_parse_embedded_json_payload(self):
+    async def test_followed_models_parse_embedded_json_html_fallback(self):
         html = """
         <html><body>
           <a href="/followed-cams/">Followed Cams</a>
@@ -252,118 +472,21 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
           </script>
         </body></html>
         """
-        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+        api = _FollowedAPI([
+            _json_response({"rooms": [_followed_room("global", is_following=False)], "total_count": 1}),
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+        ])
 
         result = await api.get_followed_models()
 
         self.assertTrue(result.trusted)
+        self.assertFalse(result.authoritative)
         self.assertEqual("_alice_", result[0]["username"])
         self.assertEqual("Alice", result[0]["display_name"])
         self.assertEqual(123, result[0]["viewers"])
-        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
         self.assertEqual(["French"], result[0]["tags"])
 
-    async def test_followed_models_use_roomlist_api_for_react_shell(self):
-        html = """
-        <html><body>
-          <a href="/followed-cams/">Followed Cams</a>
-          <div id="roomlist_root" data-testid="room-list">
-            <li class="roomCard placeholder camBgColor"></li>
-          </div>
-        </body></html>
-        """
-        api = _FollowedAPI([
-            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
-            _json_response({
-                "rooms": [{
-                    "username": "alice",
-                    "display_name": "Alice",
-                    "current_show": "public",
-                    "num_users": "42",
-                    "img": "//thumb.example.test/alice.jpg",
-                    "tags": ["French"],
-                }],
-                "total_count": 1,
-            }),
-        ])
-
-        result = await api.get_followed_models()
-
-        self.assertTrue(result.trusted)
-        self.assertEqual(["alice"], [item["username"] for item in result])
-        self.assertEqual("https://thumb.example.test/alice.jpg", result[0]["thumbnail_url"])
-        self.assertIn("follow=true", api.requests[1]["url"])
-        self.assertEqual("application/json", api.requests[1]["headers"]["Accept"])
-        self.assertEqual("XMLHttpRequest", api.requests[1]["headers"]["X-Requested-With"])
-
-    async def test_followed_models_reject_roomlist_api_above_safety_limit(self):
-        import app.services.chaturbate_api as cb_api
-
-        html = """
-        <html><body>
-          <a href="/followed-cams/">Followed Cams</a>
-          <div id="roomlist_root" data-testid="room-list"></div>
-        </body></html>
-        """
-        original = cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS
-        cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = 2
-        try:
-            api = _FollowedAPI([
-                _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
-                _json_response({
-                    "rooms": [{"username": "alice"}, {"username": "bella"}],
-                    "total_count": 36000,
-                }),
-            ])
-            result = await api.get_followed_models()
-        finally:
-            cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = original
-
-        self.assertFalse(result.trusted)
-        self.assertEqual([], list(result))
-        self.assertIn("safety limit", result.skipped_reason)
-
-    async def test_followed_models_reject_full_roomlist_page_without_total(self):
-        html = """
-        <html><body>
-          <a href="/followed-cams/">Followed Cams</a>
-          <div id="roomlist_root" data-testid="room-list"></div>
-        </body></html>
-        """
-        api = _FollowedAPI([
-            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
-            _json_response({
-                "rooms": [{"username": f"model_{i}"} for i in range(90)],
-            }),
-        ])
-
-        result = await api.get_followed_models()
-
-        self.assertFalse(result.trusted)
-        self.assertEqual([], list(result))
-        self.assertIn("total", result.skipped_reason)
-
-    async def test_followed_models_reject_short_roomlist_page_without_total(self):
-        html = """
-        <html><body>
-          <a href="/followed-cams/">Followed Cams</a>
-          <div id="roomlist_root" data-testid="room-list"></div>
-        </body></html>
-        """
-        api = _FollowedAPI([
-            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
-            _json_response({
-                "rooms": [{"username": "global_model"}],
-            }),
-        ])
-
-        result = await api.get_followed_models()
-
-        self.assertFalse(result.trusted)
-        self.assertEqual([], list(result))
-        self.assertIn("total", result.skipped_reason)
-
-    async def test_followed_models_reject_paginated_html_roomlist(self):
+    async def test_followed_models_reject_paginated_html_fallback(self):
         html = """
         <html><body>
           <a href="/followed-cams/">Followed Cams</a>
@@ -373,7 +496,10 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
           <a href="/followed-cams/?page=2">Next</a>
         </body></html>
         """
-        api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+        api = _FollowedAPI([
+            _json_response({"rooms": [_followed_room("global", is_following=False)], "total_count": 1}),
+            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+        ])
 
         result = await api.get_followed_models()
 
@@ -381,8 +507,11 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], list(result))
         self.assertIn("pagination", result.skipped_reason)
 
-    async def test_followed_models_skip_untrusted_login_redirect(self):
-        api = _FollowedAPI([_FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html")])
+    async def test_followed_models_skip_when_api_and_html_redirect_to_login(self):
+        api = _FollowedAPI([
+            _FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html"),
+            _FakeResponse(302, b"", {"Location": "/auth/login/"}, "text/html"),
+        ])
 
         result = await api.get_followed_models()
 
@@ -390,33 +519,7 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], list(result))
         self.assertIn("redirected", result.skipped_reason)
 
-    async def test_followed_models_retry_login_redirect_with_flaresolverr(self):
-        html = """
-        <html><body>
-          <a href="/followed-cams/">Followed Cams</a>
-          <li class="room_list_room" data-room="alice">
-            <img src="//thumb.example.test/alice.jpg">
-            <span class="cams">42</span>
-          </li>
-        </body></html>
-        """
-        flaresolverr = _FakeFlareSolverr()
-        api = _FollowedAPI([
-            _FakeResponse(302, b"", {"Location": "/auth/login/?next=/followed-cams/"}, "text/html"),
-            _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
-        ], flaresolverr=flaresolverr)
-
-        result = await api.get_followed_models()
-
-        self.assertTrue(result.trusted)
-        self.assertEqual(["alice"], [item["username"] for item in result])
-        self.assertEqual(["https://chaturbate.com/followed-cams/"], flaresolverr.urls)
-        self.assertEqual(2, len(api.requests))
-        retry_headers = api.requests[1]["headers"]
-        self.assertEqual("Solved-UA", retry_headers["User-Agent"])
-        self.assertIn("cf_clearance=solved", retry_headers["Cookie"])
-
-    async def test_followed_models_skip_when_safety_limit_is_exceeded(self):
+    async def test_followed_html_fallback_skips_when_safety_limit_is_exceeded(self):
         import app.services.chaturbate_api as cb_api
 
         html = """
@@ -427,7 +530,10 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         original = cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS
         cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = 1
         try:
-            api = _FollowedAPI([_FakeResponse(200, html.encode("utf-8"), {}, "text/html")])
+            api = _FollowedAPI([
+                _json_response({"rooms": [_followed_room("global", is_following=False)], "total_count": 1}),
+                _FakeResponse(200, html.encode("utf-8"), {}, "text/html"),
+            ])
             result = await api.get_followed_models()
         finally:
             cb_api.PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS = original

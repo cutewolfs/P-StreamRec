@@ -7,7 +7,6 @@ import asyncio
 import json
 import re
 import time
-from pathlib import Path
 from typing import Optional, Dict, Any
 
 import aiohttp
@@ -229,10 +228,26 @@ class ChaturbateAuthService:
                                 await self._save_error(username, self._last_error)
                                 return {"success": False, "error": self._last_error}
 
-                            # Save state
+                            # A redirect plus a sessionid is not sufficient:
+                            # regional login/age walls can issue a cookie while
+                            # leaving the account unauthenticated. Verify the
+                            # authenticated API before persisting login state.
                             self._cookies = all_cookies
-                            self._is_logged_in = True
                             self._username = username
+                            self._is_logged_in = False
+                            if not await self._validate_session():
+                                validation_error = (
+                                    self._last_validation_error
+                                    or self._last_error
+                                    or "Login session could not be verified"
+                                )
+                                self._cookies = {}
+                                self._username = None
+                                self._last_error = validation_error
+                                await self._save_error(username, validation_error)
+                                return {"success": False, "error": validation_error}
+
+                            self._is_logged_in = True
                             await self._save_state(username, password)
 
                             logger.success("Chaturbate login successful",

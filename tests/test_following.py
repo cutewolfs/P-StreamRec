@@ -119,6 +119,7 @@ class FollowingSyncTests(unittest.IsolatedAsyncioTestCase):
             ({"alice"}, "chaturbate"),
             ({"bella"}, "cam4"),
         ], db.removed)
+        self.assertTrue(all(item["authoritative"] for item in result["results"]))
         self.assertTrue(db.reconciled)
 
     async def test_provider_without_remote_sync_is_left_local_only(self):
@@ -151,7 +152,30 @@ class FollowingSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], db.upserts)
         self.assertEqual([], db.removed)
         self.assertFalse(result["results"][0]["trusted"])
+        self.assertFalse(result["results"][0]["authoritative"])
         self.assertEqual("login page", result["results"][0]["skippedReason"])
+
+    async def test_non_authoritative_remote_sync_upserts_without_removing_cache(self):
+        db = _DB()
+        registry = _Registry([
+            _Provider(
+                "chaturbate",
+                FollowedSyncResult(
+                    [{"username": "alice", "display_name": "Alice", "is_online": True}],
+                    authoritative=False,
+                ),
+                can_login=True,
+                can_sync_following=True,
+            ),
+        ])
+        following.init(None, None, db, registry)
+
+        result = await following.sync_following()
+
+        self.assertEqual(["alice"], [item["username"] for item in db.upserts])
+        self.assertEqual([], db.removed)
+        self.assertTrue(result["results"][0]["trusted"])
+        self.assertFalse(result["results"][0]["authoritative"])
 
     async def test_get_following_includes_provider_summaries(self):
         db = _FollowingDB()

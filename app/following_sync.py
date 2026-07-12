@@ -12,14 +12,20 @@ def sync_items_skipped_reason(items: object) -> str | None:
     return str(reason) if reason else None
 
 
+def sync_items_authoritative(items: object) -> bool:
+    return bool(getattr(items, "authoritative", True))
+
+
 async def store_provider_following(db: Any, source_type: str, items: list[dict]) -> dict:
     if not sync_items_trusted(items):
         return {
             "synced": 0,
             "trusted": False,
+            "authoritative": False,
             "skippedReason": sync_items_skipped_reason(items) or "Following sync skipped",
         }
 
+    authoritative = sync_items_authoritative(items)
     synced_usernames = set()
     for item in items or []:
         username = item.get("username")
@@ -40,5 +46,11 @@ async def store_provider_following(db: Any, source_type: str, items: list[dict])
         )
         synced_usernames.add(username)
 
-    await db.remove_unfollowed(synced_usernames, source_type=source_type)
-    return {"synced": len(synced_usernames), "trusted": True, "skippedReason": None}
+    if authoritative:
+        await db.remove_unfollowed(synced_usernames, source_type=source_type)
+    return {
+        "synced": len(synced_usernames),
+        "trusted": True,
+        "authoritative": authoritative,
+        "skippedReason": None,
+    }

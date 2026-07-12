@@ -393,6 +393,7 @@ async def sync_following():
                     "displayName": display_name,
                     "synced": synced,
                     "trusted": stored["trusted"],
+                    "authoritative": stored["authoritative"],
                     "skippedReason": stored["skippedReason"],
                     "success": True,
                 })
@@ -454,12 +455,14 @@ async def sync_following():
     return {
         "synced": synced,
         "trusted": stored["trusted"],
+        "authoritative": stored["authoritative"],
         "skippedReason": stored["skippedReason"],
         "results": [{
             "sourceType": "chaturbate",
             "displayName": "Chaturbate",
             "synced": synced,
             "trusted": stored["trusted"],
+            "authoritative": stored["authoritative"],
             "skippedReason": stored["skippedReason"],
             "success": True,
         }],
