@@ -9,6 +9,7 @@ import re
 import time
 from html import unescape
 from typing import Optional, List, Dict, Any
+from curl_cffi.requests import AsyncSession
 
 import aiohttp
 
@@ -115,58 +116,71 @@ class ChaturbateAPI:
         url: str,
         headers: Optional[Dict] = None,
         **kwargs
-    ) -> Optional[aiohttp.ClientResponse]:
-        """Make an HTTP request with rate limiting, retry on 403"""
+    ) -> Optional["_FakeResponse"]:
+        """Make an HTTP request with rate limiting, using curl_cffi to bypass
+        Cloudflare TLS fingerprinting, with FlareSolverr fallback on 403."""
         async with self._semaphore:
             await self._rate_limit()
 
             if headers is None:
                 headers = self._get_headers()
 
-            async with aiohttp_client_session() as session:
-                try:
-                    async with session.request(
-                        method, url, headers=headers, ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                        **aiohttp_request_kwargs(),
-                        **kwargs
-                    ) as resp:
-                        if resp.status == 403 or resp.status in _REDIRECT_STATUSES:
-                            # Cloudflare block - try FlareSolverr
-                            if self.flaresolverr:
-                                logger.info(
-                                    "Chaturbate protection detected, attempting FlareSolverr bypass",
-                                    status=resp.status,
+            curl_kwargs = {}
+            if "data" in kwargs:
+                curl_kwargs["data"] = kwargs.pop("data")
+            if "json" in kwargs:
+                curl_kwargs["json"] = kwargs.pop("json")
+            if "params" in kwargs:
+                curl_kwargs["params"] = kwargs.pop("params")
+            if "cookies" in kwargs:
+                curl_kwargs["cookies"] = kwargs.pop("cookies")
+
+            try:
+                async with AsyncSession() as session:
+                    resp = await session.request(
+                        method,
+                        url,
+                        headers=headers,
+                        impersonate="chrome120",
+                        timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+                        **curl_kwargs,
+                    )
+
+                    if resp.status_code == 403 or resp.status_code in _REDIRECT_STATUSES:
+                        if self.flaresolverr:
+                            logger.info(
+                                "Chaturbate protection detected, attempting FlareSolverr bypass",
+                                status=resp.status_code,
+                            )
+                            solved = await self._prepare_flaresolverr_retry_headers(url, headers)
+
+                            if solved:
+                                await self._rate_limit()
+                                retry_resp = await session.request(
+                                    method,
+                                    url,
+                                    headers=headers,
+                                    impersonate="chrome120",
+                                    timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+                                    **curl_kwargs,
                                 )
-                                solved = await self._prepare_flaresolverr_retry_headers(url, headers)
+                                return _FakeResponse(
+                                    retry_resp.status_code,
+                                    retry_resp.content,
+                                    retry_resp.headers,
+                                    retry_resp.headers.get("content-type"),
+                                )
 
-                                # Retry
-                                if solved:
-                                    await self._rate_limit()
-                                    async with session.request(
-                                        method, url, headers=headers, ssl=False,
-                                        timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                                        **aiohttp_request_kwargs(),
-                                        **kwargs
-                                    ) as retry_resp:
-                                        # Read body before response context exits
-                                        body = await retry_resp.read()
-                                        return _FakeResponse(
-                                            retry_resp.status,
-                                            body,
-                                            retry_resp.headers,
-                                            retry_resp.content_type
-                                        )
+                    return _FakeResponse(
+                        resp.status_code,
+                        resp.content,
+                        resp.headers,
+                        resp.headers.get("content-type"),
+                    )
 
-                        # Read body before context exits
-                        body = await resp.read()
-                        return _FakeResponse(
-                            resp.status, body, resp.headers, resp.content_type
-                        )
-
-                except Exception as e:
-                    logger.error("Request error", url=url, error=str(e))
-                    return None
+            except Exception as e:
+                logger.error("Request error", url=url, error=str(e))
+                return None
 
     async def check_status(self, username: str) -> Dict[str, Any]:
         """Statut Chaturbate d'un username. Renvoie un dict normalisé.
@@ -215,8 +229,8 @@ class ChaturbateAPI:
         Uses the roomlist API or scrapes the homepage.
 
         tag: filter by a single tag via the native API (e.g. "french", "18").
-             Le filtrage natif est crucial : sans ça le total_count reflète
-             l'ensemble et la pagination calculée côté backend est fausse.
+            Le filtrage natif est crucial : sans ça le total_count reflète
+            l'ensemble et la pagination calculée côté backend est fausse.
         """
         try:
             # Try the internal API first
@@ -1078,7 +1092,7 @@ class ChaturbateAPI:
 
             if not resp or resp.status != 200:
                 logger.warning(f"Failed to {action} model", username=username,
-                              status=resp.status if resp else None)
+                            status=resp.status if resp else None)
                 return False
 
             # Verify the state server-side (anti-bot sometimes returns 200 then drops)
@@ -1148,7 +1162,7 @@ class ChaturbateAPI:
                     hls_url = result.get("url")
                     if hls_url:
                         logger.debug("Got edge HLS URL",
-                                   username=username, source="edge_ajax")
+                                username=username, source="edge_ajax")
                         return hls_url
             except Exception as e:
                 logger.debug("Edge HLS failed", username=username, error=str(e))
@@ -1169,7 +1183,7 @@ class ChaturbateAPI:
                 ]:
                     if data.get(field):
                         logger.debug("Got HLS URL from API",
-                                   username=username, field=field)
+                                username=username, field=field)
                         return data[field]
         except Exception as e:
             logger.debug("API HLS failed", username=username, error=str(e))

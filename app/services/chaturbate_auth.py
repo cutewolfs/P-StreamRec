@@ -1,6 +1,7 @@
 """
 Chaturbate Authentication Service
 Handles login flow, cookie management, and session persistence
+Uses curl_cffi (impersonate=chrome) to match real browser TLS/JA3 fingerprint
 """
 
 import asyncio
@@ -11,6 +12,7 @@ from typing import Optional, Dict, Any
 
 import aiohttp
 import bcrypt
+from curl_cffi.requests import AsyncSession
 
 from ..logger import logger
 from ..core.config import (
@@ -25,6 +27,7 @@ from .flaresolverr import FlareSolverrClient
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _CHATURBATE_AUTH_COOKIE_NAMES = {"sessionid", "csrftoken"}
+_IMPERSONATE_TARGET = "chrome124"  # curl_cffi impersonation profile
 
 
 def _is_cloudflare_cookie(name: str) -> bool:
@@ -68,10 +71,13 @@ class ChaturbateAuthService:
         self.flaresolverr = flaresolverr
         self._session: Optional[aiohttp.ClientSession] = None
         self._cookies: Dict[str, str] = {}
+        # Kept for compatibility with other services reading get_user_agent();
+        # curl_cffi's impersonate profile sets the *real* UA/TLS internally,
+        # this string is just what we report to callers/DB.
         self._user_agent: str = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         )
         self._is_logged_in: bool = False
         self._username: Optional[str] = None
@@ -121,7 +127,6 @@ class ChaturbateAuthService:
                 except (json.JSONDecodeError, TypeError):
                     pass
 
-            # Also load from file backup
             if not self._cookies and self._cookies_file.exists():
                 try:
                     with open(self._cookies_file, "r") as f:
@@ -149,7 +154,6 @@ class ChaturbateAuthService:
                         last_error=self._last_error,
                     )
 
-        # Apply legacy cookie env vars as fallback
         if not self._cookies:
             if CHATURBATE_CSRFTOKEN:
                 self._cookies["csrftoken"] = CHATURBATE_CSRFTOKEN
@@ -164,9 +168,9 @@ class ChaturbateAuthService:
     async def login(self, username: str, password: str) -> Dict[str, Any]:
         """
         Login to Chaturbate.
-        1. GET chaturbate.com/ to extract CSRF token
-        2. If 403 (Cloudflare): use FlareSolverr, retry
-        3. POST /auth/login/ with credentials
+        1. GET chaturbate.com/ via curl_cffi (chrome impersonation) to extract CSRF token
+        2. If still blocked: use FlareSolverr, retry
+        3. POST /auth/login/ with credentials via curl_cffi
         4. Save cookies to DB + file
         """
         async with self._lock:
@@ -182,10 +186,9 @@ class ChaturbateAuthService:
                     await self._save_error(username, self._last_error)
                     return {"success": False, "error": self._last_error}
 
-                # Step 2: POST login
+                # Step 2: POST login (curl_cffi impersonating Chrome TLS/JA3)
                 login_url = "https://chaturbate.com/auth/login/"
                 headers = {
-                    "User-Agent": self._user_agent,
                     "Referer": "https://chaturbate.com/",
                     "Origin": "https://chaturbate.com",
                     "Content-Type": "application/x-www-form-urlencoded",
@@ -198,76 +201,61 @@ class ChaturbateAuthService:
                     "next": "/",
                 }
 
-                cookie_header = "; ".join(
-                    f"{k}={v}" for k, v in initial_cookies.items()
-                )
-                if cookie_header:
-                    headers["Cookie"] = cookie_header
-
-                async with aiohttp_client_session() as session:
-                    async with session.post(
+                async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
+                    resp = await session.post(
                         login_url,
                         data=form_data,
                         headers=headers,
+                        cookies=initial_cookies,
                         allow_redirects=False,
-                        ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                        **aiohttp_request_kwargs(),
-                    ) as resp:
-                        # Successful login returns 302 redirect
-                        if resp.status in (301, 302):
-                            # Extract cookies from response
-                            all_cookies = {}
-                            all_cookies.update(initial_cookies)
-                            for cookie in resp.cookies.values():
-                                all_cookies[cookie.key] = cookie.value
+                        timeout=30,
+                    )
 
-                            # Check if we got a sessionid
-                            if "sessionid" not in all_cookies:
-                                self._last_error = "Login failed: no session cookie received"
-                                await self._save_error(username, self._last_error)
-                                return {"success": False, "error": self._last_error}
+                    if resp.status_code in (301, 302):
+                        all_cookies = {}
+                        all_cookies.update(initial_cookies)
+                        for name, value in resp.cookies.items():
+                            all_cookies[name] = value
 
-                            # A redirect plus a sessionid is not sufficient:
-                            # regional login/age walls can issue a cookie while
-                            # leaving the account unauthenticated. Verify the
-                            # authenticated API before persisting login state.
-                            self._cookies = all_cookies
-                            self._username = username
-                            self._is_logged_in = False
-                            if not await self._validate_session():
-                                validation_error = (
-                                    self._last_validation_error
-                                    or self._last_error
-                                    or "Login session could not be verified"
-                                )
-                                self._cookies = {}
-                                self._username = None
-                                self._last_error = validation_error
-                                await self._save_error(username, validation_error)
-                                return {"success": False, "error": validation_error}
-
-                            self._is_logged_in = True
-                            await self._save_state(username, password)
-
-                            logger.success("Chaturbate login successful",
-                                         username=username)
-                            return {"success": True, "username": username}
-
-                        elif resp.status == 200:
-                            # 200 usually means login form re-rendered (wrong creds)
-                            body = await resp.text()
-                            if "error" in body.lower() or "incorrect" in body.lower():
-                                self._last_error = "Invalid username or password"
-                            else:
-                                self._last_error = "Login failed (form re-rendered)"
+                        if "sessionid" not in all_cookies:
+                            self._last_error = "Login failed: no session cookie received"
                             await self._save_error(username, self._last_error)
                             return {"success": False, "error": self._last_error}
 
+                        self._cookies = all_cookies
+                        self._username = username
+                        self._is_logged_in = False
+                        if not await self._validate_session():
+                            validation_error = (
+                                self._last_validation_error
+                                or self._last_error
+                                or "Login session could not be verified"
+                            )
+                            self._cookies = {}
+                            self._username = None
+                            self._last_error = validation_error
+                            await self._save_error(username, validation_error)
+                            return {"success": False, "error": validation_error}
+
+                        self._is_logged_in = True
+                        await self._save_state(username, password)
+
+                        logger.success("Chaturbate login successful", username=username)
+                        return {"success": True, "username": username}
+
+                    elif resp.status_code == 200:
+                        body = resp.text
+                        if "error" in body.lower() or "incorrect" in body.lower():
+                            self._last_error = "Invalid username or password"
                         else:
-                            self._last_error = f"Login failed with HTTP {resp.status}"
-                            await self._save_error(username, self._last_error)
-                            return {"success": False, "error": self._last_error}
+                            self._last_error = "Login failed (form re-rendered)"
+                        await self._save_error(username, self._last_error)
+                        return {"success": False, "error": self._last_error}
+
+                    else:
+                        self._last_error = f"Login failed with HTTP {resp.status_code}"
+                        await self._save_error(username, self._last_error)
+                        return {"success": False, "error": self._last_error}
 
             except Exception as e:
                 self._last_error = f"Login error: {str(e)}"
@@ -276,79 +264,79 @@ class ChaturbateAuthService:
                 return {"success": False, "error": self._last_error}
 
     async def _extract_csrf_token(self) -> tuple:
-        """Extract CSRF token from Chaturbate homepage"""
+        """Extract CSRF token from Chaturbate homepage via curl_cffi (Chrome impersonation)."""
         url = "https://chaturbate.com/"
         headers = {
-            "User-Agent": self._user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
 
-        cookies = {}
+        cookies: Dict[str, str] = {}
 
-        async with aiohttp_client_session() as session:
-            try:
-                async with session.get(
-                    url, headers=headers, ssl=False,
+        try:
+            async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
+                resp = await session.get(
+                    url, headers=headers,
                     allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    if resp.status == 403 or resp.status in _REDIRECT_STATUSES:
-                        # Cloudflare block - use FlareSolverr
-                        logger.info(
-                            "Chaturbate protection detected, using FlareSolverr",
-                            status=resp.status,
+                    timeout=15,
+                )
+
+                if resp.status_code == 403 or resp.status_code in _REDIRECT_STATUSES:
+                    logger.info(
+                        "Chaturbate protection detected, using FlareSolverr",
+                        status=resp.status_code,
+                    )
+                    fs_headers: Dict[str, str] = {}
+                    if await self._prepare_flaresolverr_headers(url, fs_headers, cookies):
+                        retry_cookies = {**cookies}
+                        retry_resp = await session.get(
+                            url, headers=fs_headers,
+                            cookies=retry_cookies,
+                            allow_redirects=False,
+                            timeout=15,
                         )
-                        if await self._prepare_flaresolverr_headers(url, headers, cookies):
-                            async with session.get(
-                                url, headers=headers, ssl=False,
-                                allow_redirects=False,
-                                timeout=aiohttp.ClientTimeout(total=15),
-                                **aiohttp_request_kwargs(),
-                            ) as retry_resp:
-                                if retry_resp.status == 200:
-                                    html = await retry_resp.text()
-                                    for c in retry_resp.cookies.values():
-                                        cookies[c.key] = c.value
-                                    csrf = self._parse_csrf(html, cookies)
-                                    return csrf, cookies
-                        return None, {}
-
-                    elif resp.status == 200:
-                        html = await resp.text()
-                        for c in resp.cookies.values():
-                            cookies[c.key] = c.value
-                        if self.flaresolverr and "cf_clearance" not in cookies:
+                        if retry_resp.status_code == 200:
+                            html = retry_resp.text
+                            for name, value in retry_resp.cookies.items():
+                                cookies[name] = value
                             csrf = self._parse_csrf(html, cookies)
-                            if await self._prepare_flaresolverr_headers(url, headers, cookies):
-                                async with session.get(
-                                    url, headers=headers, ssl=False,
-                                    allow_redirects=False,
-                                    timeout=aiohttp.ClientTimeout(total=15),
-                                    **aiohttp_request_kwargs(),
-                                ) as retry_resp:
-                                    if retry_resp.status == 200:
-                                        retry_html = await retry_resp.text()
-                                        for c in retry_resp.cookies.values():
-                                            cookies[c.key] = c.value
-                                        retry_csrf = self._parse_csrf(retry_html, cookies)
-                                        return retry_csrf or csrf, cookies
                             return csrf, cookies
+                    return None, {}
+
+                elif resp.status_code == 200:
+                    html = resp.text
+                    for name, value in resp.cookies.items():
+                        cookies[name] = value
+                    if self.flaresolverr and "cf_clearance" not in cookies:
                         csrf = self._parse_csrf(html, cookies)
+                        fs_headers = {}
+                        if await self._prepare_flaresolverr_headers(url, fs_headers, cookies):
+                            retry_resp = await session.get(
+                                url, headers=fs_headers,
+                                cookies=cookies,
+                                allow_redirects=False,
+                                timeout=15,
+                            )
+                            if retry_resp.status_code == 200:
+                                retry_html = retry_resp.text
+                                for name, value in retry_resp.cookies.items():
+                                    cookies[name] = value
+                                retry_csrf = self._parse_csrf(retry_html, cookies)
+                                return retry_csrf or csrf, cookies
                         return csrf, cookies
+                    csrf = self._parse_csrf(html, cookies)
+                    return csrf, cookies
 
-                    else:
-                        logger.error("Failed to load Chaturbate", status=resp.status)
-                        return None, {}
+                else:
+                    logger.error("Failed to load Chaturbate", status=resp.status_code)
+                    return None, {}
 
-            except Exception as e:
-                logger.error("Error extracting CSRF token", error=str(e))
-                return None, {}
+        except Exception as e:
+            logger.error("Error extracting CSRF token", error=str(e))
+            return None, {}
 
     def _parse_csrf(self, html: str, cookies: dict) -> Optional[str]:
         """Parse CSRF token from HTML or cookies"""
-        # Try HTML input field
         match = re.search(
             r'name=["\']csrfmiddlewaretoken["\']\s+value=["\']([^"\']+)["\']',
             html
@@ -356,11 +344,9 @@ class ChaturbateAuthService:
         if match:
             return match.group(1)
 
-        # Try from cookies
         if "csrftoken" in cookies:
             return cookies["csrftoken"]
 
-        # Try meta tag
         match = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
         if match:
             return match.group(1)
@@ -388,7 +374,6 @@ class ChaturbateAuthService:
             last_error=None
         )
 
-        # Also save to file backup
         try:
             self._cookies_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self._cookies_file, "w") as f:
@@ -413,11 +398,9 @@ class ChaturbateAuthService:
         if not self._is_logged_in or not self._cookies:
             return None
 
-        # Validate existing session
         is_valid = await self._validate_session()
         if is_valid:
             session = aiohttp.ClientSession(trust_env=True)
-            # Set cookies on session
             for name, value in self._cookies.items():
                 session.cookie_jar.update_cookies(
                     {name: value},
@@ -425,11 +408,9 @@ class ChaturbateAuthService:
                 )
             return session
 
-        # Session expired - try re-login from saved credentials
         auth_state = await self.db.get_auth_state()
         if auth_state and auth_state.get("username"):
             logger.info("Session expired, attempting re-login")
-            # We can't re-login without the password
             self._is_logged_in = False
             self._last_error = "Session expired, please re-login"
             return None
@@ -445,48 +426,45 @@ class ChaturbateAuthService:
         return valid
 
     async def _validate_session_detail(self) -> tuple[bool, Optional[str]]:
-        """Validate the current cookie jar and explain common failure modes."""
+        """Validate the current cookie jar via curl_cffi (Chrome impersonation)."""
         if not self._cookies.get("sessionid"):
             return False, "Chaturbate sessionid cookie is missing"
 
         try:
             headers = {
-                 "User-Agent": self._user_agent,
                 "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": "https://chaturbate.com/followed-cams/",
-                "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
             }
-            async with aiohttp_client_session() as session:
-                async with session.get(
+            async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
+                resp = await session.get(
                     "https://chaturbate.com/api/ts/chatmessages/pm_users/?offset=0",
                     headers=headers,
+                    cookies=self._cookies,
                     allow_redirects=False,
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    if resp.status == 200:
-                        return True, None
-                    if resp.status in {301, 302, 303, 307, 308}:
-                        return False, "Chaturbate session validation redirected to login"
-                    if resp.status == 403:
-                        return False, "Chaturbate returned 403 while validating the imported session"
-                async with session.get(
+                    timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+                )
+                if resp.status_code == 200:
+                    return True, None
+                if resp.status_code in {301, 302, 303, 307, 308}:
+                    return False, "Chaturbate session validation redirected to login"
+                if resp.status_code == 403:
+                    return False, "Chaturbate returned 403 while validating the imported session"
+
+                resp2 = await session.get(
                     "https://chaturbate.com/followed-cams/",
                     headers=headers,
+                    cookies=self._cookies,
                     allow_redirects=False,
-                    ssl=False,
-                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                    **aiohttp_request_kwargs(),
-                ) as resp:
-                    if resp.status == 200:
-                        return True, None
-                    if resp.status in {301, 302, 303, 307, 308}:
-                        return False, "Chaturbate followed-cams redirected to login"
-                    if resp.status == 403:
-                        return False, "Chaturbate returned 403 on followed-cams; import the same browser cookies and User-Agent"
-                    return False, f"Chaturbate session validation failed with HTTP {resp.status}"
+                    timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+                )
+                if resp2.status_code == 200:
+                    return True, None
+                if resp2.status_code in {301, 302, 303, 307, 308}:
+                    return False, "Chaturbate followed-cams redirected to login"
+                if resp2.status_code == 403:
+                    return False, "Chaturbate returned 403 on followed-cams; import the same browser cookies and User-Agent"
+                return False, f"Chaturbate session validation failed with HTTP {resp2.status_code}"
         except Exception as e:
             logger.debug("Session validation error", error=str(e))
             return False, f"Chaturbate session validation error: {e}"
