@@ -11,6 +11,7 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 from datetime import datetime, timezone
+from curl_cffi.requests import AsyncSession
 
 if TYPE_CHECKING:
     from ..ffmpeg_runner import FFmpegManager
@@ -100,43 +101,18 @@ async def check_model_status(
 ) -> dict:
     """Vérifie le statut d'un modèle via l'API Chaturbate.
 
-    Cookies priority:
-    1. ``auth_cookies`` (authenticated session stored in DB, injected by the
-       ChaturbateAuthService via the builtin plugin or monitor task)
-    2. ``CHATURBATE_*`` environment variables (legacy fallback)
-
-    Without auth cookies Chaturbate redirects ``/api/chatvideocontext/`` to the
-    login page and the check silently fails (see GH #11).
-
-    When the chatvideocontext API is blocked by Cloudflare TLS fingerprinting
-    (connection reset, error code 0), the CDN thumbnail endpoint is used as a
-    reliable fallback to detect liveness without any Cloudflare dependency.
+    Utilise curl_cffi avec impersonation Chrome pour contourner le
+    fingerprinting TLS de Cloudflare qui bloque aiohttp/httpx classiques.
     """
     try:
         url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Referer": "https://chaturbate.com/",
-            "Origin": "https://chaturbate.com",
-            "Connection": "keep-alive",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
 
         cookies: dict[str, str] = {}
-
         if auth_cookies:
             cookies.update(auth_cookies)
-
         if csrftoken and "csrftoken" not in cookies:
             cookies["csrftoken"] = csrftoken
 
-        # Legacy env-var fallback: only fill slots the authenticated session did
-        # not already provide.
         affkey_env = os.getenv("CHATURBATE_AFFKEY")
         sessionid_env = os.getenv("CHATURBATE_SESSIONID")
         if affkey_env and "affkey" not in cookies:
@@ -144,34 +120,37 @@ async def check_model_status(
         if sessionid_env and "sessionid" not in cookies:
             cookies["sessionid"] = sessionid_env
 
-        if cookies:
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        
-        async with session.get(
-            url,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-            ssl=False,
-            **aiohttp_request_kwargs(),
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                
-                # Log les données de l'API pour débogage
-                logger.debug("Réponse API Chaturbate", 
-                           username=username,
-                           room_status=data.get("room_status"),
-                           has_hls=bool(data.get("hls_source")),
-                           num_users=data.get("num_users", 0))
-                
-                # Détection améliorée du statut en ligne
+        headers = {
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://chaturbate.com/{username}/",
+            "Origin": "https://chaturbate.com",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        async with AsyncSession() as curl_session:
+            response = await curl_session.get(
+                url,
+                headers=headers,
+                cookies=cookies,
+                impersonate="chrome120",
+                timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+
+                logger.debug(
+                    "Réponse API Chaturbate",
+                    username=username,
+                    room_status=data.get("room_status"),
+                    has_hls=bool(data.get("hls_source")),
+                    num_users=data.get("num_users", 0),
+                )
+
                 room_status = data.get("room_status", "")
                 hls_source = data.get("hls_source")
-                
-                # Un modèle est en ligne si :
-                # 1. Il a un flux HLS disponible OU
-                # 2. Le room_status est "public" OU
-                # 3. Le room_status est "away" (temporairement absent mais toujours en ligne)
+
                 is_online = (
                     bool(hls_source) or
                     room_status in ["public", "away"]
@@ -189,8 +168,6 @@ async def check_model_status(
     except Exception as e:
         logger.debug("Erreur vérification statut modèle", username=username, error=str(e))
 
-    # Fallback: chatvideocontext is blocked by Cloudflare TLS fingerprinting.
-    # Use the thumbnail CDN which has no CF protection to detect liveness.
     try:
         is_live = await _check_live_via_cdn(session, username)
         if is_live:
