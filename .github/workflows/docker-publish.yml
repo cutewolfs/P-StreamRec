@@ -90,7 +90,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/raccommode/p-streamrec
+          images: ghcr.io/cutewolfs/p-streamrec
           tags: |
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
