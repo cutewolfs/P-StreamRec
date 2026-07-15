@@ -451,8 +451,10 @@ class ChaturbateAuthService:
 
         try:
             headers = {
-                "User-Agent": self._user_agent,
-                "Accept": "application/json, text/html",
+                 "User-Agent": self._user_agent,
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://chaturbate.com/followed-cams/",
                 "Cookie": "; ".join(f"{k}={v}" for k, v in self._cookies.items()),
             }
             async with aiohttp_client_session() as session:
