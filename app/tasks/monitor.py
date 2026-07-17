@@ -87,6 +87,7 @@ async def _check_live_via_cdn(session: AsyncSession, username: str) -> bool:
             headers=headers,
             timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
             allow_redirects=True,
+            verify=False,
         )
         if resp.status_code == 200:
             content = resp.content

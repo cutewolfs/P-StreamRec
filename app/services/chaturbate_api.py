@@ -11,20 +11,18 @@ from html import unescape
 from typing import Optional, List, Dict, Any
 from curl_cffi.requests import AsyncSession
 
-import aiohttp
-
 from ..logger import logger
 from ..core.config import (
     CB_REQUEST_DELAY,
     CHATURBATE_REQUEST_TIMEOUT_SECONDS,
     PSTREAMREC_MAX_FOLLOW_SYNC_ITEMS,
 )
-from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 from .chaturbate_auth import ChaturbateAuthService, merge_flaresolverr_cookies
 from .flaresolverr import FlareSolverrClient
 
 
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+_IMPERSONATE_TARGET = "chrome124"
 
 
 class FollowedSyncResult(list):
@@ -141,7 +139,7 @@ class ChaturbateAPI:
                         method,
                         url,
                         headers=headers,
-                        impersonate="chrome120",
+                        impersonate=_IMPERSONATE_TARGET,
                         timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
                         **curl_kwargs,
                     )
@@ -160,7 +158,7 @@ class ChaturbateAPI:
                                     method,
                                     url,
                                     headers=headers,
-                                    impersonate="chrome120",
+                                    impersonate=_IMPERSONATE_TARGET,
                                     timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
                                     **curl_kwargs,
                                 )
@@ -186,7 +184,10 @@ class ChaturbateAPI:
         """Statut Chaturbate d'un username. Renvoie un dict normalisé.
 
         Utilise le chaturbate_auth du service pour fournir des cookies
-        authentifiés à monitor.check_model_status().
+        authentifiés à monitor.check_model_status(). La session HTTP
+        passée à check_model_status() doit être une AsyncSession curl_cffi
+        (impersonation Chrome), pas une session aiohttp : monitor.py attend
+        des réponses avec .status_code / .content, pas .status / .read().
         """
         from ..tasks.monitor import check_model_status
 
@@ -204,7 +205,7 @@ class ChaturbateAPI:
         except Exception:
             auth_cookies = None
 
-        async with aiohttp_client_session() as session:
+        async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
             data = await check_model_status(
                 session, username, csrftoken, auth_cookies=auth_cookies
             )
@@ -457,7 +458,6 @@ class ChaturbateAPI:
             url += gender_map.get(gender.lower(), "")
         if search:
             url = f"https://chaturbate.com/tags/{search}/"
-
         if page > 1:
             url += f"?page={page}"
 
@@ -761,7 +761,7 @@ class ChaturbateAPI:
         lower = (html or "").lower()
         if "cloudflare" in lower and ("challenge" in lower or "cf-browser-verification" in lower):
             return True
-        if "/auth/login" in lower or ("name=\"password\"" in lower and "csrfmiddlewaretoken" in lower):
+        if "/auth/login" in lower or ('name="password"' in lower and "csrfmiddlewaretoken" in lower):
             return True
         return "login_required" in lower or "please log in" in lower
 
@@ -816,7 +816,7 @@ class ChaturbateAPI:
         if 'rel="next"' in lower or "rel='next'" in lower:
             return True
         next_link = re.search(
-            r'<a\b[^>]*href=["\'][^"\']*(?:\?|&)page=\d+[^"\']*["\'][^>]*>\s*(?:next|&rsaquo;|›)',
+            r'<a\b[^>]*href=["\'][^"\']*(?:\?|&)page=\d+[^"\']*["\'][^>]*>\s*(?:next|&rsaquo;|\u203a)',
             html or "",
             re.IGNORECASE | re.DOTALL,
         )
@@ -1192,7 +1192,7 @@ class ChaturbateAPI:
 
 
 class _FakeResponse:
-    """Holds response data after the aiohttp context has exited"""
+    """Holds response data after the curl_cffi context has exited"""
 
     def __init__(self, status: int, body: bytes, headers: Any, content_type: str):
         self.status = status
