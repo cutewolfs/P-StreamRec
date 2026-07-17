@@ -54,13 +54,26 @@ class _ResponseCookie:
         self.value = value
 
 
-class _AuthLoginResponse:
-    def __init__(self, status=302, cookies=None):
-        self.status = status
-        self.cookies = {
-            key: _ResponseCookie(key, value)
-            for key, value in (cookies or {}).items()
-        }
+# --- curl_cffi-style fake response/session -----------------------------
+# curl_cffi's AsyncSession.get()/post() are coroutines that directly
+# return a Response object (status_code, cookies dict-like, .text as a
+# plain str attribute) -- unlike aiohttp's async-context-manager pattern.
+
+class _CurlCffiResponse:
+    def __init__(self, status_code=302, cookies=None, text=""):
+        self.status_code = status_code
+        self.cookies = dict(cookies or {})
+        self.text = text
+
+
+class _CurlCffiSession:
+    """Mimics curl_cffi.requests.AsyncSession as an async context manager."""
+
+    def __init__(self, get_response=None, post_response=None):
+        self.get_response = get_response
+        self.post_response = post_response
+        self.get_calls = []
+        self.post_calls = []
 
     async def __aenter__(self):
         return self
@@ -68,22 +81,13 @@ class _AuthLoginResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def text(self):
-        return ""
+    async def get(self, *args, **kwargs):
+        self.get_calls.append({"args": args, "kwargs": kwargs})
+        return self.get_response
 
-
-class _AuthLoginSession:
-    def __init__(self, response):
-        self.response = response
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    def post(self, *args, **kwargs):
-        return self.response
+    async def post(self, *args, **kwargs):
+        self.post_calls.append({"args": args, "kwargs": kwargs})
+        return self.post_response
 
 
 def _json_response(payload):
@@ -178,10 +182,17 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         auth._validate_session = AsyncMock(side_effect=reject_session)
         auth._save_state = AsyncMock()
         auth._save_error = AsyncMock()
-        session = _AuthLoginSession(_AuthLoginResponse(cookies={"sessionid": "issued-session"}))
+
+        # curl_cffi.requests.AsyncSession(impersonate=...) is used as an
+        # async context manager; .post() returns a Response directly.
+        response = _CurlCffiResponse(
+            status_code=302,
+            cookies={"sessionid": "issued-session"},
+        )
+        session = _CurlCffiSession(post_response=response)
 
         with patch(
-            "app.services.chaturbate_auth.aiohttp_client_session",
+            "app.services.chaturbate_auth.AsyncSession",
             return_value=session,
         ):
             result = await auth.login("alice", "secret")
@@ -198,10 +209,15 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         auth._validate_session = AsyncMock(return_value=True)
         auth._save_state = AsyncMock()
         auth._save_error = AsyncMock()
-        session = _AuthLoginSession(_AuthLoginResponse(cookies={"sessionid": "verified-session"}))
+
+        response = _CurlCffiResponse(
+            status_code=302,
+            cookies={"sessionid": "verified-session"},
+        )
+        session = _CurlCffiSession(post_response=response)
 
         with patch(
-            "app.services.chaturbate_auth.aiohttp_client_session",
+            "app.services.chaturbate_auth.AsyncSession",
             return_value=session,
         ):
             result = await auth.login("alice", "secret")
@@ -211,6 +227,54 @@ class ChaturbateRoomlistTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("verified-session", auth._cookies["sessionid"])
         auth._save_state.assert_awaited_once_with("alice", "secret")
         auth._save_error.assert_not_awaited()
+
+    async def test_extract_csrf_token_parses_html_via_curl_cffi(self):
+        auth = ChaturbateAuthService(db=object())
+        html = (
+            '<html><body>'
+            '<input name="csrfmiddlewaretoken" value="token-123">'
+            '</body></html>'
+        )
+        response = _CurlCffiResponse(status_code=200, cookies={"csrftoken": "token-123"}, text=html)
+        session = _CurlCffiSession(get_response=response)
+
+        with patch(
+            "app.services.chaturbate_auth.AsyncSession",
+            return_value=session,
+        ):
+            csrf, cookies = await auth._extract_csrf_token()
+
+        self.assertEqual("token-123", csrf)
+        self.assertEqual("token-123", cookies.get("csrftoken"))
+
+    async def test_extract_csrf_token_falls_back_to_flaresolverr_on_403(self):
+        auth = ChaturbateAuthService(db=object(), flaresolverr=_FakeFlareSolverr())
+        blocked = _CurlCffiResponse(status_code=403, cookies={}, text="")
+        html = (
+            '<html><body>'
+            '<input name="csrfmiddlewaretoken" value="solved-token">'
+            '</body></html>'
+        )
+        solved = _CurlCffiResponse(status_code=200, cookies={"cf_clearance": "solved"}, text=html)
+
+        session = _CurlCffiSession(get_response=blocked)
+        # Second GET call (after FlareSolverr) should return the solved response.
+        calls = [blocked, solved]
+
+        async def fake_get(*args, **kwargs):
+            session.get_calls.append({"args": args, "kwargs": kwargs})
+            return calls.pop(0)
+
+        session.get = fake_get
+
+        with patch(
+            "app.services.chaturbate_auth.AsyncSession",
+            return_value=session,
+        ):
+            csrf, cookies = await auth._extract_csrf_token()
+
+        self.assertEqual("solved-token", csrf)
+        self.assertEqual("solved", cookies.get("cf_clearance"))
 
     async def test_flaresolverr_cookie_merge_preserves_authenticated_session(self):
         auth = _MutableCookieAuth()
