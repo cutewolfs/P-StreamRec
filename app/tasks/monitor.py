@@ -3,7 +3,6 @@ Tâche background: Monitoring continu des modèles
 Vérifie l'état en ligne, génère les miniatures et met à jour SQLite
 """
 import asyncio
-import aiohttp
 import json
 import re
 import os
@@ -11,6 +10,8 @@ import unicodedata
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 from datetime import datetime, timezone
+
+from curl_cffi.requests import AsyncSession
 
 if TYPE_CHECKING:
     from ..ffmpeg_runner import FFmpegManager
@@ -25,7 +26,6 @@ from ..core.config import (
     MIN_RECORDING_SECONDS,
     OUTPUT_DIR,
 )
-from ..core.http_client import aiohttp_client_session, aiohttp_request_kwargs
 
 # Intervalle de vérification (en secondes)
 CHECK_INTERVAL_SETTING_KEY = "check_interval_seconds"
@@ -35,6 +35,11 @@ MONITOR_INTERVAL = AUTO_RECORD_INTERVAL
 THUMBNAIL_UPDATE_INTERVAL = 300  # Miniature offline: toutes les 5 minutes
 THUMBNAIL_UPDATE_INTERVAL_LIVE = 60  # Miniature live: toutes les 60s pour refléter l'activité
 SHORT_RECORDING_PROBE_BYTES = max(MIN_RECORDING_BYTES, 64 * 1024 * 1024)
+
+# curl_cffi impersonation profile: matches the TLS/JA3/HTTP2 fingerprint of a
+# real Chrome browser, which is what Cloudflare inspects to distinguish bots
+# from browsers (independent of the User-Agent header value).
+_IMPERSONATE_TARGET = "chrome124"
 
 
 def normalize_check_interval_seconds(value, default: int = MONITOR_INTERVAL) -> int:
@@ -65,7 +70,7 @@ async def get_check_interval_seconds(db: 'Database') -> int:
         )
         return normalize_check_interval_seconds(AUTO_RECORD_INTERVAL)
 
-async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> bool:
+async def _check_live_via_cdn(session: AsyncSession, username: str) -> bool:
     """Check if a model is live using the Chaturbate thumbnail CDN.
 
     This CDN endpoint is not behind Cloudflare and does not require cookies.
@@ -77,23 +82,22 @@ async def _check_live_via_cdn(session: aiohttp.ClientSession, username: str) -> 
         "Referer": "https://chaturbate.com/",
     }
     try:
-        async with session.get(
+        resp = await session.get(
             url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-            ssl=False,
-            **aiohttp_request_kwargs(),
-        ) as resp:
-            if resp.status == 200:
-                content = await resp.read()
-                return len(content) > 1000
+            timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=True,
+        )
+        if resp.status_code == 200:
+            content = resp.content
+            return len(content) > 1000
     except Exception as e:
         logger.debug("Erreur fallback live CDN", username=username, error=str(e))
     return False
 
 
 async def check_model_status(
-    session: aiohttp.ClientSession,
+    session: AsyncSession,
     username: str,
     csrftoken: str = None,
     auth_cookies: dict | None = None,
@@ -108,20 +112,23 @@ async def check_model_status(
     Without auth cookies Chaturbate redirects ``/api/chatvideocontext/`` to the
     login page and the check silently fails (see GH #11).
 
-    When the chatvideocontext API is blocked by Cloudflare TLS fingerprinting
-    (connection reset, error code 0), the CDN thumbnail endpoint is used as a
-    reliable fallback to detect liveness without any Cloudflare dependency.
+    Uses curl_cffi with Chrome TLS/JA3/HTTP2 impersonation to avoid being
+    fingerprinted and blocked by Cloudflare (see GH issue on Brotli decode
+    errors and 403s from aiohttp's distinct network fingerprint).
+
+    When the chatvideocontext API is blocked or redirected (e.g. to a
+    locale-specific page such as es.chaturbate.com, or to the login page),
+    the CDN thumbnail endpoint is used as a reliable fallback to detect
+    liveness without any Cloudflare/session dependency.
     """
     try:
         url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "application/json",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
             "Referer": "https://chaturbate.com/",
             "Origin": "https://chaturbate.com",
-            "Connection": "keep-alive",
+            "X-Requested-With": "XMLHttpRequest",
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -144,30 +151,39 @@ async def check_model_status(
         if sessionid_env and "sessionid" not in cookies:
             cookies["sessionid"] = sessionid_env
 
-        if cookies:
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        
-        async with session.get(
+        response = await session.get(
             url,
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-            ssl=False,
-            **aiohttp_request_kwargs(),
-        ) as response:
-            if response.status == 200:
-                data = await response.json()
-                
-                # Log les données de l'API pour débogage
-                logger.debug("Réponse API Chaturbate", 
+            cookies=cookies,
+            timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            allow_redirects=False,
+        )
+
+        if response.status_code == 200:
+            content_type = response.headers.get("Content-Type", "")
+            if "application/json" not in content_type.lower():
+                # Chaturbate served an HTML page instead of JSON: this
+                # happens on locale redirects (e.g. es.chaturbate.com) or
+                # when the session/csrf isn't accepted. Treat it as a soft
+                # failure and fall through to the CDN fallback below rather
+                # than crashing on .json().
+                logger.debug(
+                    "Réponse non-JSON de chatvideocontext (redirect locale/login ?)",
+                    username=username,
+                    content_type=content_type,
+                )
+            else:
+                data = response.json()
+
+                logger.debug("Réponse API Chaturbate",
                            username=username,
                            room_status=data.get("room_status"),
                            has_hls=bool(data.get("hls_source")),
                            num_users=data.get("num_users", 0))
-                
-                # Détection améliorée du statut en ligne
+
                 room_status = data.get("room_status", "")
                 hls_source = data.get("hls_source")
-                
+
                 # Un modèle est en ligne si :
                 # 1. Il a un flux HLS disponible OU
                 # 2. Le room_status est "public" OU
@@ -186,11 +202,19 @@ async def check_model_status(
                     "room_status": room_status or None,
                     "tags": data.get("tags") or data.get("room_tags") or [],
                 }
+        elif response.status_code in (301, 302, 303, 307, 308):
+            logger.debug(
+                "chatvideocontext a redirigé (session non authentifiée ?)",
+                username=username,
+                status=response.status_code,
+                location=response.headers.get("Location"),
+            )
     except Exception as e:
         logger.debug("Erreur vérification statut modèle", username=username, error=str(e))
 
-    # Fallback: chatvideocontext is blocked by Cloudflare TLS fingerprinting.
-    # Use the thumbnail CDN which has no CF protection to detect liveness.
+    # Fallback: chatvideocontext is blocked/redirected (Cloudflare TLS
+    # fingerprinting, locale redirect, or invalid session). Use the
+    # thumbnail CDN which has no CF/session dependency to detect liveness.
     try:
         is_live = await _check_live_via_cdn(session, username)
         if is_live:
@@ -223,15 +247,15 @@ async def generate_thumbnail_from_stream(
     try:
         session_dir = output_dir / "sessions" / session_id
         m3u8_file = session_dir / "stream.m3u8"
-        
+
         if not m3u8_file.exists():
             return None
-        
+
         # Dossier pour les miniatures live
         live_thumbs_dir = output_dir / "thumbnails" / "live"
         live_thumbs_dir.mkdir(parents=True, exist_ok=True)
         thumb_path = live_thumbs_dir / f"{username}.jpg"
-        
+
         # Générer la miniature
         process = await asyncio.create_subprocess_exec(
             ffmpeg_path, "-i", str(m3u8_file),
@@ -242,15 +266,15 @@ async def generate_thumbnail_from_stream(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        
+
         await wait_with_timeout(process, 10)
-        
+
         if thumb_path.exists():
             return str(thumb_path)
-    
+
     except Exception as e:
         logger.debug("Erreur génération miniature stream", username=username, error=str(e))
-    
+
     return None
 
 async def generate_thumbnail_from_recording(
@@ -261,27 +285,27 @@ async def generate_thumbnail_from_recording(
     """Génère une miniature depuis la dernière rediffusion"""
     try:
         records_dir = output_dir / "records" / username
-        
+
         if not records_dir.exists():
             return None
-        
+
         # Trouver la dernière rediffusion
         ts_files = sorted(records_dir.rglob("*.ts"), key=lambda p: p.stat().st_mtime, reverse=True)
-        
+
         if not ts_files:
             return None
-        
+
         latest_recording = ts_files[0]
-        
+
         # Dossier pour les miniatures offline
         offline_thumbs_dir = output_dir / "thumbnails" / "offline"
         offline_thumbs_dir.mkdir(parents=True, exist_ok=True)
         thumb_path = offline_thumbs_dir / f"{username}.jpg"
-        
+
         # Ne régénérer que si la miniature n'existe pas ou est plus ancienne que l'enregistrement
         if thumb_path.exists() and thumb_path.stat().st_mtime > latest_recording.stat().st_mtime:
             return str(thumb_path)
-        
+
         # Extraire une frame au milieu de la vidéo
         process = await asyncio.create_subprocess_exec(
             ffmpeg_path, "-ss", "00:00:30",
@@ -293,19 +317,19 @@ async def generate_thumbnail_from_recording(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        
+
         await wait_with_timeout(process, 15)
-        
+
         if thumb_path.exists():
             return str(thumb_path)
-    
+
     except Exception as e:
         logger.debug("Erreur génération miniature offline", username=username, error=str(e))
-    
+
     return None
 
 async def download_thumbnail_from_chaturbate(
-    session: aiohttp.ClientSession,
+    session: AsyncSession,
     username: str,
     output_dir: Path
 ) -> str | None:
@@ -315,39 +339,38 @@ async def download_thumbnail_from_chaturbate(
             f"https://roomimg.stream.highwebmedia.com/ri/{username}.jpg",
             f"https://cbjpeg.stream.highwebmedia.com/stream?room={username}&f=.jpg",
         ]
-        
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://chaturbate.com/",
         }
-        
+
         for img_url in img_urls:
             try:
-                async with session.get(
+                response = await session.get(
                     img_url,
                     headers=headers,
                     timeout=5,
-                    **aiohttp_request_kwargs(),
-                ) as response:
-                    if response.status == 200:
-                        content = await response.read()
-                        
-                        if len(content) > 1000:
-                            # Sauvegarder la miniature
-                            cb_thumbs_dir = output_dir / "thumbnails" / "chaturbate"
-                            cb_thumbs_dir.mkdir(parents=True, exist_ok=True)
-                            thumb_path = cb_thumbs_dir / f"{username}.jpg"
-                            
-                            with open(thumb_path, 'wb') as f:
-                                f.write(content)
-                            
-                            return str(thumb_path)
+                )
+                if response.status_code == 200:
+                    content = response.content
+
+                    if len(content) > 1000:
+                        # Sauvegarder la miniature
+                        cb_thumbs_dir = output_dir / "thumbnails" / "chaturbate"
+                        cb_thumbs_dir.mkdir(parents=True, exist_ok=True)
+                        thumb_path = cb_thumbs_dir / f"{username}.jpg"
+
+                        with open(thumb_path, 'wb') as f:
+                            f.write(content)
+
+                        return str(thumb_path)
             except Exception:
                 continue
-    
+
     except Exception as e:
         logger.debug("Erreur téléchargement miniature Chaturbate", username=username, error=str(e))
-    
+
     return None
 
 async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> int:
@@ -355,7 +378,7 @@ async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> in
     try:
         # Utiliser ffprobe pour récupérer la durée
         ffprobe_path = ffmpeg_path.replace("ffmpeg", "ffprobe")
-        
+
         process = await asyncio.create_subprocess_exec(
             ffprobe_path,
             "-v", "error",
@@ -365,17 +388,17 @@ async def get_video_duration(file_path: Path, ffmpeg_path: str = "ffmpeg") -> in
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
-        
+
         stdout, stderr = await communicate_with_timeout(process, 10)
-        
+
         if process.returncode == 0 and stdout:
             duration_str = stdout.decode().strip()
             if duration_str:
                 return int(float(duration_str))
-    
+
     except Exception as e:
         logger.debug("Erreur récupération durée vidéo", file_path=str(file_path), error=str(e))
-    
+
     return 0
 
 
@@ -684,7 +707,6 @@ def _parse_video_recorded_at(probe_data: dict[str, Any]) -> int | None:
                     return parsed
     return None
 
-
 async def get_video_recorded_at(file_path: Path, ffmpeg_path: str = "ffmpeg") -> int | None:
     """Read the media/container recorded date from ffprobe metadata tags."""
     try:
@@ -764,11 +786,11 @@ async def generate_recording_thumbnail(
         thumbs_dir = output_dir / "thumbnails" / username
         thumbs_dir.mkdir(parents=True, exist_ok=True)
         thumb_path = thumbs_dir / f"{ts_file.stem}.jpg"
-        
+
         # Ne pas régénérer si existe déjà
         if thumb_path.exists():
             return str(thumb_path)
-        
+
         # Extraire une frame à 30 secondes du début
         process = await asyncio.create_subprocess_exec(
             ffmpeg_path,
@@ -781,20 +803,19 @@ async def generate_recording_thumbnail(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        
+
         await wait_with_timeout(process, 15)
-        
+
         if thumb_path.exists():
             return str(thumb_path)
-    
-    except Exception as e:
-        logger.debug("Erreur génération miniature enregistrement", 
-                    username=username, 
-                    filename=ts_file.name, 
-                    error=str(e))
-    
-    return None
 
+    except Exception as e:
+        logger.debug("Erreur génération miniature enregistrement",
+                    username=username,
+                    filename=ts_file.name,
+                    error=str(e))
+
+    return None
 
 async def _record_dirs_for_username(db: 'Database', username: str, output_dir: Path) -> list[Path]:
     records_root = output_dir / "records"
@@ -836,7 +857,6 @@ async def _record_dirs_for_username(db: 'Database', username: str, output_dir: P
         seen.add(key)
         unique.append(candidate)
     return unique
-
 
 async def update_recordings_cache(db: 'Database', username: str, output_dir: Path, ffmpeg_path: str = "ffmpeg"):
     """Met à jour le cache des enregistrements dans SQLite"""
@@ -930,7 +950,7 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
 
         for ts_file in (ts_file for records_dir in records_dirs for ts_file in records_dir.glob("*.ts")):
             stat = ts_file.stat()
-            
+
             # Récupérer la durée actuelle depuis la DB
             existing_recordings = await db.get_recordings(username)
             existing_rec = next((r for r in existing_recordings if r['filename'] == ts_file.name), None)
@@ -938,12 +958,12 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
 
             if await cleanup_short_recording(ts_file, existing_rec, seconds_since_modification):
                 continue
-            
+
             # Calculer la durée uniquement si elle n'est pas déjà en cache ou est à 0
             duration_seconds = 0
             if existing_rec:
                 duration_seconds = existing_rec.get('duration_seconds', 0)
-            
+
             if duration_seconds == 0:
                 # Vérifier que le fichier est stable (pas modifié depuis 120s)
                 # pour éviter de calculer la durée sur un fichier en cours d'écriture
@@ -952,26 +972,26 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                     duration_seconds = await get_video_duration(ts_file, ffmpeg_path)
                     logger.debug("Durée calculée", username=username, filename=ts_file.name, duration=duration_seconds)
                 else:
-                    logger.debug("Fichier pas encore stable, skip calcul durée", 
-                               username=username, 
+                    logger.debug("Fichier pas encore stable, skip calcul durée",
+                               username=username,
                                filename=ts_file.name,
                                seconds_since_modification=int(seconds_since_modification))
-            
+
             # Générer la miniature si elle n'existe pas
             thumbnail_path = None
             if existing_rec:
                 thumbnail_path = existing_rec.get('thumbnail_path')
-            
+
             if not thumbnail_path or not Path(thumbnail_path).exists():
                 thumbnail_path = await generate_recording_thumbnail(ts_file, output_dir, username, ffmpeg_path)
                 if thumbnail_path:
                     logger.debug("Miniature générée", username=username, filename=ts_file.name, thumb=thumbnail_path)
-            
+
             # Générer recording_id si c'est un nouvel enregistrement
             recording_id = None
             if existing_rec:
                 recording_id = existing_rec.get('recording_id')
-            
+
             if not recording_id:
                 # Extraire le timestamp du nom de fichier (format: YYYYMMDD_HHMMSS_xxx.ts)
                 # Sinon générer un nouveau recording_id
@@ -989,7 +1009,7 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                     ffmpeg_path,
                     fallback_timestamp=int(stat.st_mtime),
                 )
-            
+
             await db.add_or_update_recording(
                 username=username,
                 filename=ts_file.name,
@@ -1000,7 +1020,7 @@ async def update_recordings_cache(db: 'Database', username: str, output_dir: Pat
                 thumbnail_path=thumbnail_path,
                 created_at=created_at,
             )
-    
+
     except Exception as e:
         logger.debug("Erreur mise à jour cache enregistrements", username=username, error=str(e))
 
@@ -1022,6 +1042,10 @@ async def monitor_models_task(
     ``chaturbate_auth`` fournit les cookies authentifiés pour check_model_status
     Chaturbate (évite le redirect login, GH #11). ``cam4_auth`` est reservé
     pour d'éventuels besoins futurs côté CAM4.
+
+    Toutes les requêtes HTTP vers chaturbate.com passent par curl_cffi avec
+    impersonation Chrome (JA3/TLS/HTTP2), ce qui évite le fingerprinting
+    Cloudflare et les erreurs de decode Brotli rencontrées avec aiohttp.
     """
     logger.background_task("monitor", "Démarrage du monitoring continu")
 
@@ -1043,7 +1067,7 @@ async def monitor_models_task(
             interval = MONITOR_INTERVAL
         await asyncio.sleep(interval)
 
-    async with aiohttp_client_session() as session:
+    async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
         while True:
             try:
                 models = await db.get_all_models()
@@ -1059,7 +1083,6 @@ async def monitor_models_task(
                 for model in models:
                     username = model['username']
                     source_type = model.get('source_type') or 'chaturbate'
-
                     try:
                         if provider_registry is not None and provider_registry.has(source_type):
                             try:
@@ -1097,7 +1120,7 @@ async def monitor_models_task(
                                 csrftoken,
                                 auth_cookies=auth_cookies,
                             )
-                        
+
                         # Vérifier si en cours d'enregistrement
                         active_session = next(
                             (
@@ -1110,7 +1133,7 @@ async def monitor_models_task(
                             None
                         )
                         is_recording = active_session is not None
-                        
+
                         # Générer/mettre à jour la miniature. Les modèles live
                         # sont rafraîchis plus souvent (60s) pour refléter
                         # l'activité sur les pages Discover / Following.
@@ -1123,7 +1146,7 @@ async def monitor_models_task(
                         needs_thumbnail_update = (
                             datetime.now().timestamp() - last_thumbnail_update > thumb_interval
                         )
-                        
+
                         if needs_thumbnail_update:
                             # 1) HTTP download from provider (zero CPU). Only for Chaturbate;
                             #    CAM4 has its own flow via download in followed/model APIs.
@@ -1150,7 +1173,7 @@ async def monitor_models_task(
                                     OUTPUT_DIR,
                                     ffmpeg_path
                                 )
-                        
+
                         # Mettre à jour le statut dans la DB
                         await db.update_model_status(
                             username=username,
@@ -1161,26 +1184,26 @@ async def monitor_models_task(
                             room_status=status.get('room_status'),
                             source_type=source_type,
                         )
-                        
+
                         # Mettre à jour le cache des enregistrements
                         await update_recordings_cache(db, username, OUTPUT_DIR, ffmpeg_path)
-                        
+
                         logger.debug("Modèle mis à jour",
                                    username=username,
                                    is_online=status['is_online'],
                                    is_recording=is_recording,
                                    viewers=status['viewers'])
-                    
+
                     except Exception as e:
                         logger.error("Erreur monitoring modèle",
                                    username=username,
                                    error=str(e),
                                    exc_info=True)
                         continue
-                
+
                 # Attendre avant la prochaine vérification
                 await sleep_until_next_check()
-            
+
             except Exception as e:
                 logger.error("Erreur dans monitor task",
                            error=str(e),
