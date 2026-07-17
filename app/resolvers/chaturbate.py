@@ -1,24 +1,25 @@
 import re
 import html
-import aiohttp
-import requests
 from typing import Optional
 from urllib.parse import urljoin
+from curl_cffi.requests import AsyncSession
+import requests
 from .base import ResolveError
 from ..logger import logger
 from ..core.config import CHATURBATE_REQUEST_TIMEOUT_SECONDS
-from ..core.http_client import (
-    aiohttp_client_session,
-    aiohttp_request_kwargs,
-    requests_proxy_kwargs,
-)
+from ..core.http_client import requests_proxy_kwargs
 
-# Rate limiting pour éviter HTTP 429
+
+_IMPERSONATE_TARGET = "chrome124"
+
+# Rate limiting pour eviter HTTP 429
 _last_request_time = 0
-_min_delay_between_requests = 2.0  # 2 secondes entre chaque requête
+_min_delay_between_requests = 2.0  # 2 secondes entre chaque requete
+
 
 # Optional ChaturbateAPI instance (set at startup)
 _chaturbate_api = None
+
 
 
 def _quality_field_order(max_height: Optional[int] = None):
@@ -55,10 +56,12 @@ def _quality_field_order(max_height: Optional[int] = None):
     return [(field_name, labels[field_name]) for field_name in order]
 
 
+
 def set_chaturbate_api(api):
     """Set the ChaturbateAPI instance for authenticated resolution"""
     global _chaturbate_api
     _chaturbate_api = api
+
 
 
 async def resolve_m3u8_async(username: str, max_height: Optional[int] = None) -> str:
@@ -73,7 +76,7 @@ async def resolve_m3u8_async(username: str, max_height: Optional[int] = None) ->
         username: target model
         max_height: optional max resolution (e.g. 720). None = best available.
     """
-    logger.subsection(f"Résolution M3U8 async - {username}")
+    logger.subsection(f"Resolution M3U8 async - {username}")
 
     username = username.strip().lower()
     if not username or not re.match(r'^[a-z0-9_]+$', username):
@@ -84,7 +87,7 @@ async def resolve_m3u8_async(username: str, max_height: Optional[int] = None) ->
         try:
             hls_url = await _chaturbate_api.get_edge_hls_url(username)
             if hls_url:
-                logger.success("M3U8 résolu via API authentifiée", username=username)
+                logger.success("M3U8 resolu via API authentifiee", username=username)
                 return await _resolve_variant(hls_url, max_height=max_height)
         except Exception as e:
             logger.debug("Auth resolution failed, falling back", error=str(e))
@@ -93,9 +96,12 @@ async def resolve_m3u8_async(username: str, max_height: Optional[int] = None) ->
     return await _resolve_m3u8_async_fallback(username, max_height=max_height)
 
 
+
 async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] = None) -> str:
     """Async fallback: try the chatvideocontext API, then scrape the HTML page.
-    Uses aiohttp so the FastAPI event loop isn't blocked during resolution."""
+    Uses curl_cffi (Chrome impersonation) so the FastAPI event loop isn't
+    blocked during resolution and Brotli/Cloudflare responses decode
+    correctly."""
     username = username.strip().lower()
     if not username or not re.match(r'^[a-z0-9_]+$', username):
         raise ResolveError("Nom d'utilisateur invalide")
@@ -107,26 +113,24 @@ async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] 
     }
 
     try:
-        async with aiohttp_client_session() as session:
+        async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
             # 1) API chatvideocontext
             api_url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
             try:
-                async with session.get(
+                api_resp = await session.get(
                     api_url,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                    ssl=False,
-                    **aiohttp_request_kwargs(),
-                ) as api_resp:
-                    if api_resp.status == 200:
-                        api_data = await api_resp.json(content_type=None)
-                        best_m3u8 = None
-                        for field_name, _quality_label in _quality_field_order(max_height):
-                            if api_data.get(field_name):
-                                best_m3u8 = api_data[field_name]
-                                break
-                        if best_m3u8:
-                            return await _resolve_variant(best_m3u8, max_height=max_height)
+                    timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+                )
+                if api_resp.status_code == 200:
+                    api_data = api_resp.json()
+                    best_m3u8 = None
+                    for field_name, _quality_label in _quality_field_order(max_height):
+                        if api_data.get(field_name):
+                            best_m3u8 = api_data[field_name]
+                            break
+                    if best_m3u8:
+                        return await _resolve_variant(best_m3u8, max_height=max_height)
             except Exception as e:
                 logger.debug("Async API resolve failed, falling back to HTML", username=username, error=str(e))
 
@@ -135,16 +139,14 @@ async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] 
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             }
-            async with session.get(
+            resp = await session.get(
                 f"https://chaturbate.com/{username}/",
                 headers=html_headers,
-                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                ssl=False,
-                **aiohttp_request_kwargs(),
-            ) as resp:
-                if resp.status != 200:
-                    raise ResolveError(f"Impossible d'accéder à la page (HTTP {resp.status})")
-                html_content = await resp.text()
+                timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            )
+            if resp.status_code != 200:
+                raise ResolveError(f"Impossible d'acceder a la page (HTTP {resp.status_code})")
+            html_content = resp.text
 
         m3u8_patterns = [
             r'"(https?://[^"]*\.m3u8[^"]*)"',
@@ -168,7 +170,8 @@ async def _resolve_m3u8_async_fallback(username: str, max_height: Optional[int] 
     except ResolveError:
         raise
     except Exception as e:
-        raise ResolveError(f"Erreur réseau: {str(e)}")
+        raise ResolveError(f"Erreur reseau: {str(e)}")
+
 
 
 def _parse_master_playlist(text: str):
@@ -207,6 +210,7 @@ def _parse_master_playlist(text: str):
     return variants
 
 
+
 def _pick_variant_info(variants, max_height: Optional[int]):
     """Pick a variant entry given a max height constraint.
 
@@ -227,13 +231,15 @@ def _pick_variant_info(variants, max_height: Optional[int]):
     eligible = [v for v in variants if v.get("height", 0) <= max_height]
     if eligible:
         return sorted(eligible, key=sort_key, reverse=True)[0]
-    # Nothing fits — return the smallest to save bandwidth
+    # Nothing fits - return the smallest to save bandwidth
     return sorted(variants, key=sort_key)[0]
+
 
 
 def _pick_variant(variants, max_height: Optional[int]):
     picked = _pick_variant_info(variants, max_height)
     return picked["url"] if picked else None
+
 
 
 async def resolve_llhls_master_playlist(
@@ -253,23 +259,21 @@ async def resolve_llhls_master_playlist(
     request_headers.update(headers or {})
 
     try:
-        async with aiohttp_client_session() as session:
-            async with session.get(
+        async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
+            resp = await session.get(
                 m3u8_url,
                 headers=request_headers,
-                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS),
-                ssl=False,
-                **aiohttp_request_kwargs(),
-            ) as resp:
-                if resp.status != 200:
-                    logger.debug(
-                        "Chaturbate LL-HLS master fetch failed",
-                        status=resp.status,
-                    )
-                    return None
-                text = await resp.text()
-                content_type = resp.headers.get("Content-Type", "")
-                base_url = str(resp.url)
+                timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            )
+            if resp.status_code != 200:
+                logger.debug(
+                    "Chaturbate LL-HLS master fetch failed",
+                    status=resp.status_code,
+                )
+                return None
+            text = resp.text
+            content_type = resp.headers.get("Content-Type", "")
+            base_url = str(resp.url)
     except Exception as e:
         logger.debug("Could not fetch Chaturbate LL-HLS master", error=str(e))
         return None
@@ -282,6 +286,7 @@ async def resolve_llhls_master_playlist(
         "base_url": base_url,
         "content_type": content_type,
     }
+
 
 
 async def resolve_llhls_video_stream_index(
@@ -301,12 +306,13 @@ async def resolve_llhls_video_stream_index(
     return int(value) if value is not None else None
 
 
+
 async def _resolve_variant(m3u8_url: str, max_height: Optional[int] = None) -> str:
     """If URL is a traditional master playlist, pick a variant according to max_height.
 
     Only operates on playlist.m3u8 (non-LL-HLS muxed streams).
     LL-HLS edge URLs (llhls.m3u8) carry separate audio rendition groups that are
-    only resolvable from the master playlist — ffmpeg must receive the master URL
+    only resolvable from the master playlist - ffmpeg must receive the master URL
     so it can map both the video variant and the audio rendition. Passing a
     video-only chunk URL to ffmpeg results in silent recordings.
     """
@@ -314,29 +320,29 @@ async def _resolve_variant(m3u8_url: str, max_height: Optional[int] = None) -> s
         return m3u8_url
 
     try:
-        async with aiohttp_client_session() as session:
+        async with AsyncSession(impersonate=_IMPERSONATE_TARGET) as session:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             }
-            async with session.get(
+            resp = await session.get(
                 m3u8_url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=CHATURBATE_REQUEST_TIMEOUT_SECONDS), ssl=False,
-                **aiohttp_request_kwargs(),
-            ) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    variants = _parse_master_playlist(text)
-                    picked = _pick_variant(variants, max_height)
-                    if picked:
-                        logger.debug("HLS variant picked",
-                                    max_height=max_height,
-                                    variant=picked,
-                                    candidates=len(variants))
-                        return urljoin(m3u8_url, picked)
+                timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
+            )
+            if resp.status_code == 200:
+                text = resp.text
+                variants = _parse_master_playlist(text)
+                picked = _pick_variant(variants, max_height)
+                if picked:
+                    logger.debug("HLS variant picked",
+                                max_height=max_height,
+                                variant=picked,
+                                candidates=len(variants))
+                    return urljoin(m3u8_url, picked)
     except Exception as e:
         logger.debug("Could not extract variant from playlist", error=str(e))
 
     return m3u8_url
+
 
 
 # Backwards-compatible alias
@@ -344,22 +350,23 @@ async def _resolve_best_quality(m3u8_url: str) -> str:
     return await _resolve_variant(m3u8_url, max_height=None)
 
 
+
 def resolve_m3u8(username: str) -> str:
     """
-    Résolveur Chaturbate ultra-simplifié et fiable.
-    Utilise l'API puis fallback sur HTML si nécessaire.
+    Resolveur Chaturbate ultra-simplifie et fiable.
+    Utilise l'API puis fallback sur HTML si necessaire.
     """
-    logger.subsection(f"Résolution M3U8 - {username}")
+    logger.subsection(f"Resolution M3U8 - {username}")
 
     username = username.strip().lower()
     if not username or not re.match(r'^[a-z0-9_]+$', username):
         logger.error("Nom d'utilisateur invalide", username=username)
         raise ResolveError("Nom d'utilisateur invalide")
 
-    logger.debug("Username validé", username=username)
+    logger.debug("Username valide", username=username)
 
     try:
-        # MÉTHODE 1: Essayer l'API Chaturbate d'abord (meilleure qualité)
+        # METHODE 1: Essayer l'API Chaturbate d'abord (meilleure qualite)
         api_url = f"https://chaturbate.com/api/chatvideocontext/{username}/"
         logger.progress("Tentative via API Chaturbate", username=username, url=api_url)
 
@@ -382,8 +389,8 @@ def resolve_m3u8(username: str) -> str:
             hls_fields = {k: v[:80] if isinstance(v, str) else v for k, v in api_data.items() if 'hls' in k.lower() or 'm3u8' in str(v).lower()}
             logger.debug("Champs HLS disponibles dans API", username=username, hls_fields=hls_fields)
 
-            # Chercher la meilleure qualité disponible
-            # Tester plusieurs noms possibles pour haute qualité
+            # Chercher la meilleure qualite disponible
+            # Tester plusieurs noms possibles pour haute qualite
             best_m3u8 = None
             quality_source = None
 
@@ -391,14 +398,14 @@ def resolve_m3u8(username: str) -> str:
                 if api_data.get(field_name):
                     best_m3u8 = api_data[field_name]
                     quality_source = f"{field_name} ({quality_label})"
-                    logger.success("M3U8 trouvé via API", username=username, quality=quality_source)
+                    logger.success("M3U8 trouve via API", username=username, quality=quality_source)
                     break
 
             if best_m3u8:
-                # ASTUCE: Si c'est un playlist.m3u8, charger et prendre la dernière ligne (meilleure qualité)
+                # ASTUCE: Si c'est un playlist.m3u8, charger et prendre la derniere ligne (meilleure qualite)
                 if 'playlist.m3u8' in best_m3u8:
                     try:
-                        logger.debug("Extraction meilleure qualité du playlist", username=username)
+                        logger.debug("Extraction meilleure qualite du playlist", username=username)
                         playlist_resp = requests.get(
                             best_m3u8,
                             headers=headers,
@@ -407,27 +414,27 @@ def resolve_m3u8(username: str) -> str:
                         )
                         if playlist_resp.status_code == 200:
                             lines = playlist_resp.text.strip().split('\n')
-                            # La dernière ligne non-vide qui n'est pas un commentaire est la meilleure qualité
+                            # La derniere ligne non-vide qui n'est pas un commentaire est la meilleure qualite
                             for line in reversed(lines):
                                 line = line.strip()
                                 if line and not line.startswith('#'):
-                                    # C'est un chemin relatif, construire l'URL complète
+                                    # C'est un chemin relatif, construire l'URL complete
                                     base_url = best_m3u8.rsplit('/', 1)[0]
                                     best_m3u8 = f"{base_url}/{line}"
-                                    logger.success("Meilleure qualité extraite du playlist", username=username)
+                                    logger.success("Meilleure qualite extraite du playlist", username=username)
                                     break
                     except Exception as e:
-                        logger.warning("Impossible d'extraire meilleure qualité du playlist, utilisation URL brute",
+                        logger.warning("Impossible d'extraire meilleure qualite du playlist, utilisation URL brute",
                                      username=username, error=str(e))
 
-                logger.success("M3U8 résolu via API", username=username)
+                logger.success("M3U8 resolu via API", username=username)
                 return best_m3u8
 
             logger.debug("Pas de HLS dans API, fallback sur HTML", username=username)
 
-        # MÉTHODE 2: Fallback sur parsing HTML
+        # METHODE 2: Fallback sur parsing HTML
         url = f"https://chaturbate.com/{username}/"
-        logger.progress("Fallback: Récupération page HTML", username=username, url=url)
+        logger.progress("Fallback: Recuperation page HTML", username=username, url=url)
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -440,16 +447,16 @@ def resolve_m3u8(username: str) -> str:
             timeout=CHATURBATE_REQUEST_TIMEOUT_SECONDS,
             **requests_proxy_kwargs(),
         )
-        logger.debug("Réponse HTTP reçue", username=username, status_code=resp.status_code)
+        logger.debug("Reponse HTTP recue", username=username, status_code=resp.status_code)
 
         if resp.status_code != 200:
             logger.error("Erreur HTTP", username=username, status_code=resp.status_code)
-            raise ResolveError(f"Impossible d'accéder à la page (HTTP {resp.status_code})")
+            raise ResolveError(f"Impossible d'acceder a la page (HTTP {resp.status_code})")
 
         html_content = resp.text
-        logger.debug("Page HTML récupérée", username=username, size_chars=len(html_content))
+        logger.debug("Page HTML recuperee", username=username, size_chars=len(html_content))
 
-        # Chercher le M3U8 avec patterns multiples et variés
+        # Chercher le M3U8 avec patterns multiples et varies
         m3u8_patterns = [
             # URLs directes entre guillemets
             r'"(https?://[^"]*\.m3u8[^"]*)"',
@@ -458,7 +465,7 @@ def resolve_m3u8(username: str) -> str:
             r'hls_source["\s:=]+(["\'])(https?://[^"\']+\.m3u8[^"\']*)\1',
             r'hlsSource["\s:=]+(["\'])(https?://[^"\']+\.m3u8[^"\']*)\1',
             r'm3u8["\s:=]+(["\'])(https?://[^"\']+\.m3u8[^"\']*)\1',
-            # URL encodée (avec antislash)
+            # URL encodee (avec antislash)
             r'(https?:\\?/\\?/[^"\'\\s]+\.m3u8[^"\'\\s]*)',
             # Dans JSON
             r'"url"["\s:]+(["\'])(https?://[^"\']+\.m3u8[^"\']*)\1',
@@ -475,10 +482,10 @@ def resolve_m3u8(username: str) -> str:
             matches = re.findall(pattern, html_content, re.IGNORECASE)
 
             if matches:
-                logger.debug("Pattern match trouvé", username=username, pattern_index=i, matches=len(matches))
-                # Prendre le premier match (ou le groupe capturé)
+                logger.debug("Pattern match trouve", username=username, pattern_index=i, matches=len(matches))
+                # Prendre le premier match (ou le groupe capture)
                 if isinstance(matches[0], tuple):
-                    # Si c'est un tuple (groupes capturés), prendre le dernier élément non vide
+                    # Si c'est un tuple (groupes captures), prendre le dernier element non vide
                     m3u8_url = [g for g in matches[0] if g and 'http' in g][0] if matches[0] else matches[0][-1]
                 else:
                     m3u8_url = matches[0]
@@ -486,31 +493,31 @@ def resolve_m3u8(username: str) -> str:
                 # Nettoyer l'URL
                 m3u8_url = m3u8_url.replace("\\/", "/").replace("\\", "")
 
-                # Décoder les entités Unicode (u002D = -, u0022 = ", etc.)
+                # Decoder les entites Unicode (u002D = -, u0022 = ", etc.)
                 m3u8_url = html.unescape(m3u8_url)
 
-                # Remplacer les codes Unicode hexadécimaux
+                # Remplacer les codes Unicode hexadecimaux
                 def decode_unicode(match):
                     return chr(int(match.group(1), 16))
                 m3u8_url = re.sub(r'u([0-9a-fA-F]{4})', decode_unicode, m3u8_url)
 
-                # Supprimer les caractères parasites à la fin
+                # Supprimer les caracteres parasites a la fin
                 m3u8_url = m3u8_url.rstrip('",;: \t\n\r')
 
-                logger.debug("M3U8 candidat trouvé", username=username)
+                logger.debug("M3U8 candidat trouve", username=username)
 
                 if m3u8_url.startswith("http") and ".m3u8" in m3u8_url:
-                    logger.success("M3U8 résolu avec succès", username=username, pattern=i)
+                    logger.success("M3U8 resolu avec succes", username=username, pattern=i)
                     return m3u8_url
                 else:
                     logger.debug("URL candidat invalide", username=username)
 
-        # Si pas trouvé, vérifier si hors ligne
-        logger.warning("Aucun M3U8 trouvé, vérification statut", username=username)
+        # Si pas trouve, verifier si hors ligne
+        logger.warning("Aucun M3U8 trouve, verification statut", username=username)
 
         html_lower = html_content.lower()
         if "offline" in html_lower:
-            logger.info("Utilisateur détecté hors ligne", username=username)
+            logger.info("Utilisateur detecte hors ligne", username=username)
             raise ResolveError(f"{username} est hors ligne")
 
         # Debug: rechercher 'hls' et 'm3u8' dans le HTML
@@ -519,15 +526,15 @@ def resolve_m3u8(username: str) -> str:
 
         logger.debug("Analyse HTML", username=username, size=len(html_content), hls_count=hls_count, m3u8_count=m3u8_count)
 
-        logger.error("M3U8 non trouvé", username=username)
+        logger.error("M3U8 non trouve", username=username)
         raise ResolveError(f"Impossible de trouver le flux M3U8 pour {username}")
 
     except requests.RequestException as e:
-        logger.error("Erreur réseau lors de la résolution",
+        logger.error("Erreur reseau lors de la resolution",
                     username=username,
                     exc_info=True,
                     error=str(e))
-        raise ResolveError(f"Erreur réseau: {str(e)}")
+        raise ResolveError(f"Erreur reseau: {str(e)}")
     except ResolveError:
         raise
     except Exception as e:
